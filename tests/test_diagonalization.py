@@ -217,7 +217,7 @@ def test_davidson_energy_scaled_residual_safeguard():
     assert np.max(result.residual_norms) ** 2 < tolerance
 
 
-def test_davidson_restart_refreshes_operator_and_stays_well_conditioned():
+def test_davidson_restart_reuses_ritz_images_and_stays_well_conditioned():
     rng = np.random.default_rng(711)
     dimension = 48
     update = rng.normal(size=(dimension, 7))
@@ -251,7 +251,8 @@ def test_davidson_restart_refreshes_operator_and_stays_well_conditioned():
     )
 
 
-def test_local_potential_workspace_reuses_block_buffers():
+@pytest.mark.parametrize("backend", ["numpy", "scipy"])
+def test_local_potential_workspace_reuses_block_buffers(backend):
     rng = np.random.default_rng(45)
     shape = (5, 5, 5)
     indices = np.array(
@@ -262,18 +263,15 @@ def test_local_potential_workspace_reuses_block_buffers():
     vectors = rng.normal(size=(len(indices), 2)) + 1j * rng.normal(
         size=(len(indices), 2)
     )
-    workspace = LocalPotentialWorkspace(indices, shape)
+    workspace = LocalPotentialWorkspace(indices, shape, backend=backend)
     prepared = workspace.prepare_potential(potential_g)
     first = workspace.apply(prepared, vectors)
-    assert workspace._numpy_input is not None
-    buffer_id = id(workspace._numpy_input[1])
+    buffer_id = id(workspace.scratch_pool._complex["serial_fft_input"])
     second = workspace.apply(prepared, vectors)
-    assert workspace._numpy_input is not None
-    assert id(workspace._numpy_input[1]) == buffer_id
+    assert id(workspace.scratch_pool._complex["serial_fft_input"]) == buffer_id
     workspace.apply(prepared, vectors[:, :1])
-    assert workspace._numpy_input is not None
-    assert workspace._numpy_input[0] == 1
-    assert id(workspace._numpy_input[1]) != buffer_id
+    assert id(workspace.scratch_pool._complex["serial_fft_input"]) == buffer_id
+    workspace.apply(prepared, vectors)
     expected = potential_matrix(potential_g, indices) @ vectors
     assert np.allclose(first, expected, atol=1.0e-13)
     assert np.allclose(second, expected, atol=1.0e-13)
@@ -292,11 +290,11 @@ def test_fft_scratch_pool_reuses_storage_and_indices_are_compact():
     first = workspace.coefficients_to_grid(
         coefficients, use_scratch=True
     )
-    buffer_id = id(pool._complex["real_slabs"])
+    buffer_id = id(pool._complex["serial_fft_input"])
     second = workspace.coefficients_to_grid(
         coefficients, use_scratch=True
     )
-    assert id(pool._complex["real_slabs"]) == buffer_id
+    assert id(pool._complex["serial_fft_input"]) == buffer_id
     assert np.allclose(first, second)
     assert workspace.indices.dtype == np.int32
     assert workspace.linear_slots.dtype == np.int32
@@ -328,17 +326,16 @@ def test_planned_pyfftw_workspace_matches_numpy_backend():
     fftw_result = fftw_workspace.apply(
         fftw_workspace.prepare_potential(potential_g), vectors
     )
-    assert fftw_workspace._fftw_buffer is not None
-    first_plan_ids = tuple(
-        id(item) for item in fftw_workspace._fftw_buffer[1]
+    assert len(fftw_workspace.scratch_pool._fftw_plans) == 1
+    first_buffers = next(
+        iter(fftw_workspace.scratch_pool._fftw_plans.values())
     )
+    first_plan_ids = tuple(id(item) for item in first_buffers)
     repeated = fftw_workspace.apply(
         fftw_workspace.prepare_potential(potential_g), vectors
     )
-    assert fftw_workspace._fftw_buffer is not None
-    assert tuple(
-        id(item) for item in fftw_workspace._fftw_buffer[1]
-    ) == first_plan_ids
+    repeated_buffers = next(iter(fftw_workspace.scratch_pool._fftw_plans.values()))
+    assert tuple(id(item) for item in repeated_buffers) == first_plan_ids
     assert np.allclose(fftw_result, numpy_result, atol=1.0e-12)
     assert np.allclose(repeated, numpy_result, atol=1.0e-12)
 

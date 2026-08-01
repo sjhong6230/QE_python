@@ -21,6 +21,9 @@ def scatter_scaled(
 ) -> None:
     """Clear an FFT block and scatter plane-wave coefficients into it."""
     destination[:] = 0.0
+    # Keep the C-order coefficient row contiguous here.  Although the FFT
+    # destination is a transposed view, sparse slots prevent a unit-stride
+    # destination walk and benchmarks favor contiguous coefficient reads.
     for plane in range(linear_slots.size):
         slot = linear_slots[plane]
         for vector in range(vectors.shape[1]):
@@ -34,9 +37,11 @@ def multiply_real_complex(
     product: np.ndarray,
 ) -> None:
     """Fuse the local-potential multiplication without array temporaries."""
-    for point in range(real_potential.size):
-        value = real_potential[point]
-        for vector in range(wavefunctions.shape[1]):
+    # wavefunctions/product are transposed views of C-order FFT batches, so
+    # walking points in the inner loop gives unit-stride reads and writes.
+    for vector in range(wavefunctions.shape[1]):
+        for point in range(real_potential.size):
+            value = real_potential[point]
             product[point, vector] = value * wavefunctions[point, vector]
 
 
@@ -48,6 +53,8 @@ def gather_scaled(
     scale: float,
 ) -> None:
     """Gather retained plane waves from an FFT block."""
+    # destination is an ordinary C-order (plane, vector) matrix, so vectors
+    # remain innermost even though the FFT source has the opposite layout.
     for plane in range(linear_slots.size):
         slot = linear_slots[plane]
         for vector in range(destination.shape[1]):
@@ -75,15 +82,15 @@ def accumulate_density_bands(
     factor: float,
 ) -> None:
     """Accumulate all occupied bands in one allocation-free kernel call."""
-    for point in range(density.size):
-        value = 0.0
-        for band in range(wavefunctions.shape[1]):
+    # coefficients_to_grid returns a (point, band) transposed FFT-batch view;
+    # the point index is contiguous even though it is the first index.
+    for band in range(wavefunctions.shape[1]):
+        for point in range(density.size):
             coefficient = wavefunctions[point, band]
-            value += (
+            density[point] += factor * (
                 coefficient.real * coefficient.real
                 + coefficient.imag * coefficient.imag
             )
-        density[point] += factor * value
 
 
 @njit(cache=True, nogil=True)
@@ -94,15 +101,14 @@ def accumulate_density_weighted_bands(
     kpoint_weight: float,
 ) -> None:
     """Accumulate weighted fractional-band occupations without temporaries."""
-    for point in range(density.size):
-        value = 0.0
-        for band in range(wavefunctions.shape[1]):
+    for band in range(wavefunctions.shape[1]):
+        factor = kpoint_weight * occupations[band]
+        for point in range(density.size):
             coefficient = wavefunctions[point, band]
-            value += occupations[band] * (
+            density[point] += factor * (
                 coefficient.real * coefficient.real
                 + coefficient.imag * coefficient.imag
             )
-        density[point] += kpoint_weight * value
 
 
 @njit(cache=True, nogil=True)

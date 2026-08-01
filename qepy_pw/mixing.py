@@ -97,19 +97,17 @@ class PlainBroydenMixer:
                 self.previous_residual - residual_active
             )
         if self.delta_inputs:
-            count = len(self.delta_residuals)
-            gram = np.empty((count, count))
-            projection = np.empty(count)
-            for i in range(count):
-                projection[i] = self._metric(
-                    self.delta_residuals[i], residual_active
-                )
-                for j in range(i, count):
-                    value = self._metric(
-                        self.delta_residuals[j],
-                        self.delta_residuals[i],
-                    )
-                    gram[i, j] = gram[j, i] = value
+            delta_inputs = np.stack(self.delta_inputs)
+            delta_residuals = np.stack(self.delta_residuals)
+            weighted_conjugates = (
+                delta_residuals.conj() / self.active_g2[None, :]
+            )
+            projection = self.mpi.sum_array(
+                np.real(weighted_conjugates @ residual_active)
+            )
+            gram = self.mpi.sum_array(
+                np.real(weighted_conjugates @ delta_residuals.T)
+            )
             try:
                 # QE factorizes and inverts this symmetric Gram matrix.
                 gamma = np.linalg.solve(gram, projection)
@@ -119,11 +117,8 @@ class PlainBroydenMixer:
                 gamma = np.linalg.lstsq(
                     gram, projection, rcond=1.0e-14
                 )[0]
-            for coefficient, delta_input, delta_residual in zip(
-                gamma, self.delta_inputs, self.delta_residuals
-            ):
-                current_active -= coefficient * delta_input
-                residual_active -= coefficient * delta_residual
+            current_active -= gamma @ delta_inputs
+            residual_active -= gamma @ delta_residuals
         local_mixed = (
             current_active
             + self.beta * residual_active
@@ -199,30 +194,25 @@ class DistributedBroydenMixer:
                 self.previous_residual - residual_active
             )
         if self.delta_inputs:
-            count = len(self.delta_inputs)
-            gram = np.empty((count, count))
-            projection = np.empty(count)
-            for i in range(count):
-                projection[i] = self._metric(
-                    self.delta_residuals[i], residual_active
-                )
-                for j in range(i, count):
-                    value = self._metric(
-                        self.delta_residuals[j],
-                        self.delta_residuals[i],
-                    )
-                    gram[i, j] = gram[j, i] = value
+            delta_inputs = np.stack(self.delta_inputs)
+            delta_residuals = np.stack(self.delta_residuals)
+            weighted_conjugates = (
+                delta_residuals.conj() / self.active_g2[None, :]
+            )
+            projection = self.mpi.sum_array(
+                np.real(weighted_conjugates @ residual_active)
+            )
+            gram = self.mpi.sum_array(
+                np.real(weighted_conjugates @ delta_residuals.T)
+            )
             try:
                 gamma = np.linalg.solve(gram, projection)
             except np.linalg.LinAlgError:
                 gamma = np.linalg.lstsq(
                     gram, projection, rcond=1.0e-14
                 )[0]
-            for coefficient, delta_input, delta_residual in zip(
-                gamma, self.delta_inputs, self.delta_residuals
-            ):
-                current_active -= coefficient * delta_input
-                residual_active -= coefficient * delta_residual
+            current_active -= gamma @ delta_inputs
+            residual_active -= gamma @ delta_residuals
         mixed = current + self.beta * residual
         mixed[self.active] = current_active + self.beta * residual_active
         zero = np.flatnonzero(self.local_g2 <= 1.0e-14)

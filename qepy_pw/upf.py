@@ -102,7 +102,11 @@ class LocalPotential:
                 volume * unique_q[mask] ** 2
             )
             return result[inverse].reshape(original_shape)
-        assert self.r is not None and self.rab is not None and self.vloc_ry is not None
+        assert (
+            self.r is not None
+            and self.rab is not None
+            and self.vloc_ry is not None
+        )
         beyond = np.flatnonzero(self.r > 10.0)
         count = int(beyond[0] + 1) if len(beyond) else len(self.r)
         if count % 2 == 0:
@@ -162,9 +166,69 @@ class LocalPotential:
             result[positive] = interpolated
         return result[inverse].reshape(original_shape)
 
+    def fourier_with_derivative(
+        self, q: np.ndarray, volume: float
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return ``V_loc(q)`` and its analytic radial derivative."""
+        q_array = np.asarray(q, dtype=float)
+        values = self.fourier(q_array, volume)
+        derivative = np.zeros_like(q_array)
+        positive = q_array > 1.0e-12
+        if self.coulomb:
+            derivative[positive] = -2.0 * values[positive] / q_array[positive]
+            return values, derivative
+
+        assert (
+            self.r is not None
+            and self.rab is not None
+            and self.vloc_ry is not None
+        )
+        if not np.any(positive):
+            return values, derivative
+        beyond = np.flatnonzero(self.r > 10.0)
+        count = int(beyond[0] + 1) if len(beyond) else len(self.r)
+        if count % 2 == 0:
+            count -= 1
+        count = max(1, count)
+        r = self.r[:count]
+        rab = self.rab[:count]
+        v_ha = 0.5 * self.vloc_ry[:count]
+        prefactor = 4.0 * np.pi / volume
+        positive_q = q_array[positive]
+        dq = 0.01
+        table_size = int(float(np.max(positive_q)) / dq + 4)
+        table_q = np.arange(table_size, dtype=float) * dq
+        qr = np.multiply.outer(table_q, r)
+        sinc = np.ones_like(qr)
+        np.divide(
+            np.sin(qr), table_q[:, None], out=sinc,
+            where=table_q[:, None] != 0.0,
+        )
+        sinc[0] = r
+        short_radial = r * v_ha + self.z_valence * erf(r)
+        table = prefactor * _qe_simpson(
+            sinc * short_radial[None, :], rab, axis=1
+        )
+        _, table_derivative = _qe_cubic_interpolate_with_derivative(
+            table, positive_q, dq
+        )
+        tail = (
+            -prefactor
+            * self.z_valence
+            * np.exp(-0.25 * positive_q**2)
+            / positive_q**2
+        )
+        derivative[positive] = table_derivative + tail * (
+            -0.5 * positive_q - 2.0 / positive_q
+        )
+        return values, derivative
+
     @property
     def number_of_projector_channels(self) -> int:
-        return sum(2 * projector.angular_momentum + 1 for projector in self.projectors)
+        return sum(
+            2 * projector.angular_momentum + 1
+            for projector in self.projectors
+        )
 
     def radial_projector_fourier(self, q: np.ndarray, volume: float) -> np.ndarray:
         """Return QE-normalized radial beta transforms, shape ``(nq, nbeta)``."""
@@ -224,6 +288,19 @@ class LocalPotential:
             - table[lower + 2] * (fraction * u * w / 2.0)[:, None]
             + table[lower + 3] * (fraction * u * v / 6.0)[:, None]
         )
+
+    def radial_projector_fourier_with_derivative(
+        self, q: np.ndarray, volume: float
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return radial beta tables and exact cubic-interpolant derivatives."""
+        values = self.radial_projector_fourier(q, volume)
+        if values.shape[1] == 0:
+            return values, np.empty_like(values)
+        assert self._projector_table is not None
+        _, derivative = _qe_cubic_interpolate_with_derivative(
+            self._projector_table, np.asarray(q, dtype=float).reshape(-1), 0.01
+        )
+        return values, derivative
 
     @property
     def has_nlcc(self) -> bool:
@@ -346,6 +423,42 @@ class LocalPotential:
             self._expanded_projector_coupling = coupling
         return beta_matrix, coupling
 
+    def projector_basis_with_gradient(
+        self, gk: np.ndarray, volume: float
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Build beta projectors and analytic Cartesian q-space gradients."""
+        gk = np.asarray(gk, dtype=float)
+        beta, coupling = self.projector_basis(gk, volume)
+        if beta.shape[1] == 0:
+            return beta, coupling, np.empty((len(gk), 0, 3), dtype=complex)
+        q = np.linalg.norm(gk, axis=1)
+        radial, radial_derivative = (
+            self.radial_projector_fourier_with_derivative(q, volume)
+        )
+        radial_direction = np.zeros_like(gk)
+        nonzero = q > 1.0e-14
+        radial_direction[nonzero] = gk[nonzero] / q[nonzero, None]
+        gradients: list[np.ndarray] = []
+        for projector_index, projector in enumerate(self.projectors):
+            harmonics, harmonic_gradient = (
+                _qe_real_spherical_harmonics_with_gradient(
+                    projector.angular_momentum, gk, q
+                )
+            )
+            angular_phase = (-1j) ** projector.angular_momentum
+            for channel in range(2 * projector.angular_momentum + 1):
+                gradients.append(
+                    angular_phase
+                    * (
+                        radial_derivative[:, projector_index, None]
+                        * radial_direction
+                        * harmonics[:, channel, None]
+                        + radial[:, projector_index, None]
+                        * harmonic_gradient[:, channel, :]
+                    )
+                )
+        return beta, coupling, np.stack(gradients, axis=1)
+
     def atomic_projectors(
         self, gk: np.ndarray, position: np.ndarray, volume: float
     ) -> tuple[np.ndarray, np.ndarray]:
@@ -463,7 +576,11 @@ def _qe_real_spherical_harmonics(
 ) -> np.ndarray:
     """Real harmonics in QE ``ylmr2`` order: m=0, cos(1), sin(1), ..."""
     vectors = np.asarray(vectors, dtype=float)
-    q = np.linalg.norm(vectors, axis=1) if lengths is None else np.asarray(lengths)
+    q = (
+        np.linalg.norm(vectors, axis=1)
+        if lengths is None
+        else np.asarray(lengths)
+    )
     safe = q > 1.0e-14
     theta = np.zeros(len(q))
     theta[safe] = np.arccos(np.clip(vectors[safe, 2] / q[safe], -1.0, 1.0))
@@ -486,6 +603,148 @@ def _qe_real_spherical_harmonics(
     return np.column_stack(values)
 
 
+def _qe_real_spherical_harmonics_with_gradient(
+    angular_momentum: int,
+    vectors: np.ndarray,
+    lengths: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return QE real harmonics and analytic Cartesian gradients."""
+    vectors = np.asarray(vectors, dtype=float)
+    q = (
+        np.linalg.norm(vectors, axis=1)
+        if lengths is None
+        else np.asarray(lengths)
+    )
+    values = _qe_real_spherical_harmonics(angular_momentum, vectors, q)
+    gradients = np.zeros((len(q), values.shape[1], 3))
+    if angular_momentum == 0:
+        return values, gradients
+
+    transverse = np.hypot(vectors[:, 0], vectors[:, 1])
+    safe = (q > 1.0e-14) & (transverse > 1.0e-14)
+    theta = np.arccos(
+        np.clip(vectors[safe, 2] / q[safe], -1.0, 1.0)
+    )
+    phi = np.arctan2(vectors[safe, 1], vectors[safe, 0])
+    theta_gradient = np.column_stack(
+        (
+            vectors[safe, 2] * vectors[safe, 0]
+            / (q[safe] ** 2 * transverse[safe]),
+            vectors[safe, 2] * vectors[safe, 1]
+            / (q[safe] ** 2 * transverse[safe]),
+            -transverse[safe] / q[safe] ** 2,
+        )
+    )
+    phi_gradient = np.column_stack(
+        (
+            -vectors[safe, 1] / transverse[safe] ** 2,
+            vectors[safe, 0] / transverse[safe] ** 2,
+            np.zeros(np.count_nonzero(safe)),
+        )
+    )
+    derivative_columns: list[np.ndarray] = []
+    for m in range(angular_momentum + 1):
+        harmonic = _complex_spherical_harmonic(
+            angular_momentum, m, theta, phi
+        )
+        derivative_theta = (
+            m * np.cos(theta) / np.sin(theta) * harmonic
+        )
+        if m < angular_momentum:
+            derivative_theta += (
+                np.sqrt(
+                    (angular_momentum - m)
+                    * (angular_momentum + m + 1)
+                )
+                * np.exp(-1j * phi)
+                * _complex_spherical_harmonic(
+                    angular_momentum, m + 1, theta, phi
+                )
+            )
+        derivative_phi = 1j * m * harmonic
+        complex_gradient = (
+            derivative_theta[:, None] * theta_gradient
+            + derivative_phi[:, None] * phi_gradient
+        )
+        if m == 0:
+            derivative_columns.append(np.real(complex_gradient))
+        else:
+            derivative_columns.extend(
+                [
+                    np.sqrt(2.0) * np.real(complex_gradient),
+                    np.sqrt(2.0) * np.imag(complex_gradient),
+                ]
+            )
+    if np.any(safe):
+        gradients[safe] = np.stack(derivative_columns, axis=1)
+
+    # At a polar axis theta/phi coordinates are singular, but the Cartesian
+    # limits are finite. Only the |m|=1 channels have nonzero first derivative.
+    polar = (q > 1.0e-14) & ~safe
+    if np.any(polar):
+        coefficient = 0.5 * np.sqrt(
+            (2 * angular_momentum + 1)
+            * angular_momentum
+            * (angular_momentum + 1)
+            / (4.0 * np.pi)
+        )
+        positive_z = vectors[polar, 2] >= 0.0
+        derivative_theta = np.where(
+            positive_z,
+            -coefficient,
+            (-1) ** (angular_momentum + 1) * coefficient,
+        )
+        direction = np.where(positive_z, 1.0, -1.0) / q[polar]
+        complex_gradient = np.column_stack(
+            (
+                direction * derivative_theta,
+                1j * direction * derivative_theta,
+                np.zeros(np.count_nonzero(polar), dtype=complex),
+            )
+        )
+        # QE order is m=0, Re(m=1), Im(m=1), ... .
+        gradients[polar, 1, :] = np.sqrt(2.0) * np.real(complex_gradient)
+        gradients[polar, 2, :] = np.sqrt(2.0) * np.imag(complex_gradient)
+    return values, gradients
+
+
+def _qe_cubic_interpolate_with_derivative(
+    table: np.ndarray, q: np.ndarray, dq: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """QE four-point cubic interpolation and its analytic derivative."""
+    q = np.asarray(q, dtype=float).reshape(-1)
+    scaled = q / dq
+    lower = np.floor(scaled).astype(int)
+    fraction = scaled - lower
+    u = 1.0 - fraction
+    v = 2.0 - fraction
+    w = 3.0 - fraction
+    weights = np.column_stack(
+        (
+            u * v * w / 6.0,
+            fraction * v * w / 2.0,
+            -fraction * u * w / 2.0,
+            fraction * u * v / 6.0,
+        )
+    )
+    derivatives = np.column_stack(
+        (
+            -(v * w + u * w + u * v) / 6.0,
+            (v * w - fraction * (v + w)) / 2.0,
+            -(u * w - fraction * (u + w)) / 2.0,
+            (u * v - fraction * (u + v)) / 6.0,
+        )
+    ) / dq
+    samples = np.stack(
+        [table[lower + offset] for offset in range(4)], axis=1
+    )
+    expand = (slice(None), slice(None)) + (None,) * (table.ndim - 1)
+    return (
+        np.sum(samples * weights[expand], axis=1),
+        np.sum(samples * derivatives[expand], axis=1),
+    )
+
+
 def _qe_simpson(values: np.ndarray, rab: np.ndarray, axis: int = -1) -> np.ndarray:
     """QE's ``upflib/simpsn.f90`` quadrature on an arbitrary radial grid."""
     values = np.asarray(values)
@@ -496,9 +755,11 @@ def _qe_simpson(values: np.ndarray, rab: np.ndarray, axis: int = -1) -> np.ndarr
     weights = np.zeros(size)
     weights[0] = 1.0
     weights[-1] = 1.0
-    for python_index in range(1, size - 1):
-        fortran_index = python_index + 1
-        weights[python_index] = 4.0 if fortran_index % 2 == 0 else 2.0
+    # Python index 1 is Fortran index 2, so odd Python positions carry the
+    # Simpson factor four.  Slice assignment avoids the scalar translation
+    # loop while retaining QE's one-based parity exactly.
+    weights[1:-1:2] = 4.0
+    weights[2:-1:2] = 2.0
     if size % 2 == 0:
         weights[-3] -= 0.25
         weights[-2] += 1.0

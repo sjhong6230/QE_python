@@ -27,6 +27,9 @@ class FFTScratchPool:
 
     def __init__(self) -> None:
         self._complex: dict[str, np.ndarray] = {}
+        self._fftw_plans: dict[
+            tuple[object, ...], tuple[object, ...]
+        ] = {}
 
     def complex_buffer(
         self,
@@ -152,8 +155,6 @@ class LocalPotentialWorkspace:
                 "py_fft_planner must be 'estimate', 'measure', or 'patient'"
             )
         self.planner_flag = efforts[effort]
-        self._numpy_input: tuple[int, np.ndarray] | None = None
-        self._fftw_buffer: tuple[int, tuple[object, ...]] | None = None
         if self.backend == "pyfftw":
             try:
                 import pyfftw
@@ -171,7 +172,7 @@ class LocalPotentialWorkspace:
     def prepare_potential(self, potential_g: np.ndarray) -> np.ndarray:
         """Transform a fixed local potential once per Hamiltonian."""
         values = potential_g * self.size
-        if self.backend == "scipy":
+        if self.backend in {"scipy", "pyfftw"}:
             return np.real(
                 scipy_fft.ifftn(
                     values,
@@ -185,7 +186,7 @@ class LocalPotentialWorkspace:
     def _backward_fft(
         self, values: np.ndarray, axes: tuple[int, ...]
     ) -> np.ndarray:
-        if self.backend == "scipy":
+        if self.backend in {"scipy", "pyfftw"}:
             return scipy_fft.ifftn(
                 values,
                 axes=axes,
@@ -197,7 +198,7 @@ class LocalPotentialWorkspace:
     def _forward_fft(
         self, values: np.ndarray, axes: tuple[int, ...]
     ) -> np.ndarray:
-        if self.backend == "scipy":
+        if self.backend in {"scipy", "pyfftw"}:
             return scipy_fft.fftn(
                 values,
                 axes=axes,
@@ -227,6 +228,47 @@ class LocalPotentialWorkspace:
                 "coefficients must contain the rank-local G-vector rows"
             )
         number_of_vectors = vectors.shape[1]
+        if self.mpi.size == 1:
+            band_slots = (slice(None),) + self.slots
+            if self.backend == "pyfftw" and use_scratch:
+                (
+                    reciprocal_input,
+                    real_grid,
+                    _product,
+                    _transformed,
+                    backward,
+                    _forward,
+                ) = self._planned_buffers(number_of_vectors)
+                reciprocal_input.fill(0.0)
+                reciprocal_input[band_slots] = vectors.T * self.size
+                timer = (
+                    self.timers.measure("fftw")
+                    if self.timers is not None
+                    else nullcontext()
+                )
+                with timer:
+                    backward(normalise_idft=True)
+            else:
+                reciprocal_input = (
+                    self._numpy_buffers(number_of_vectors)
+                    if use_scratch
+                    else np.zeros(
+                        (number_of_vectors,) + self.shape,
+                        dtype=complex,
+                    )
+                )
+                reciprocal_input[band_slots] = vectors.T * self.size
+                timer = (
+                    self.timers.measure("fftw")
+                    if self.timers is not None
+                    else nullcontext()
+                )
+                with timer:
+                    real_grid = self._backward_fft(
+                        reciprocal_input, (1, 2, 3)
+                    )
+            result = np.moveaxis(real_grid, 0, -1)
+            return result[..., 0] if was_vector else result
         local_sticks = self.sticks_by_rank[self.mpi.rank]
         stick_shape = (
             self.shape[2],
@@ -426,24 +468,25 @@ class LocalPotentialWorkspace:
     def _numpy_buffers(
         self, number_of_vectors: int
     ) -> np.ndarray:
-        cached = self._numpy_input
-        if cached is None or cached[0] != number_of_vectors:
-            block_shape = self.shape + (number_of_vectors,)
-            cached = (
-                number_of_vectors,
-                np.zeros(block_shape, dtype=complex),
-            )
-            self._numpy_input = cached
-        return cached[1]
+        block_shape = (number_of_vectors,) + self.shape
+        return self.scratch_pool.complex_buffer(
+            "serial_fft_input", block_shape, zero=True
+        )
 
     def _planned_buffers(
         self, number_of_vectors: int
     ) -> tuple[object, ...]:
-        cached = self._fftw_buffer
-        if cached is not None and cached[0] == number_of_vectors:
-            return cached[1]
+        cache_key = (
+            self.shape,
+            number_of_vectors,
+            self.threads,
+            self.planner_flag,
+        )
+        cached = self.scratch_pool._fftw_plans.get(cache_key)
+        if cached is not None:
+            return cached
         pyfftw = self._pyfftw
-        block_shape = self.shape + (number_of_vectors,)
+        block_shape = (number_of_vectors,) + self.shape
         reciprocal_input = pyfftw.empty_aligned(
             block_shape, dtype="complex128"
         )
@@ -459,7 +502,7 @@ class LocalPotentialWorkspace:
         backward = pyfftw.FFTW(
             reciprocal_input,
             real_output,
-            axes=(0, 1, 2),
+            axes=(1, 2, 3),
             direction="FFTW_BACKWARD",
             flags=(self.planner_flag,),
             threads=self.threads,
@@ -467,7 +510,7 @@ class LocalPotentialWorkspace:
         forward = pyfftw.FFTW(
             product_input,
             reciprocal_output,
-            axes=(0, 1, 2),
+            axes=(1, 2, 3),
             direction="FFTW_FORWARD",
             flags=(self.planner_flag,),
             threads=self.threads,
@@ -480,7 +523,7 @@ class LocalPotentialWorkspace:
             backward,
             forward,
         )
-        self._fftw_buffer = (number_of_vectors, buffers)
+        self.scratch_pool._fftw_plans[cache_key] = buffers
         return buffers
 
     def apply(
@@ -502,21 +545,21 @@ class LocalPotentialWorkspace:
                 "(nplane_local,) or (nplane_local, nvec)"
             )
         number_of_vectors = vectors.shape[1]
-        if self.mpi.size > 1 or self.backend == "scipy":
+        if self.mpi.size > 1:
             result = self._distributed_apply(real_potential, vectors)
             return result[:, 0] if was_vector else result
         if self.backend in {"numpy", "scipy"}:
             reciprocal_input = self._numpy_buffers(number_of_vectors)
             if self.use_numba:
                 self._jit.scatter_scaled(
-                    reciprocal_input.reshape(self.size, number_of_vectors),
+                    reciprocal_input.reshape(number_of_vectors, self.size).T,
                     self.linear_slots,
                     vectors,
                     float(self.size),
                 )
             else:
                 reciprocal_input.fill(0.0)
-                reciprocal_input[self.slots] = vectors * self.size
+                reciprocal_input[(slice(None),) + self.slots] = vectors.T * self.size
             timer = (
                 self.timers.measure("fftw")
                 if self.timers is not None
@@ -524,21 +567,21 @@ class LocalPotentialWorkspace:
             )
             with timer:
                 real_wavefunctions = self._backward_fft(
-                    reciprocal_input, (0, 1, 2)
+                    reciprocal_input, (1, 2, 3)
                 )
             if self.use_numba:
                 self._jit.multiply_real_complex(
                     real_potential.reshape(self.size),
                     real_wavefunctions.reshape(
-                        self.size, number_of_vectors
-                    ),
+                        number_of_vectors, self.size
+                    ).T,
                     real_wavefunctions.reshape(
-                        self.size, number_of_vectors
-                    ),
+                        number_of_vectors, self.size
+                    ).T,
                 )
             else:
                 np.multiply(
-                    real_potential[..., None],
+                    real_potential[None, ...],
                     real_wavefunctions,
                     out=real_wavefunctions,
                 )
@@ -549,18 +592,19 @@ class LocalPotentialWorkspace:
             )
             with timer:
                 transformed = self._forward_fft(
-                    real_wavefunctions, (0, 1, 2)
-                ) / self.size
+                    real_wavefunctions, (1, 2, 3)
+                )
+                transformed /= self.size
             if self.use_numba:
                 result = np.empty_like(vectors)
                 self._jit.gather_scaled(
-                    transformed.reshape(self.size, number_of_vectors),
+                    transformed.reshape(number_of_vectors, self.size).T,
                     self.linear_slots,
                     result,
                     1.0,
                 )
             else:
-                result = transformed[self.slots]
+                result = transformed[(slice(None),) + self.slots].T
         else:
             (
                 reciprocal_input,
@@ -572,14 +616,14 @@ class LocalPotentialWorkspace:
             ) = self._planned_buffers(number_of_vectors)
             if self.use_numba:
                 self._jit.scatter_scaled(
-                    reciprocal_input.reshape(self.size, number_of_vectors),
+                    reciprocal_input.reshape(number_of_vectors, self.size).T,
                     self.linear_slots,
                     vectors,
                     float(self.size),
                 )
             else:
                 reciprocal_input.fill(0.0)
-                reciprocal_input[self.slots] = vectors * self.size
+                reciprocal_input[(slice(None),) + self.slots] = vectors.T * self.size
             timer = (
                 self.timers.measure("fftw")
                 if self.timers is not None
@@ -591,13 +635,13 @@ class LocalPotentialWorkspace:
                 self._jit.multiply_real_complex(
                     real_potential.reshape(self.size),
                     real_wavefunctions.reshape(
-                        self.size, number_of_vectors
-                    ),
-                    product.reshape(self.size, number_of_vectors),
+                        number_of_vectors, self.size
+                    ).T,
+                    product.reshape(number_of_vectors, self.size).T,
                 )
             else:
                 np.multiply(
-                    real_potential[..., None],
+                    real_potential[None, ...],
                     real_wavefunctions,
                     out=product,
                 )
@@ -611,13 +655,13 @@ class LocalPotentialWorkspace:
             if self.use_numba:
                 result = np.empty_like(vectors)
                 self._jit.gather_scaled(
-                    transformed.reshape(self.size, number_of_vectors),
+                    transformed.reshape(number_of_vectors, self.size).T,
                     self.linear_slots,
                     result,
                     1.0 / self.size,
                 )
             else:
-                result = transformed[self.slots] / self.size
+                result = transformed[(slice(None),) + self.slots].T / self.size
         return result[:, 0] if was_vector else result
 
 

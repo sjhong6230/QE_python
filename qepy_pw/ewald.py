@@ -229,3 +229,102 @@ def ewald_forces(
                 forces[left_index] -= energy_gradient
                 forces[right_index] += energy_gradient
     return forces
+
+
+def ewald_stress(
+    lattice: np.ndarray,
+    positions: np.ndarray,
+    charges: np.ndarray,
+    ecutrho_ry: float,
+) -> np.ndarray:
+    """Return analytic compressive-positive Ewald stress in Ha/bohr**3."""
+    lattice = np.asarray(lattice, dtype=float)
+    positions = np.asarray(positions, dtype=float)
+    charges = np.asarray(charges, dtype=float)
+    volume = abs(float(np.linalg.det(lattice)))
+    reciprocal = 2.0 * np.pi * np.linalg.inv(lattice).T
+    total_charge = float(np.sum(charges))
+
+    alpha = 2.9
+    while True:
+        alpha -= 0.1
+        upper_bound = (
+            2.0
+            * total_charge**2
+            * np.sqrt(alpha / np.pi)
+            * erfc(np.sqrt(ecutrho_ry / (4.0 * alpha)))
+        )
+        if upper_bound <= 1.0e-7:
+            break
+        if alpha <= 0.0:
+            raise RuntimeError("optimal Ewald alpha not found")
+
+    g_vectors, g2 = _integer_vectors_within_cutoff(
+        reciprocal, ecutrho_ry
+    )
+    nonzero = g2 > 1.0e-14
+    g_vectors = g_vectors[nonzero]
+    g2 = g2[nonzero]
+    structure = np.sum(
+        charges[:, None]
+        * np.exp(-1j * (positions @ g_vectors.T)),
+        axis=0,
+    )
+    reciprocal_terms = (
+        np.abs(structure) ** 2
+        * np.exp(-g2 / (4.0 * alpha))
+        / g2
+    )
+    reciprocal_scalar = (
+        -total_charge**2 / (4.0 * alpha)
+        + float(np.sum(reciprocal_terms))
+    )
+    stress = 2.0 * np.pi / volume**2 * (
+        reciprocal_scalar * np.eye(3)
+        - 2.0
+        * np.einsum(
+            "g,gi,gj->ij",
+            reciprocal_terms * (1.0 / (4.0 * alpha) + 1.0 / g2),
+            g_vectors,
+            g_vectors,
+        )
+    )
+
+    radius = 4.0 / np.sqrt(alpha)
+    minimum_stretch = float(
+        np.linalg.svd(lattice, compute_uv=False)[-1]
+    )
+    root_alpha = np.sqrt(alpha)
+    for left, left_charge in zip(positions, charges):
+        for right, right_charge in zip(positions, charges):
+            displacement0 = left - right
+            bound = int(
+                np.ceil(
+                    (radius + np.linalg.norm(displacement0))
+                    / minimum_stretch
+                )
+            ) + 1
+            for image in itertools.product(
+                range(-bound, bound + 1), repeat=3
+            ):
+                displacement = displacement0 + np.asarray(image) @ lattice
+                distance = float(np.linalg.norm(displacement))
+                if distance < 1.0e-14 or distance > radius:
+                    continue
+                radial_derivative = (
+                    -erfc(root_alpha * distance) / distance**2
+                    - 2.0
+                    * root_alpha
+                    / np.sqrt(np.pi)
+                    * np.exp(-alpha * distance**2)
+                    / distance
+                )
+                stress -= (
+                    0.25
+                    * left_charge
+                    * right_charge
+                    * radial_derivative
+                    / (volume * distance)
+                    * np.outer(displacement, displacement)
+                )
+    return 0.5 * (stress + stress.T)

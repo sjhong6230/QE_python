@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from importlib.util import find_spec
 import time
 from typing import Callable
 
@@ -27,7 +28,7 @@ from .diagonalization import (
     davidson,
 )
 from .errors import QEInputError, UnsupportedFeatureError
-from .ewald import ewald_energy, ewald_forces
+from .ewald import ewald_energy, ewald_forces, ewald_stress
 from .input import PWInput
 from .mixing import (
     DistributedBroydenMixer,
@@ -574,24 +575,24 @@ def _xc_energy_potential(
         raise ValueError("PBE requires an FFT workspace and reciprocal vectors")
 
     coefficients = workspace.grid_to_coefficients(density)
-    gradient = np.empty((3, *density.shape), dtype=float)
-    for axis in range(3):
-        gradient[axis] = np.real(
-            workspace.coefficients_to_grid(
-                1j * g_vectors[:, axis] * coefficients
-            )
-        )
+    gradient = np.moveaxis(
+        workspace.coefficients_to_grid(
+            1j * g_vectors * coefficients[:, None]
+        ),
+        -1,
+        0,
+    ).real
 
     def divergence(field: np.ndarray) -> np.ndarray:
-        result = np.zeros_like(density, dtype=float)
-        for axis in range(3):
-            flux_coefficients = workspace.grid_to_coefficients(field[axis])
-            result += np.real(
-                workspace.coefficients_to_grid(
-                    1j * g_vectors[:, axis] * flux_coefficients
-                )
-            )
-        return result
+        # Put Cartesian components last while entering the FFT workspace: its
+        # C-order batch layout then keeps grid points contiguous in memory.
+        flux_coefficients = workspace.grid_to_coefficients(
+            np.moveaxis(field, 0, -1)
+        )
+        derivatives = workspace.coefficients_to_grid(
+            1j * g_vectors * flux_coefficients
+        )
+        return np.sum(derivatives.real, axis=-1)
 
     return pbe_unpolarized(density, gradient, divergence)
 
@@ -943,24 +944,21 @@ def _nonlocal_energy_and_forces(
             )
             if result is None:
                 continue
-            for axis in range(3):
-                derivative_overlap = mpi.sum_array(
-                    beta.conj().T
-                    @ (1j * gk[:, axis, None] * modulated)
+            derivative_source = (
+                1j * gk[:, :, None] * modulated[:, None, :]
+            ).reshape(len(gk), -1)
+            derivative_overlap = mpi.sum_array(
+                beta.conj().T @ derivative_source
+            ).reshape(beta.shape[1], 3, band_count)
+            result[atom_index] -= 2.0 * float(weight) * np.real(
+                np.einsum(
+                    "pab,pb,b->a",
+                    np.conjugate(derivative_overlap),
+                    coupled,
+                    occupation_weights,
+                    optimize=True,
                 )
-                result[atom_index, axis] -= (
-                    2.0
-                    * float(weight)
-                    * float(
-                        np.real(
-                            np.sum(
-                                np.conjugate(derivative_overlap)
-                                * coupled
-                                * occupation_weights[None, :]
-                            )
-                        )
-                    )
-                )
+            )
     return energy, result
 
 
@@ -1006,153 +1004,6 @@ def _local_and_core_forces(
     return mpi.sum_array(local), mpi.sum_array(core)
 
 
-def _fixed_state_energy(
-    pw: PWInput,
-    pseudos: dict[str, LocalPotential],
-    lattice: np.ndarray,
-    positions: np.ndarray,
-    bases: list[PlaneWaveBasis],
-    eigenvectors: list[np.ndarray],
-    weights: np.ndarray,
-    occupations: list[np.ndarray],
-    shape: tuple[int, int, int],
-    charge_indices: np.ndarray,
-    charge_workspace: LocalPotentialWorkspace,
-    local_workspaces: list[LocalPotentialWorkspace],
-    density_symmetrizer: DensitySymmetrizer,
-    ecutrho: float,
-    xc_functional: str,
-    use_numba: bool,
-    mpi: MPIContext,
-    nelec: float,
-    charges: np.ndarray,
-) -> float:
-    """Evaluate the HF energy at fixed plane-wave coefficients after strain."""
-    volume = abs(float(np.linalg.det(lattice)))
-    reciprocal = 2.0 * np.pi * np.linalg.inv(lattice).T
-    strained_bases: list[PlaneWaveBasis] = []
-    kinetic_energy = 0.0
-    for point, basis, vectors, weight, workspace, band_occupations in zip(
-        pw.kpoints,
-        bases,
-        eigenvectors,
-        weights,
-        local_workspaces,
-        occupations,
-    ):
-        gk = (basis.indices + point.crystal) @ reciprocal
-        kinetic = 0.5 * np.einsum("ij,ij->i", gk, gk)
-        strained_basis = PlaneWaveBasis(basis.indices, gk, kinetic)
-        strained_bases.append(strained_basis)
-        local_rows = (
-            workspace.local_plane_wave_indices
-            if mpi.size > 1
-            else np.arange(len(basis.indices))
-        )
-        kinetic_energy += float(weight) * mpi.sum_scalar(
-            float(
-                np.sum(
-                    np.abs(vectors[:, : len(band_occupations)]) ** 2
-                    * kinetic[local_rows, None]
-                    * band_occupations[None, :]
-                )
-            )
-        )
-
-    density = _density_from_states(
-        eigenvectors,
-        strained_bases,
-        weights,
-        occupations,
-        shape,
-        volume,
-        nelec,
-        use_numba,
-        mpi,
-        local_workspaces,
-    )
-    if pw.full_kpoint_count > len(pw.kpoints):
-        density = density_symmetrizer.apply(density)
-        total_density = mpi.sum_scalar(float(np.sum(density)))
-        density *= nelec * np.prod(shape) / (total_density * volume)
-    local_rows = charge_workspace.local_plane_wave_indices
-    g_vectors = charge_indices[local_rows] @ reciprocal
-    g2 = np.einsum("ij,ij->i", g_vectors, g_vectors)
-    q = np.sqrt(g2)
-    density_g = charge_workspace.grid_to_coefficients(density)
-
-    ionic_coefficients = np.zeros_like(density_g)
-    core_coefficients = np.zeros_like(density_g)
-    strained_pw = PWInput(
-        control=pw.control,
-        system=pw.system,
-        electrons=pw.electrons,
-        lattice=lattice,
-        species=pw.species,
-        atoms=[
-            type(atom)(atom.label, position)
-            for atom, position in zip(pw.atoms, positions)
-        ],
-        kpoints=pw.kpoints,
-        kpoint_mode=pw.kpoint_mode,
-        full_kpoint_count=pw.full_kpoint_count,
-        symmetry_operations=pw.symmetry_operations,
-        source=pw.source,
-    )
-    for atom in strained_pw.atoms:
-        pseudo = pseudos[atom.label]
-        phase = np.exp(-1j * (g_vectors @ atom.position))
-        ionic_coefficients += pseudo.fourier(q, volume) * phase
-        if pseudo.has_nlcc:
-            core_coefficients += (
-                pseudo.core_density_fourier(q, volume) * phase
-            )
-    local_energy = volume * mpi.sum_scalar(
-        float(np.real(np.vdot(density_g, ionic_coefficients)))
-    )
-    hartree_coefficients = np.zeros_like(density_g)
-    nonzero = g2 > 1.0e-14
-    hartree_coefficients[nonzero] = (
-        4.0 * np.pi * density_g[nonzero] / g2[nonzero]
-    )
-    hartree_energy = 0.5 * volume * mpi.sum_scalar(
-        float(np.real(np.vdot(density_g, hartree_coefficients)))
-    )
-    core_density = np.real(
-        charge_workspace.coefficients_to_grid(core_coefficients)
-    )
-    epsilon_xc, _ = _xc_energy_potential(
-        density + core_density,
-        xc_functional,
-        use_numba=use_numba,
-        workspace=charge_workspace,
-        g_vectors=g_vectors,
-    )
-    xc_energy = volume / np.prod(shape) * mpi.sum_scalar(
-        float(np.sum((density + core_density) * epsilon_xc))
-    )
-    nonlocal_energy, _ = _nonlocal_energy_and_forces(
-        strained_pw,
-        pseudos,
-        strained_bases,
-        eigenvectors,
-        weights,
-        occupations,
-        mpi,
-        local_workspaces,
-        forces=False,
-    )
-    ion_energy = ewald_energy(lattice, positions, charges, ecutrho)
-    return (
-        kinetic_energy
-        + local_energy
-        + nonlocal_energy
-        + hartree_energy
-        + xc_energy
-        + ion_energy
-    )
-
-
 def _hellmann_feynman_stress(
     pw: PWInput,
     pseudos: dict[str, LocalPotential],
@@ -1160,84 +1011,204 @@ def _hellmann_feynman_stress(
     eigenvectors: list[np.ndarray],
     weights: np.ndarray,
     occupations: list[np.ndarray],
+    density: np.ndarray,
     shape: tuple[int, int, int],
     charge_indices: np.ndarray,
     charge_workspace: LocalPotentialWorkspace,
     local_workspaces: list[LocalPotentialWorkspace],
-    density_symmetrizer: DensitySymmetrizer,
     ecutrho: float,
     xc_functional: str,
     use_numba: bool,
     mpi: MPIContext,
-    nelec: float,
     charges: np.ndarray,
 ) -> np.ndarray:
-    """Return compressive-positive HF stress in Ha/bohr^3."""
-    step = float(pw.control.get("py_stress_step", 2.0e-4))
-    if step <= 0.0:
-        raise QEInputError("py_stress_step must be positive")
-    identity = np.eye(3)
-    original_positions = np.array([atom.position for atom in pw.atoms])
+    """Return analytic compressive-positive HF stress in Ha/bohr^3."""
+    if xc_functional != "pz":
+        raise UnsupportedFeatureError(
+            "analytic stress is currently implemented for LDA/PZ only"
+        )
+    if any(pseudo.has_nlcc for pseudo in pseudos.values()):
+        raise UnsupportedFeatureError(
+            "analytic NLCC stress is not yet implemented"
+        )
+
+    volume = pw.volume
     stress = np.zeros((3, 3))
-    for left in range(3):
-        for right in range(left, 3):
-            generator = np.zeros((3, 3))
-            if left == right:
-                generator[left, right] = 1.0
-            else:
-                generator[left, right] = 0.5
-                generator[right, left] = 0.5
-            plus = identity + step * generator
-            minus = identity - step * generator
-            energy_plus = _fixed_state_energy(
-                pw,
-                pseudos,
-                pw.lattice @ plus,
-                original_positions @ plus,
-                bases,
-                eigenvectors,
-                weights,
-                occupations,
-                shape,
-                charge_indices,
-                charge_workspace,
-                local_workspaces,
-                density_symmetrizer,
-                ecutrho,
-                xc_functional,
-                use_numba,
-                mpi,
-                nelec,
-                charges,
+
+    # Kinetic term: fixed reduced-coordinate coefficients and k points imply
+    # d(G+k)/d strain = -(G+k) strain.
+    kinetic_stress = np.zeros((3, 3))
+    for basis, vectors, weight, workspace, band_occupations in zip(
+        bases, eigenvectors, weights, local_workspaces, occupations
+    ):
+        local_rows = (
+            workspace.local_plane_wave_indices
+            if mpi.size > 1
+            else np.arange(len(basis.indices))
+        )
+        gk = basis.vectors[local_rows]
+        band_count = len(band_occupations)
+        plane_wave_weight = np.sum(
+            np.abs(vectors[:, :band_count]) ** 2
+            * np.asarray(band_occupations)[None, :],
+            axis=1,
+        )
+        kinetic_stress += float(weight) * mpi.sum_array(
+            np.einsum("g,gi,gj->ij", plane_wave_weight, gk, gk)
+        ) / volume
+    stress += kinetic_stress
+
+    local_charge_rows = charge_workspace.local_plane_wave_indices
+    g_vectors = charge_indices[local_charge_rows] @ pw.reciprocal
+    g2 = np.einsum("gi,gi->g", g_vectors, g_vectors)
+    q = np.sqrt(g2)
+    density_g = charge_workspace.grid_to_coefficients(density)
+
+    # Local pseudopotential. Atomic phases are invariant when cell and ions
+    # undergo the same homogeneous deformation; only Omega^-1 and |G| vary.
+    local_energy = 0.0
+    local_tensor = np.zeros((3, 3))
+    radial_mask = q > 1.0e-14
+    local_radial: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for atom in pw.atoms:
+        if atom.label not in local_radial:
+            local_radial[atom.label] = pseudos[
+                atom.label
+            ].fourier_with_derivative(q, volume)
+        potential, radial_derivative = local_radial[atom.label]
+        phase = np.exp(-1j * (g_vectors @ atom.position))
+        coefficient = potential * phase
+        local_energy += volume * mpi.sum_scalar(
+            float(np.real(np.vdot(density_g, coefficient)))
+        )
+        radial_weight = np.zeros_like(q)
+        radial_weight[radial_mask] = np.real(
+            np.conjugate(density_g[radial_mask])
+            * radial_derivative[radial_mask]
+            * phase[radial_mask]
+        ) / q[radial_mask]
+        local_tensor += mpi.sum_array(
+            np.einsum("g,gi,gj->ij", radial_weight, g_vectors, g_vectors)
+        )
+    stress += local_tensor + local_energy / volume * np.eye(3)
+
+    # Hartree term, obtained by differentiating 4*pi/G^2 and the two
+    # Omega^-1 density coefficients.
+    nonzero = g2 > 1.0e-14
+    hartree_energy = 2.0 * np.pi * volume * mpi.sum_scalar(
+        float(np.sum(np.abs(density_g[nonzero]) ** 2 / g2[nonzero]))
+    )
+    hartree_tensor = np.zeros((3, 3))
+    if np.any(nonzero):
+        hartree_tensor = -4.0 * np.pi * mpi.sum_array(
+            np.einsum(
+                "g,gi,gj->ij",
+                np.abs(density_g[nonzero]) ** 2 / g2[nonzero] ** 2,
+                g_vectors[nonzero],
+                g_vectors[nonzero],
             )
-            energy_minus = _fixed_state_energy(
-                pw,
-                pseudos,
-                pw.lattice @ minus,
-                original_positions @ minus,
-                bases,
-                eigenvectors,
-                weights,
-                occupations,
-                shape,
-                charge_indices,
-                charge_workspace,
-                local_workspaces,
-                density_symmetrizer,
-                ecutrho,
-                xc_functional,
-                use_numba,
-                mpi,
-                nelec,
-                charges,
+        )
+    stress += hartree_tensor + hartree_energy / volume * np.eye(3)
+
+    # LDA exchange-correlation contribution. At self-consistency the density
+    # response cancels, leaving QE's -(E_xc - integral rho V_xc)/Omega.
+    epsilon_xc, potential_xc = _xc_energy_potential(
+        density,
+        xc_functional,
+        use_numba=use_numba,
+        workspace=charge_workspace,
+        g_vectors=g_vectors,
+    )
+    grid_scale = volume / np.prod(shape)
+    xc_energy = grid_scale * mpi.sum_scalar(
+        float(np.sum(density * epsilon_xc))
+    )
+    xc_potential_energy = grid_scale * mpi.sum_scalar(
+        float(np.sum(density * potential_xc))
+    )
+    stress -= (xc_energy - xc_potential_energy) / volume * np.eye(3)
+
+    # Norm-conserving nonlocal projectors. The diagonal term differentiates
+    # beta's Omega^-1/2 normalization; the tensor term differentiates both
+    # its radial table and real spherical harmonic analytically.
+    nonlocal_energy = 0.0
+    nonlocal_tensor = np.zeros((3, 3))
+    for basis, vectors, weight, workspace, band_occupations in zip(
+        bases, eigenvectors, weights, local_workspaces, occupations
+    ):
+        local_rows = (
+            workspace.local_plane_wave_indices
+            if mpi.size > 1
+            else np.arange(len(basis.indices))
+        )
+        gk = basis.vectors[local_rows]
+        active = np.flatnonzero(np.abs(band_occupations) > 1.0e-15)
+        if active.size == 0:
+            continue
+        band_count = int(active[-1]) + 1
+        occupied_vectors = vectors[:, :band_count]
+        occupation_weights = np.asarray(band_occupations[:band_count])
+        projector_gradients: dict[
+            str, tuple[np.ndarray, np.ndarray, np.ndarray]
+        ] = {}
+        for atom in pw.atoms:
+            if atom.label not in projector_gradients:
+                projector_gradients[atom.label] = pseudos[
+                    atom.label
+                ].projector_basis_with_gradient(gk, volume)
+            beta, coupling, beta_gradient = projector_gradients[atom.label]
+            if beta.shape[1] == 0:
+                continue
+            phase = np.exp(-1j * (gk @ atom.position))
+            modulated = np.conjugate(phase)[:, None] * occupied_vectors
+            overlap = mpi.sum_array(beta.conj().T @ modulated)
+            coupled = coupling @ overlap
+            atom_energy = float(weight) * float(
+                np.real(
+                    np.sum(
+                        np.conjugate(overlap)
+                        * coupled
+                        * occupation_weights[None, :]
+                    )
+                )
             )
-            value = -(
-                energy_plus - energy_minus
-            ) / (2.0 * step * pw.volume)
-            stress[left, right] = value
-            stress[right, left] = value
+            nonlocal_energy += atom_energy
+            derivative_source = (
+                gk[:, :, None] * modulated[:, None, :]
+            ).reshape(len(gk), -1)
+            derivative_overlap = mpi.sum_array(
+                np.moveaxis(beta_gradient.conj(), 0, -1).reshape(
+                    -1, len(gk)
+                )
+                @ derivative_source
+            ).reshape(beta.shape[1], 3, 3, band_count)
+            nonlocal_tensor += (
+                2.0
+                * float(weight)
+                / volume
+                * np.real(
+                    np.einsum(
+                        "plrb,pb,b->lr",
+                        np.conjugate(derivative_overlap),
+                        coupled,
+                        occupation_weights,
+                        optimize=True,
+                    )
+                )
+            )
+    stress += (
+        0.5 * (nonlocal_tensor + nonlocal_tensor.T)
+        + nonlocal_energy / volume * np.eye(3)
+    )
+
+    stress += ewald_stress(
+        pw.lattice,
+        np.array([atom.position for atom in pw.atoms]),
+        charges,
+        ecutrho,
+    )
     return symmetrize_stress(
-        stress, pw.lattice, pw.symmetry_operations
+        0.5 * (stress + stress.T), pw.lattice, pw.symmetry_operations
     )
 
 
@@ -1375,7 +1346,7 @@ def _run_scf(
     if diagonalization == "david" and davidson_ndim < 2:
         raise QEInputError("diago_david_ndim must be at least 2")
     projector_cache_value = pw.electrons.get(
-        "py_cache_projectors", False
+        "py_cache_projectors", True
     )
     if not isinstance(projector_cache_value, bool):
         raise QEInputError("py_cache_projectors must be a logical value")
@@ -1401,8 +1372,11 @@ def _run_scf(
         from .save import validate_restart_metadata
 
         validate_restart_metadata(pw, shape, nbnd)
+    requested_fft_backend = pw.electrons.get("py_fft_backend")
     fft_backend = str(
-        pw.electrons.get("py_fft_backend", "scipy")
+        requested_fft_backend
+        if requested_fft_backend is not None
+        else ("pyfftw" if find_spec("pyfftw") is not None else "scipy")
     ).lower()
     fft_threads = int(pw.electrons.get("py_fft_threads", 1))
     fft_planner = str(
@@ -2458,16 +2432,15 @@ def _run_scf(
                     eigenvectors,
                     weights,
                     band_occupations,
+                    rho,
                     shape,
                     charge_indices,
                     charge_workspace,
                     local_workspaces,
-                    density_symmetrizer,
                     ecutrho,
                     xc_functional,
                     numba_enabled,
                     mpi,
-                    nelec,
                     charges,
                 )
                 timers.stop("stress", stress_started)

@@ -535,13 +535,11 @@ def davidson(
                 active_columns = number_of_roots
                 basis_storage[:, :active_columns] = ritz_vectors
                 basis = basis_storage[:, :active_columns]
-                # Refresh H|psi> instead of carrying a long sequence of
-                # projected linear combinations through Davidson restarts.
-                # The extra application bounds accumulated FFT/BLAS roundoff
-                # and keeps the reported residual tied to the actual operator.
-                applied_storage[:, :active_columns] = operator(basis)
+                # The Ritz vectors and their H images use the same reduced-
+                # space rotation. Carry both through the restart as QE does;
+                # reapplying H here only repeats an expensive FFT block.
+                applied_storage[:, :active_columns] = applied_ritz
                 applied_basis = applied_storage[:, :active_columns]
-                hamiltonian_applications += basis.shape[1]
 
     return DavidsonResult(
         values,

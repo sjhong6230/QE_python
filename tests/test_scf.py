@@ -471,7 +471,6 @@ def test_energy_scaled_safeguard_remains_available_as_opt_in(monkeypatch):
 def test_scf_caches_nonlocal_projectors_once_per_kpoint(monkeypatch):
     root = Path(__file__).parents[1]
     pw = read_pw_input(root / "examples" / "h2.scf.in")
-    pw.electrons["py_cache_projectors"] = True
     calls = 0
     original = scf_module._nonlocal_projector_terms
 
@@ -498,9 +497,10 @@ def test_scf_caches_nonlocal_projectors_once_per_kpoint(monkeypatch):
     assert setup.projector_cache_enabled
 
 
-def test_scf_defaults_to_low_memory_recomputed_projectors(monkeypatch):
+def test_scf_can_recompute_projectors_for_low_memory(monkeypatch):
     root = Path(__file__).parents[1]
     pw = read_pw_input(root / "examples" / "h2.scf.in")
+    pw.electrons["py_cache_projectors"] = False
     calls = 0
     original = scf_module._nonlocal_projector_terms
 

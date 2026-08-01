@@ -7,9 +7,11 @@ from qepy_pw.upf import _qe_real_spherical_harmonics, read_upf
 
 def test_coulomb_upf_transform():
     pseudo = read_upf(Path(__file__).parents[1] / "examples" / "H.coulomb.UPF")
-    values = pseudo.fourier(np.array([0.0, 2.0]), volume=10.0)
-    assert values[0] == 0.0
+    q = np.array([0.0, 2.0])
+    values, derivative = pseudo.fourier_with_derivative(q, volume=10.0)
+    assert values[0] == derivative[0] == 0.0
     assert np.isclose(values[1], -np.pi / 10.0)
+    assert np.isclose(derivative[1], np.pi / 10.0)
 
 
 def test_norm_conserving_projector_channels_and_hermiticity():
@@ -42,6 +44,26 @@ def test_norm_conserving_projector_channels_and_hermiticity():
     assert orbitals.shape == (4, 1)
     assert np.all(np.isfinite(orbitals))
     assert np.linalg.norm(orbitals) > 0.0
+
+
+def test_analytic_projector_gradient_including_polar_axis():
+    pseudo = read_upf(Path(__file__).parent / "data" / "He.local-nc.UPF")
+    gk = np.array(
+        [[0.4, 0.7, 0.9], [0.0, 0.0, 1.2], [0.0, 0.0, -1.4]]
+    )
+    _, _, gradient = pseudo.projector_basis_with_gradient(gk, 20.0)
+    step = 1.0e-4
+    for axis in range(3):
+        plus = gk.copy()
+        minus = gk.copy()
+        plus[:, axis] += step
+        minus[:, axis] -= step
+        beta_plus, _ = pseudo.projector_basis(plus, 20.0)
+        beta_minus, _ = pseudo.projector_basis(minus, 20.0)
+        finite_gradient = (beta_plus - beta_minus) / (2.0 * step)
+        assert np.allclose(
+            gradient[:, :, axis], finite_gradient, atol=2.0e-8
+        )
 
 
 def test_qe_real_harmonic_l1_order_and_signs():
