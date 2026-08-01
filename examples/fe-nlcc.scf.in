@@ -1,0 +1,25 @@
+&CONTROL
+  calculation = 'scf',
+  prefix = 'iron-nlcc',
+  pseudo_dir = '../quantum-espresso/pseudo',
+/
+&SYSTEM
+  ibrav = 1,
+  celldm(1) = 8.0,
+  nat = 1,
+  ntyp = 1,
+  ecutwfc = 12.0,
+  nbnd = 4,
+  input_dft = 'LDA',
+/
+&ELECTRONS
+  conv_thr = 1.0d-5,
+  electron_maxstep = 80,
+  mixing_beta = 0.20,
+/
+ATOMIC_SPECIES
+Fe  55.845  Fe.pz-n-nc.UPF
+ATOMIC_POSITIONS alat
+Fe  0.00  0.00  0.00
+K_POINTS gamma
+

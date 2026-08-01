@@ -1,0 +1,25 @@
+&CONTROL
+  calculation = 'scf',
+  prefix = 'h2',
+  pseudo_dir = '.',
+/
+&SYSTEM
+  ibrav = 1,
+  celldm(1) = 12.0,
+  nat = 2,
+  ntyp = 1,
+  ecutwfc = 8.0,
+  nbnd = 2,
+/
+&ELECTRONS
+  conv_thr = 1.0d-5,
+  electron_maxstep = 40,
+  mixing_beta = 0.35,
+/
+ATOMIC_SPECIES
+H  1.00784  H.coulomb.UPF
+ATOMIC_POSITIONS bohr
+H  5.30  6.00  6.00
+H  6.70  6.00  6.00
+K_POINTS gamma
+
