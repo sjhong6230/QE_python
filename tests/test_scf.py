@@ -20,7 +20,7 @@ from qepy_pw.scf import (
 from qepy_pw.xc import pz81_unpolarized
 
 
-def test_atomic_trial_randomization_populates_exact_zero_components():
+def test_atomic_trial_randomization_matches_qe_multiplicative_form():
     trials = np.zeros((12, 3), dtype=complex)
     trials[:4, 0] = 1.0
     trials[4:8, 1] = 2.0
@@ -34,7 +34,7 @@ def test_atomic_trial_randomization_populates_exact_zero_components():
     )
 
     assert randomized.shape == trials.shape
-    assert np.all(np.abs(randomized[trials == 0.0]) > 0.0)
+    assert np.all(randomized[trials == 0.0] == 0.0)
     relative_change = np.linalg.norm(
         randomized - trials, axis=0
     ) / np.linalg.norm(trials, axis=0)
@@ -427,9 +427,33 @@ def test_implicit_diagonalization_threshold_tracks_scf_accuracy():
     )
 
 
-def test_scf_uses_energy_scaled_davidson_residual_safeguard(monkeypatch):
+def test_scf_defaults_to_qe_davidson_controls(monkeypatch):
     root = Path(__file__).parents[1]
     pw = read_pw_input(root / "examples" / "h2.scf.in")
+    observed_controls: list[tuple[float | None, int, int]] = []
+    original = scf_module.davidson
+
+    def observing_davidson(*args, **kwargs):
+        observed_controls.append(
+            (
+                kwargs["residual_energy_scale"],
+                kwargs["subspace_multiplier"],
+                kwargs["max_iterations"],
+            )
+        )
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(scf_module, "davidson", observing_davidson)
+    result = run_scf(pw)
+    assert result.converged
+    assert observed_controls
+    assert set(observed_controls) == {(None, 2, 20)}
+
+
+def test_energy_scaled_safeguard_remains_available_as_opt_in(monkeypatch):
+    root = Path(__file__).parents[1]
+    pw = read_pw_input(root / "examples" / "h2.scf.in")
+    pw.electrons["py_davidson_residual_energy_scale"] = 10.0
     observed_scales: list[float | None] = []
     original = scf_module.davidson
 
@@ -442,24 +466,6 @@ def test_scf_uses_energy_scaled_davidson_residual_safeguard(monkeypatch):
     assert result.converged
     assert observed_scales
     assert set(observed_scales) == {10.0}
-
-
-def test_zero_energy_scaled_safeguard_selects_qe_acceptance(monkeypatch):
-    root = Path(__file__).parents[1]
-    pw = read_pw_input(root / "examples" / "h2.scf.in")
-    pw.electrons["py_davidson_residual_energy_scale"] = 0.0
-    observed_scales: list[float | None] = []
-    original = scf_module.davidson
-
-    def observing_davidson(*args, **kwargs):
-        observed_scales.append(kwargs["residual_energy_scale"])
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(scf_module, "davidson", observing_davidson)
-    result = run_scf(pw)
-    assert result.converged
-    assert observed_scales
-    assert set(observed_scales) == {None}
 
 
 def test_scf_caches_nonlocal_projectors_once_per_kpoint(monkeypatch):

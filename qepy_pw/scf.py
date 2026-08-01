@@ -224,29 +224,13 @@ def _randomize_atomic_trials(
     random_stream: _QERandom,
     strength: float = 0.05,
 ) -> np.ndarray:
-    """Break invariant atomic subspaces without discarding their character.
-
-    QE applies a small coefficient-wise random factor to a complete atomic
-    trial set.  Some ported atomic orbitals contain exact reciprocal-space
-    zeros, however, and a multiplicative perturbation cannot populate those
-    components.  Adding a kinetic-energy-damped random vector with the same
-    small relative norm prevents a high-symmetry Davidson solve from missing
-    a lower state while retaining the QE-style multiplicative perturbation.
-    """
+    """Apply QE's coefficient-wise 5% perturbation to atomic trials."""
+    del kinetic  # Retained in the private signature for compatibility.
     amplitude, phase = random_stream.pairs_by_band(
         trials.shape[0], trials.shape[1]
     )
     noise = amplitude * np.exp(2j * np.pi * phase)
-    randomized = trials * (1.0 + strength * noise)
-    additive = noise / (1.0 + 2.0 * kinetic[:, None])
-    additive_norms = np.linalg.norm(additive, axis=0)
-    trial_norms = np.linalg.norm(trials, axis=0)
-    usable = additive_norms > 0.0
-    additive[:, usable] *= (
-        trial_norms[usable] / additive_norms[usable]
-    )[None, :]
-    randomized += strength * additive
-    return randomized
+    return trials * (1.0 + strength * noise)
 
 
 def _ionic_potential(
@@ -1387,7 +1371,7 @@ def _run_scf(
             f"diagonalization={diagonalization!r} is not ported; use "
             "'david' or the Python-only diagnostic mode 'dense'"
         )
-    davidson_ndim = int(pw.electrons.get("diago_david_ndim", 4))
+    davidson_ndim = int(pw.electrons.get("diago_david_ndim", 2))
     if diagonalization == "david" and davidson_ndim < 2:
         raise QEInputError("diago_david_ndim must be at least 2")
     projector_cache_value = pw.electrons.get(
@@ -1902,7 +1886,7 @@ def _run_scf(
     )
     previous_accuracy = np.inf
     davidson_maxiter = int(
-        pw.electrons.get("py_davidson_maxiter", 100)
+        pw.electrons.get("py_davidson_maxiter", 20)
     )
     residual_factor_value = pw.electrons.get(
         "py_davidson_residual_factor"
@@ -1913,7 +1897,7 @@ def _run_scf(
         else float(residual_factor_value)
     )
     residual_energy_scale_value = pw.electrons.get(
-        "py_davidson_residual_energy_scale", 10.0
+        "py_davidson_residual_energy_scale"
     )
     if residual_energy_scale_value is None:
         davidson_residual_energy_scale = None
@@ -2051,7 +2035,10 @@ def _run_scf(
                     local_workspace=local_workspaces[kpoint_index],
                     timers=timers,
                     real_potential=v_eff_local,
-                    potential_average=potential_average,
+                    # QE's usnldiag uses v_of_0: the G=0 component of the
+                    # ionic local potential, not the average total effective
+                    # potential used by H|psi>.
+                    potential_average=v_ion_average,
                 )
                 trial_vectors = previous_eigenvectors[kpoint_index]
                 if trial_vectors is None:
@@ -2086,6 +2073,14 @@ def _run_scf(
                     subspace_multiplier=davidson_ndim,
                     residual_factor=davidson_residual_factor,
                     residual_energy_scale=davidson_residual_energy_scale,
+                    # QE initializes every btype as occupied. Empty-band
+                    # tolerances apply only after occupations are known from
+                    # the first diagonalization.
+                    occupied_roots=(
+                        occupied
+                        if occupations_mode == "fixed" and iteration > 1
+                        else nbnd
+                    ),
                     # Atomic trials have just been Rayleigh-Ritz rotated.
                     # File orbitals may accompany a different starting
                     # potential and must therefore be projected again.
@@ -2097,7 +2092,14 @@ def _run_scf(
                 )
                 timers.stop("cegterg", davidson_started)
                 davidson_iterations = solution.iterations
-                if not solution.converged:
+                # cegterg returns its best Ritz vectors after 20 iterations.
+                # c_bands accepts that result unless more than five bands are
+                # unconverged; do not turn QE's accepted small-band result
+                # into a fatal Python error.
+                if (
+                    not solution.converged
+                    and solution.number_unconverged > 5
+                ):
                     raise QEInputError(
                         f"Davidson diagonalization did not converge at k point "
                         f"{kpoint_index + 1} after {davidson_iterations} "

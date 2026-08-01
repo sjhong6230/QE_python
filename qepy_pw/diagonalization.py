@@ -300,6 +300,7 @@ def davidson(
     subspace_multiplier: int = 4,
     residual_factor: float | None = 10.0,
     residual_energy_scale: float | None = None,
+    occupied_roots: int | None = None,
     initial_is_ritz: bool = False,
     mpi: MPIContext | None = None,
     global_dimension: int | None = None,
@@ -329,6 +330,16 @@ def davidson(
         raise ValueError(
             "Davidson residual_energy_scale must be positive or None"
         )
+    if occupied_roots is None:
+        occupied_roots = number_of_roots
+    if not 0 <= occupied_roots <= number_of_roots:
+        raise ValueError(
+            "occupied_roots must be between zero and number_of_roots"
+        )
+    root_tolerances = np.full(
+        number_of_roots, max(5.0 * tolerance, 5.0e-6)
+    )
+    root_tolerances[:occupied_roots] = tolerance
 
     if initial_vectors is None:
         if global_row_indices is None:
@@ -485,9 +496,13 @@ def davidson(
                 mpi.sum_array(np.sum(np.abs(residuals) ** 2, axis=0))
             )
         )
-        converged = np.abs(values - previous_values) < tolerance
+        converged = (
+            np.abs(values - previous_values) < root_tolerances
+        )
         if residual_factor is not None:
-            converged &= residual_norms < residual_factor * tolerance
+            converged &= (
+                residual_norms < residual_factor * root_tolerances
+            )
         if residual_energy_scale is not None:
             # Ritz values can stagnate while the vectors still have large
             # residuals. Eigenvalue errors are second order in a normalized
@@ -495,7 +510,7 @@ def davidson(
             # an excessively strict linear residual test.
             converged &= (
                 residual_norms**2
-                < residual_energy_scale * tolerance
+                < residual_energy_scale * root_tolerances
             )
         unconverged = ~converged
         number_unconverged = int(np.count_nonzero(~converged))
