@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 import qepy_pw.scf as scf_module
+from qepy_pw.basis import LocalPotentialWorkspace
 from qepy_pw.errors import QEInputError, UnsupportedFeatureError
 from qepy_pw.input import Atom, KPoint, Species, read_pw_input
 from qepy_pw.output import format_output
@@ -39,6 +40,20 @@ def test_atomic_trial_randomization_matches_qe_multiplicative_form():
         randomized - trials, axis=0
     ) / np.linalg.norm(trials, axis=0)
     assert np.all(relative_change < 0.11)
+
+
+def test_qe_random_batch_matches_scalar_stream_exactly():
+    batch_stream = scf_module._QERandom(17)
+    scalar_stream = scf_module._QERandom(17)
+    first, second = batch_stream.pairs_by_band(11, 4)
+    scalar = np.array(
+        [scalar_stream.random() for _ in range(2 * 11 * 4)]
+    )
+    expected_first = scalar[0::2].reshape(4, 11).T
+    expected_second = scalar[1::2].reshape(4, 11).T
+    assert np.array_equal(first, expected_first)
+    assert np.array_equal(second, expected_second)
+    assert batch_stream.random() == scalar_stream.random()
 
 
 def test_xc_functional_family_recognizes_qe_and_rejects_pbe_variants():
@@ -290,21 +305,6 @@ def test_real_qe_si_norm_conserving_upf_converges():
     assert np.isfinite(result.total_energy_ha)
     assert abs(np.mean(result.density) * pw.volume - 8.0) < 1e-10
 
-    cached_pw = read_pw_input(root / "examples" / "si-nc.scf.in")
-    cached_pw.electrons["py_cache_projectors"] = True
-    cached_result = run_scf(cached_pw)
-    assert cached_result.converged
-    assert cached_result.total_energy_ha == pytest.approx(
-        result.total_energy_ha, abs=1.0e-12
-    )
-    assert np.allclose(
-        cached_result.density,
-        result.density,
-        rtol=0.0,
-        atol=1.0e-12,
-    )
-
-
 def test_nlcc_xc_energy_uses_total_density_but_potential_uses_valence():
     valence = np.array([0.02, 0.04, 0.08])
     core = np.array([0.20, 0.10, 0.05])
@@ -528,7 +528,7 @@ def test_energy_scaled_safeguard_remains_available_as_opt_in(monkeypatch):
     assert set(observed_scales) == {10.0}
 
 
-def test_scf_caches_nonlocal_projectors_once_per_kpoint(monkeypatch):
+def test_scf_rebuilds_nonlocal_projectors_for_each_kpoint_solve(monkeypatch):
     root = Path(__file__).parents[1]
     pw = read_pw_input(root / "examples" / "h2.scf.in")
     calls = 0
@@ -549,44 +549,50 @@ def test_scf_caches_nonlocal_projectors_once_per_kpoint(monkeypatch):
         pw,
         progress=lambda kind, payload: events.append((kind, payload)),
     )
-    setup = next(
-        payload for kind, payload in events if kind == "setup"
-    )
     assert result.converged
-    assert calls == len(pw.kpoints)
-    assert setup.projector_cache_enabled
+    assert calls == result.timings["init_us_2"].calls
+    assert calls >= len(pw.kpoints) * len(result.iterations)
 
 
-def test_scf_can_recompute_projectors_for_low_memory(monkeypatch):
+def test_removed_projector_cache_control_is_rejected():
     root = Path(__file__).parents[1]
     pw = read_pw_input(root / "examples" / "h2.scf.in")
     pw.electrons["py_cache_projectors"] = False
-    calls = 0
-    original = scf_module._nonlocal_projector_terms
+    with pytest.raises(QEInputError, match="has been removed"):
+        run_scf(pw)
 
-    def counting_projectors(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        return original(*args, **kwargs)
+
+def test_scf_reuses_real_potential_and_reciprocal_geometry(monkeypatch):
+    root = Path(__file__).parents[1]
+    pw = read_pw_input(root / "examples" / "h2.scf.in")
+    prepared = 0
+    geometry_ids: list[int] = []
+    original_prepare = LocalPotentialWorkspace.prepare_potential
+    original_hartree = scf_module._hartree
+
+    def counting_prepare(self, potential_g):
+        nonlocal prepared
+        prepared += 1
+        return original_prepare(self, potential_g)
+
+    def observing_hartree(*args, **kwargs):
+        geometry = (
+            kwargs.get("geometry")
+            if "geometry" in kwargs
+            else (args[3] if len(args) > 3 else None)
+        )
+        assert geometry is not None
+        geometry_ids.append(id(geometry))
+        return original_hartree(*args, **kwargs)
 
     monkeypatch.setattr(
-        scf_module,
-        "_nonlocal_projector_terms",
-        counting_projectors,
+        LocalPotentialWorkspace, "prepare_potential", counting_prepare
     )
-    events: list[tuple[str, object]] = []
-    result = run_scf(
-        pw,
-        progress=lambda kind, payload: events.append((kind, payload)),
-    )
-    setup = next(
-        payload for kind, payload in events if kind == "setup"
-    )
+    monkeypatch.setattr(scf_module, "_hartree", observing_hartree)
+    result = run_scf(pw)
     assert result.converged
-    assert calls == len(pw.kpoints) * len(result.iterations)
-    assert not setup.projector_cache_enabled
-    assert setup.projector_cache_bytes_per_rank == 0
-    assert not setup.numba_enabled
+    assert prepared == 0
+    assert geometry_ids and len(set(geometry_ids)) == 1
 
 
 def test_symmetry_reduced_si_scf_converges():

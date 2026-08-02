@@ -163,14 +163,26 @@ pocketfft remains the default because backend-level roundoff can alter a
 nonlinear SCF trajectory even when every individual `Hpsi` agrees to
 numerical precision.
 
-Davidson calculations now construct one immutable species-centered nonlocal
-Kleinman--Bylander beta basis per active k point and store atom positions as
-compact phase columns. Only each MPI rank's local plane-wave rows are retained.
-All atom/projector overlaps are fused into one collective reduction per
-Hamiltonian application, while BLAS conjugate-transpose flags avoid temporary
-copies of complete beta matrices. Setup and real-time memory reports include
-the exact cache allocation per rank. Recalculation is the low-memory default;
-`py_cache_projectors=.true.` retains the factorized bases for maximum speed.
+Davidson calculations construct one species-centered nonlocal
+Kleinman--Bylander beta basis for the current k point and release it after the
+solve, matching QE's `init_us_2` lifetime. Only each MPI rank's local
+plane-wave rows are retained. All atom/projector overlaps are fused into one
+collective reduction per Hamiltonian application, while BLAS
+conjugate-transpose flags avoid temporary copies of complete beta matrices.
+The former all-k `py_cache_projectors` mode was removed.
+
+The k-point bases now retain int32 mappings into one QE-ordered global G
+catalog rather than replicated Miller, Cartesian, and kinetic arrays. Serial
+FFT workspaces retain compact linear slots and omit distributed stick-owner
+maps. A shared density-grid descriptor supplies G2, cutoff-sphere indices,
+Cartesian G vectors, and FFT slots to every potential, mixing-error, force,
+stress, and PBE consumer. The effective real-space potential is assembled
+once per SCF iteration and shared across the complete k loop.
+
+NLCC transforms now reproduce `rhoc_mod`: `rho_core(G)` is tabulated at
+`dq=0.01` on QE's shortened species mesh, interpolated with the four-point
+cubic formula, and differentiated by the analytic derivative of that same
+interpolant for stress.
 
 The distributed SciPy FFT path shares one grow-only scratch pool across the
 sequential k-point workspaces and overwrites inverse-transformed
@@ -184,14 +196,12 @@ by correction, expansion, and consecutive-eigenvalue testing, so the printed
 iteration count has the same meaning as `cegterg`. Converged roots are
 excluded from correction blocks, restarts retain current Ritz vectors, and
 the output reports actual Hamiltonian-vector applications and the maximum
-eigen-residual. Experiments with QE's nonorthogonal generalized correction
-space, eigenvalue-only acceptance, and rotated `Hpsi` restart were reverted
-after they destabilized the Si Broyden trajectory. The stable defaults retain
-orthonormal corrections, explicit `Hpsi` refresh, and a residual safety gate;
-pure QE acceptance remains available through Python-specific controls. The
-default energy-scaled residual factor is 10: the unreduced Si benchmark then
-converges in QE's 28 SCF iterations, whereas disabling the safety gate reaches
-a late ill-conditioned Davidson failure.
+eigen-residual. The stable path retains rank-revealing orthonormal corrections
+instead of QE's nonorthogonal correction space. Restarts carry both Ritz
+vectors and their rotated `Hpsi` images, and reduced Hamiltonian/overlap
+matrices are updated only for newly added columns. QE's eigenvalue-change
+acceptance is the default; residual and energy-scaled safety gates remain
+available through Python-specific controls.
 
 ### 0.6.6 - optional Numba scalar kernels (implemented)
 
@@ -284,6 +294,29 @@ file records QE's scalar-wavefunction attributes, ordered Miller indices with
 reciprocal vectors, and the complex band-major `evc` dataset. Distributed
 plane-wave rows are gathered directly to rank zero only after the final SCF
 iteration; `disk_io='none'` avoids both collection and persistence.
+
+### 0.6.14 - descriptor-driven MPI hot paths (implemented)
+
+Wavefunction and charge grids now each build one QE-style stick/slab
+descriptor shared by every lazy current-k workspace. It caches ownership,
+transpose counts/displacements, and flattened slab indices. Distributed FFT
+transposes consequently use one native `MPI_Alltoallv` without a preceding
+Python-object count exchange; reciprocal-to-real sends are already contiguous,
+and the reverse indexed pack is vectorized or compiled by the optional Numba
+path. Grow-only exchange and aligned FFT scratch buffers remove steady-state
+allocation.
+
+The optional pyFFTW backend now plans the distributed one-dimensional stick
+and two-dimensional slab transforms directly on those reusable buffers, so
+the inverse FFT, local-potential product, and forward FFT remain in place.
+Independent batch dimensions are flattened only in the plan view, preserving
+the communication layout and numerical normalization.
+
+Davidson combines projection with the raw Gram matrix in one collective and
+forms the projected Gram matrix by a Schur complement, with explicit
+reprojection retained for cancellation-dominated corrections. New projected
+Hamiltonian and overlap rows are likewise reduced together. The common
+expansion path therefore uses three small-matrix reductions instead of six.
 
 ### 0.8 — ground-state derivatives and persistence
 

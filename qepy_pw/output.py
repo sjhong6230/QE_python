@@ -349,16 +349,6 @@ def format_setup(setup: SCFSetup) -> str:
             file=out,
         )
         print("     full Hamiltonian matrices =      avoided", file=out)
-        print(
-            "     nonlocal projector cache  = "
-            + (
-                f"enabled ({setup.projector_cache_bytes_per_rank / 1e6:.2f} "
-                "MB/rank)"
-                if setup.projector_cache_enabled
-                else "disabled"
-            ),
-            file=out,
-        )
         print(file=out)
     else:
         print(
@@ -448,12 +438,6 @@ def format_iteration(step: SCFIteration) -> str:
             "estimated for FFT workspace",
             file=out,
         )
-        if step.memory_projector_cache_bytes_per_rank:
-            print(
-                f"{step.memory_projector_cache_bytes_per_rank / 1e6:14.2f} MB "
-                "estimated for nonlocal projector cache",
-                file=out,
-            )
         print("------------------", file=out)
         print(
             f"     ethr = {2.0 * step.davidson_threshold_ha:9.2E}, "
@@ -695,6 +679,15 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
         print("     forces       :" + _format_timing(result, "forces"), file=out)
     if result.stress_ha_per_bohr3 is not None:
         print("     stress       :" + _format_timing(result, "stress"), file=out)
+    if (
+        result.forces_ha_per_bohr is not None
+        or result.stress_ha_per_bohr3 is not None
+    ):
+        print(
+            "     nonlocal deriv.:"
+            + _format_timing(result, "nonlocal_derivatives"),
+            file=out,
+        )
     print("\n     Called by init_run:", file=out)
     for name in ("wfcinit", "potinit", "hinit0"):
         print(f"     {name:<13s}:" + _format_timing(result, name), file=out)

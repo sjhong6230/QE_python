@@ -143,12 +143,22 @@ thread count. Set `py_blas_threads` explicitly to opt into threaded linear
 algebra; `py_fft_threads` independently controls the optional pyFFTW/SciPy
 FFT worker count and also defaults to one.
 
-The low-memory default recomputes the factorized Kleinman--Bylander projector
-bases for each k point and SCF iteration. Projector overlaps use BLAS
-conjugate-transpose operations and one fused MPI reduction per `Hpsi`. Set
-`py_cache_projectors=.true.` in `&electrons` to retain species-centered beta
-bases and compact atom-dependent phase columns for a faster, higher-memory
-run. Setup and iteration reports state the exact cache allocation per rank.
+Like QE, the Davidson path builds the factorized Kleinman--Bylander projector
+basis only for the current k point and releases it after that solve. Projector
+overlaps use BLAS conjugate-transpose operations and one fused MPI reduction
+per `Hpsi`; there is no all-k projector-cache mode.
+
+All k-point bases map into one globally ordered G-vector catalog and
+materialize Cartesian vectors only for the current solve. The density-grid
+G2 values, cutoff sphere, compact G vectors, and FFT slots are likewise built
+once and shared by Hartree, density-error, ionic/core-density, force, stress,
+and PBE paths. Each SCF iteration constructs one real-space effective
+potential and passes that same array through the complete k loop.
+
+NLCC core densities follow QE's `rhoc_mod`: a `dq=0.01` reciprocal table is
+formed on the shortened species mesh, potentials and forces use its
+four-point cubic interpolation, and stress uses the derivative of that same
+interpolant.
 
 For symmetry-reduced calculations, the G-vector MPI ranks also divide the
 independent scalar-density space-group operations. Each rank accumulates a
@@ -277,7 +287,10 @@ full `Gz` axis on their owning rank. After the one-dimensional Z FFT, one
 two-dimensional XY transform. The forward transform reverses these steps.
 Local-potential multiplication and density accumulation operate on the
 real-space Z slab without assembling a complete wavefunction grid. Only rank
-zero writes output.
+zero writes output. One shared descriptor per wavefunction/charge grid caches
+stick ownership, transpose counts, displacements, and slab indices. The hot
+transpose therefore performs one native `MPI_Alltoallv`, with compiled or
+vectorized indexed packing, and no Python-object count exchange.
 
 Davidson wavefunctions, applied wavefunctions, residuals, corrections, and
 subspace-basis rows are distributed over those G-vector owners. Kinetic and
@@ -286,6 +299,9 @@ projector overlaps, vector overlaps, residual norms, and Rayleigh--Ritz
 matrices are summed collectively; only the small band/subspace matrices are
 replicated. Small FFT grids may nevertheless remain latency-bound, but each
 Hamiltonian application now needs two distributed transposes rather than four.
+The common Davidson expansion fuses projection/Gram and projected-H/projected-S
+pairs, reducing its six small-matrix reductions to three; a cancellation-safe
+orthogonalization fallback is retained.
 
 ## XML/HDF5 save output
 
@@ -329,12 +345,14 @@ marks.
 
 FFT storage is bounded to the currently active Davidson block size rather than
 retaining one full grid for every block size encountered. All sequential
-k-point workspaces share one process-local distributed-FFT scratch pool, and
-both serial and distributed paths multiply inverse-FFT wavefunctions in
-place. MPI exchanges pack directly into one send buffer, collective sums
-operate in place, and Miller, slot, and stick metadata use 32-bit indices.
-The pyFFTW backend likewise retains only its current block-size plan and
-buffers; changing block size replaces the previous cache.
+k-point workspaces are constructed lazily and share one process-local
+distributed-FFT scratch pool and one immutable grid descriptor. Both serial
+and distributed paths multiply inverse-FFT wavefunctions in place. MPI
+exchanges reuse grow-only buffers, collective sums operate in place, and
+Miller, slot, and stick metadata use 32-bit indices. The pyFFTW backend also
+uses planned in-place one- and two-dimensional transforms around the
+distributed transpose; changing block size replaces the previous plan and
+buffer cache.
 
 Each SCF iteration emits a QE-shaped real-time memory block with process RSS,
 node-available memory, and separate estimates for density/potential grids,

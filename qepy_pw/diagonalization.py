@@ -60,7 +60,7 @@ class PlaneWaveHamiltonian:
         self.local_workspace = (
             local_workspace
             if local_workspace is not None
-            else LocalPotentialWorkspace(basis.indices, potential_g.shape)
+            else LocalPotentialWorkspace(basis, potential_g.shape)
         )
         self.timers = timers
         self.real_potential = (
@@ -75,10 +75,11 @@ class PlaneWaveHamiltonian:
         )
         self.mpi = self.local_workspace.mpi
         self.local_rows = self.local_workspace.local_plane_wave_indices
+        kinetic = self.basis.kinetic
         self.local_kinetic = (
-            self.basis.kinetic[self.local_rows]
+            kinetic[self.local_rows]
             if self.mpi.size > 1
-            else self.basis.kinetic
+            else kinetic
         )
         localized_terms: list[ProjectorTerm] = []
         for term in projector_terms:
@@ -225,20 +226,54 @@ def _orthonormalize(
     threshold: float = 1.0e-12,
     mpi: MPIContext | None = None,
 ) -> np.ndarray:
-    """Twice-project and return a rank-revealing orthonormal column basis."""
+    """Return a rank-revealing basis with one common-case MPI reduction.
+
+    Projection and the unprojected Gram matrix are reduced together. Their
+    Schur complement is the projected Gram matrix when ``against`` is
+    orthonormal. A second projection/reduction is reserved for cancellation-
+    dominated blocks, retaining the former numerical safety net.
+    """
     block = np.asarray(vectors, dtype=complex).copy()
     if block.ndim == 1:
         block = block[:, None]
     mpi = mpi if mpi is not None else MPIContext()
-    if against is not None and against.ndim == 2 and against.shape[1]:
-        for _ in range(2):
-            projection = against.conj().T @ block
-            projection = mpi.sum_array(projection)
-            block -= against @ projection
     if block.shape[1] == 0:
         return np.empty((block.shape[0], 0), dtype=complex)
     if mpi.size > 1:
-        gram = mpi.sum_array(block.conj().T @ block)
+        if against is not None and against.ndim == 2 and against.shape[1]:
+            projection_local = against.conj().T @ block
+            raw_gram_local = block.conj().T @ block
+            split = projection_local.size
+            reduced = mpi.sum_array(
+                np.concatenate(
+                    (projection_local.ravel(), raw_gram_local.ravel())
+                )
+            )
+            projection = reduced[:split].reshape(projection_local.shape)
+            raw_gram = reduced[split:].reshape(raw_gram_local.shape)
+            block -= against @ projection
+            gram = raw_gram - projection.conj().T @ projection
+            gram = 0.5 * (gram + gram.conj().T)
+            raw_scale = max(
+                float(np.max(np.abs(np.diag(raw_gram)))), 1.0e-300
+            )
+            remaining_scale = float(
+                np.max(np.abs(np.diag(gram)), initial=0.0)
+            )
+            smallest = float(
+                np.min(np.linalg.eigvalsh(gram), initial=0.0)
+            )
+            if (
+                remaining_scale < 1.0e-8 * raw_scale
+                or smallest < -1.0e-10 * raw_scale
+            ):
+                # Severe cancellation makes the Schur complement inaccurate.
+                # Reproject and form the Gram matrix explicitly only then.
+                projection = mpi.sum_array(against.conj().T @ block)
+                block -= against @ projection
+                gram = mpi.sum_array(block.conj().T @ block)
+        else:
+            gram = mpi.sum_array(block.conj().T @ block)
         gram = 0.5 * (gram + gram.conj().T)
         squared, rotation = eigh(gram, check_finite=False)
         order = np.argsort(squared)[::-1]
@@ -256,6 +291,9 @@ def _orthonormalize(
             @ rotation[:, :rank]
             / np.sqrt(squared[:rank])[None, :]
         )
+    if against is not None and against.ndim == 2 and against.shape[1]:
+        for _ in range(2):
+            block -= against @ (against.conj().T @ block)
     left, singular_values, _ = np.linalg.svd(block, full_matrices=False)
     if not len(singular_values) or singular_values[0] == 0.0:
         return np.empty((block.shape[0], 0), dtype=complex)
@@ -399,6 +437,51 @@ def davidson(
     applied_storage[:, :active_columns] = operator(basis)
     applied_basis = applied_storage[:, :active_columns]
     hamiltonian_applications = active_columns
+    projected_storage = np.zeros(
+        (maximum_subspace, maximum_subspace), dtype=complex
+    )
+    overlap_storage = np.zeros_like(projected_storage)
+
+    def update_projected(first_new: int) -> None:
+        """Update only reduced-matrix rows/columns added since first_new."""
+        with (
+            timers.measure("cegterg:over")
+            if timers is not None
+            else nullcontext()
+        ):
+            new_basis = basis[:, first_new:active_columns]
+            h_local = new_basis.conj().T @ applied_basis
+            s_local = new_basis.conj().T @ basis
+            split = h_local.size
+            reduced = mpi.sum_array(
+                np.concatenate((h_local.ravel(), s_local.ravel()))
+            )
+            h_rows = reduced[:split].reshape(h_local.shape)
+            s_rows = reduced[split:].reshape(s_local.shape)
+            projected_storage[
+                first_new:active_columns, :active_columns
+            ] = h_rows
+            overlap_storage[
+                first_new:active_columns, :active_columns
+            ] = s_rows
+            if first_new:
+                projected_storage[
+                    :first_new, first_new:active_columns
+                ] = h_rows[:, :first_new].conj().T
+                overlap_storage[
+                    :first_new, first_new:active_columns
+                ] = s_rows[:, :first_new].conj().T
+            new_slice = slice(first_new, active_columns)
+            projected_storage[new_slice, new_slice] = 0.5 * (
+                projected_storage[new_slice, new_slice]
+                + projected_storage[new_slice, new_slice].conj().T
+            )
+            overlap_storage[new_slice, new_slice] = 0.5 * (
+                overlap_storage[new_slice, new_slice]
+                + overlap_storage[new_slice, new_slice].conj().T
+            )
+
+    update_projected(0)
 
     def ritz_pairs() -> tuple[
         np.ndarray, np.ndarray, np.ndarray, np.ndarray
@@ -408,17 +491,9 @@ def davidson(
             if timers is not None
             else nullcontext()
         ):
-            projected = mpi.sum_array(
-                basis.conj().T @ applied_basis
-            )
-            projected = 0.5 * (
-                projected + projected.conj().T
-            )
-            overlap = mpi.sum_array(basis.conj().T @ basis)
-            overlap = 0.5 * (overlap + overlap.conj().T)
             roots, coefficients = eigh(
-                projected,
-                overlap,
+                projected_storage[:active_columns, :active_columns],
+                overlap_storage[:active_columns, :active_columns],
                 subset_by_index=(0, number_of_roots - 1),
                 check_finite=False,
             )
@@ -490,6 +565,7 @@ def davidson(
         )
         applied_basis = applied_storage[:, :active_columns]
         hamiltonian_applications += corrections.shape[1]
+        update_projected(old_columns)
         values, ritz_vectors, applied_ritz, residuals = ritz_pairs()
         residual_norms = np.sqrt(
             np.real(
@@ -540,6 +616,13 @@ def davidson(
                 # reapplying H here only repeats an expensive FFT block.
                 applied_storage[:, :active_columns] = applied_ritz
                 applied_basis = applied_storage[:, :active_columns]
+                projected_storage[:active_columns, :active_columns] = 0.0
+                projected_storage[
+                    np.arange(active_columns), np.arange(active_columns)
+                ] = values
+                overlap_storage[:active_columns, :active_columns] = np.eye(
+                    active_columns, dtype=complex
+                )
 
     return DavidsonResult(
         values,

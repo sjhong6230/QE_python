@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from contextlib import nullcontext
-import itertools
 
 import numpy as np
 from scipy.fft import next_fast_len
@@ -16,10 +15,256 @@ from .timing import TimingRegistry
 
 
 @dataclass(frozen=True)
-class PlaneWaveBasis:
+class PlaneWaveCatalog:
+    """One QE-ordered global G catalog shared by every k-point basis."""
+
     indices: np.ndarray
-    vectors: np.ndarray
-    kinetic: np.ndarray
+    reciprocal: np.ndarray
+
+    @property
+    def vectors(self) -> np.ndarray:
+        return self.indices @ self.reciprocal
+
+
+@dataclass(frozen=True, init=False)
+class PlaneWaveBasis:
+    """Compact per-k mapping into a shared global reciprocal catalog."""
+
+    catalog: PlaneWaveCatalog | None
+    global_indices: np.ndarray | None
+    k_crystal: np.ndarray | None
+    _legacy_indices: np.ndarray | None
+    _legacy_vectors: np.ndarray | None
+    _legacy_kinetic: np.ndarray | None
+
+    def __init__(
+        self,
+        catalog_or_indices: PlaneWaveCatalog | np.ndarray,
+        mapping_or_vectors: np.ndarray,
+        kpoint_or_kinetic: np.ndarray,
+    ) -> None:
+        # Retain the small public array constructor used by diagnostic tests
+        # and downstream callers while make_bases uses the compact catalog.
+        if isinstance(catalog_or_indices, PlaneWaveCatalog):
+            object.__setattr__(self, "catalog", catalog_or_indices)
+            object.__setattr__(
+                self,
+                "global_indices",
+                np.asarray(mapping_or_vectors, dtype=np.int32),
+            )
+            object.__setattr__(
+                self, "k_crystal", np.asarray(kpoint_or_kinetic, dtype=float)
+            )
+            object.__setattr__(self, "_legacy_indices", None)
+            object.__setattr__(self, "_legacy_vectors", None)
+            object.__setattr__(self, "_legacy_kinetic", None)
+        else:
+            object.__setattr__(self, "catalog", None)
+            object.__setattr__(self, "global_indices", None)
+            object.__setattr__(self, "k_crystal", None)
+            object.__setattr__(
+                self,
+                "_legacy_indices",
+                np.asarray(catalog_or_indices, dtype=np.int32),
+            )
+            object.__setattr__(
+                self,
+                "_legacy_vectors",
+                np.asarray(mapping_or_vectors, dtype=float),
+            )
+            object.__setattr__(
+                self,
+                "_legacy_kinetic",
+                np.asarray(kpoint_or_kinetic, dtype=float),
+            )
+
+    @property
+    def indices(self) -> np.ndarray:
+        if self.catalog is None:
+            assert self._legacy_indices is not None
+            return self._legacy_indices
+        assert self.global_indices is not None
+        return self.catalog.indices[self.global_indices]
+
+    @property
+    def vectors(self) -> np.ndarray:
+        if self.catalog is None:
+            assert self._legacy_vectors is not None
+            return self._legacy_vectors
+        assert self.k_crystal is not None
+        return (
+            self.indices + self.k_crystal[None, :]
+        ) @ self.catalog.reciprocal
+
+    @property
+    def kinetic(self) -> np.ndarray:
+        if self.catalog is None:
+            assert self._legacy_kinetic is not None
+            return self._legacy_kinetic
+        vectors = self.vectors
+        return 0.5 * np.einsum("ij,ij->i", vectors, vectors)
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def materialize(self) -> "PlaneWaveBasis":
+        """Return current-k arrays without retaining them across k points."""
+        if self.catalog is None:
+            return self
+        indices = self.indices
+        vectors = (
+            indices + self.k_crystal[None, :]
+        ) @ self.catalog.reciprocal
+        kinetic = 0.5 * np.einsum("ij,ij->i", vectors, vectors)
+        return PlaneWaveBasis(indices, vectors, kinetic)
+
+
+def _displacements(counts: np.ndarray) -> np.ndarray:
+    return np.concatenate(
+        (np.array([0], dtype=np.int64), np.cumsum(counts[:-1]))
+    )
+
+
+@dataclass
+class FFTTransposePlan:
+    """Rank-local cached metadata for QE-style stick/slab transposes."""
+
+    g2r_send_base: np.ndarray
+    g2r_recv_base: np.ndarray
+    slab_point_indices: np.ndarray
+    _scaled: dict[
+        tuple[int, bool], tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+    ] = field(default_factory=dict, repr=False)
+
+    def counts(
+        self, number_of_vectors: int, *, reverse: bool = False
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        key = (int(number_of_vectors), bool(reverse))
+        cached = self._scaled.get(key)
+        if cached is not None:
+            return cached
+        if reverse:
+            send = self.g2r_recv_base * number_of_vectors
+            recv = self.g2r_send_base * number_of_vectors
+        else:
+            send = self.g2r_send_base * number_of_vectors
+            recv = self.g2r_recv_base * number_of_vectors
+        cached = (send, _displacements(send), recv, _displacements(recv))
+        self._scaled[key] = cached
+        return cached
+
+
+@dataclass(frozen=True)
+class FFTGridDescriptor:
+    """One shared FFT stick distribution for a grid and communicator size."""
+
+    shape: tuple[int, int, int]
+    processes: int
+    sticks: np.ndarray
+    stick_owners: np.ndarray
+    sticks_by_rank: tuple[np.ndarray, ...]
+    stick_lookup: np.ndarray
+    transpose_plans: tuple[FFTTransposePlan, ...]
+
+    @classmethod
+    def build(
+        cls,
+        indices: np.ndarray,
+        shape: tuple[int, int, int],
+        processes: int,
+    ) -> "FFTGridDescriptor":
+        miller = np.asarray(indices, dtype=np.int32)
+        shape = tuple(int(value) for value in shape)
+        if miller.ndim != 2 or miller.shape[1] != 3:
+            raise ValueError("indices must have shape (nplane, 3)")
+        if processes < 1:
+            raise ValueError("FFT descriptor needs at least one process")
+        pairs = np.column_stack(
+            (miller[:, 0] % shape[0], miller[:, 1] % shape[1])
+        )
+        sticks, inverse = np.unique(pairs, axis=0, return_inverse=True)
+        sticks = np.asarray(sticks, dtype=np.int32)
+        counts = np.bincount(inverse, minlength=len(sticks))
+        owners = np.zeros(len(sticks), dtype=np.int32)
+        g_loads = np.zeros(processes, dtype=np.int64)
+        stick_loads = np.zeros(processes, dtype=np.int64)
+        # Match QE's primary G-count balance and stick-count tie breaker.
+        for stick in np.argsort(-counts, kind="stable"):
+            owner = min(
+                range(processes),
+                key=lambda rank: (g_loads[rank], stick_loads[rank]),
+            )
+            owners[stick] = owner
+            g_loads[owner] += counts[stick]
+            stick_loads[owner] += 1
+        by_rank = tuple(
+            np.asarray(np.flatnonzero(owners == rank), dtype=np.int32)
+            for rank in range(processes)
+        )
+        lookup = np.full(shape[0] * shape[1], -1, dtype=np.int32)
+        lookup[sticks[:, 0] * shape[1] + sticks[:, 1]] = np.arange(
+            len(sticks), dtype=np.int32
+        )
+        z_counts = np.asarray(
+            [
+                shape[2] * (rank + 1) // processes
+                - shape[2] * rank // processes
+                for rank in range(processes)
+            ],
+            dtype=np.int64,
+        )
+        stick_counts = np.asarray(
+            [len(value) for value in by_rank], dtype=np.int64
+        )
+        xy = sticks[:, 0].astype(np.int64) * shape[1] + sticks[:, 1]
+        plans: list[FFTTransposePlan] = []
+        for rank in range(processes):
+            local_z = int(z_counts[rank])
+            point_blocks = []
+            for peer_sticks in by_rank:
+                peer_xy = xy[peer_sticks]
+                point_blocks.append(
+                    (
+                        peer_xy[None, :] * local_z
+                        + np.arange(local_z, dtype=np.int64)[:, None]
+                    ).ravel()
+                )
+            points = (
+                np.concatenate(point_blocks)
+                if point_blocks
+                else np.empty(0, dtype=np.int64)
+            )
+            plans.append(
+                FFTTransposePlan(
+                    g2r_send_base=z_counts * stick_counts[rank],
+                    g2r_recv_base=local_z * stick_counts,
+                    slab_point_indices=points,
+                )
+            )
+        return cls(
+            shape,
+            int(processes),
+            sticks,
+            owners,
+            by_rank,
+            lookup,
+            tuple(plans),
+        )
+
+    @property
+    def nbytes(self) -> int:
+        return int(
+            self.sticks.nbytes
+            + self.stick_owners.nbytes
+            + self.stick_lookup.nbytes
+            + sum(array.nbytes for array in self.sticks_by_rank)
+            + sum(
+                plan.g2r_send_base.nbytes
+                + plan.g2r_recv_base.nbytes
+                + plan.slab_point_indices.nbytes
+                for plan in self.transpose_plans
+            )
+        )
 
 
 class FFTScratchPool:
@@ -27,6 +272,7 @@ class FFTScratchPool:
 
     def __init__(self) -> None:
         self._complex: dict[str, np.ndarray] = {}
+        self._complex_alignment: dict[str, int] = {}
         self._fftw_plans: dict[
             tuple[object, ...], tuple[object, ...]
         ] = {}
@@ -37,12 +283,35 @@ class FFTScratchPool:
         shape: tuple[int, ...],
         *,
         zero: bool = False,
+        alignment: int | None = None,
     ) -> np.ndarray:
         size = int(np.prod(shape))
         buffer = self._complex.get(name)
-        if buffer is None or buffer.size < size:
-            buffer = np.empty(size, dtype=np.complex128)
+        requested_alignment = 0 if alignment is None else int(alignment)
+        if (
+            buffer is None
+            or buffer.size < size
+            or self._complex_alignment.get(name, 0) < requested_alignment
+        ):
+            if buffer is not None:
+                old_pointer = int(buffer.ctypes.data)
+                for key in list(self._fftw_plans):
+                    if (
+                        key
+                        and key[0] == "local"
+                        and key[-1] == old_pointer
+                    ):
+                        del self._fftw_plans[key]
+            if requested_alignment:
+                import pyfftw
+
+                buffer = pyfftw.empty_aligned(
+                    size, dtype="complex128", n=requested_alignment
+                )
+            else:
+                buffer = np.empty(size, dtype=np.complex128)
             self._complex[name] = buffer
+            self._complex_alignment[name] = requested_alignment
         view = buffer[:size].reshape(shape)
         if zero:
             view.fill(0.0)
@@ -58,7 +327,7 @@ class LocalPotentialWorkspace:
 
     def __init__(
         self,
-        indices: np.ndarray,
+        indices: np.ndarray | PlaneWaveBasis,
         shape: tuple[int, int, int],
         *,
         backend: str = "numpy",
@@ -68,19 +337,26 @@ class LocalPotentialWorkspace:
         mpi: MPIContext | None = None,
         timers: TimingRegistry | None = None,
         scratch_pool: FFTScratchPool | None = None,
+        descriptor: FFTGridDescriptor | None = None,
     ) -> None:
-        self.indices = np.asarray(indices, dtype=np.int32)
+        if isinstance(indices, PlaneWaveBasis):
+            miller = indices.indices
+        else:
+            miller = np.asarray(indices, dtype=np.int32)
+        if miller.ndim != 2 or miller.shape[1] != 3:
+            raise ValueError("indices must have shape (nplane, 3)")
+        self.plane_waves = len(miller)
         self.shape = tuple(shape)
         self.size = int(np.prod(shape))
-        self.slots = tuple(
+        slots = tuple(
             np.asarray(
-                self.indices[:, axis] % shape[axis],
+                miller[:, axis] % shape[axis],
                 dtype=np.int32,
             )
             for axis in range(3)
         )
         self.linear_slots = np.asarray(
-            np.ravel_multi_index(self.slots, self.shape),
+            np.ravel_multi_index(slots, self.shape),
             dtype=np.int32,
         )
         self.use_numba = bool(use_numba)
@@ -92,50 +368,69 @@ class LocalPotentialWorkspace:
         # QE stores complete Z-sticks indexed by (Gx,Gy), then transposes
         # them into real-space Z-plane slabs for the two-dimensional XY FFT.
         self.local_slab = self.mpi.slab(self.shape[2])
-        stick_pairs = np.column_stack((self.slots[0], self.slots[1]))
-        self.sticks, self.stick_indices = np.unique(
-            stick_pairs, axis=0, return_inverse=True
-        )
-        self.sticks = np.asarray(self.sticks, dtype=np.int32)
-        self.stick_indices = np.asarray(
-            self.stick_indices, dtype=np.int32
-        )
-        stick_counts = np.bincount(
-            self.stick_indices, minlength=len(self.sticks)
-        )
-        stick_owners = np.zeros(len(self.sticks), dtype=np.int32)
-        stick_loads = np.zeros(self.mpi.size, dtype=np.int64)
-        for stick in np.argsort(-stick_counts, kind="stable"):
-            owner = int(np.argmin(stick_loads))
-            stick_owners[stick] = owner
-            stick_loads[owner] += stick_counts[stick]
-        self.stick_owners = stick_owners
-        self.sticks_by_rank = [
-            np.asarray(
-                np.flatnonzero(stick_owners == rank),
+        if self.mpi.size == 1:
+            self.descriptor = None
+            self.transpose_plan = None
+            self.sticks = np.unique(
+                np.column_stack((slots[0], slots[1])), axis=0
+            ).astype(np.int32, copy=False)
+            # Serial transforms need only compact linear FFT slots. Avoid
+            # retaining the distributed stick ownership/maps for every k.
+            self.stick_indices = np.empty(0, dtype=np.int32)
+            self.stick_owners = np.empty(0, dtype=np.int32)
+            self.sticks_by_rank = [
+                np.arange(len(self.sticks), dtype=np.int32)
+            ]
+            self.owned_plane_waves = np.empty(0, dtype=bool)
+            self.local_plane_wave_indices = np.arange(
+                self.plane_waves, dtype=np.int32
+            )
+            self.local_slots = tuple(
+                np.empty(0, dtype=np.int32) for _ in range(3)
+            )
+            self.local_stick_positions = np.empty(0, dtype=np.int32)
+        else:
+            if descriptor is None:
+                descriptor = FFTGridDescriptor.build(
+                    miller, self.shape, self.mpi.size
+                )
+            if (
+                descriptor.shape != self.shape
+                or descriptor.processes != self.mpi.size
+            ):
+                raise ValueError(
+                    "FFT descriptor does not match the grid/communicator"
+                )
+            self.descriptor = descriptor
+            self.transpose_plan = descriptor.transpose_plans[self.mpi.rank]
+            self.sticks = descriptor.sticks
+            self.stick_owners = descriptor.stick_owners
+            self.sticks_by_rank = descriptor.sticks_by_rank
+            pair_slots = slots[0] * self.shape[1] + slots[1]
+            self.stick_indices = descriptor.stick_lookup[pair_slots]
+            if np.any(self.stick_indices < 0):
+                raise ValueError(
+                    "FFT descriptor does not cover the plane-wave basis"
+                )
+            self.owned_plane_waves = (
+                self.stick_owners[self.stick_indices] == self.mpi.rank
+            )
+            self.local_plane_wave_indices = np.asarray(
+                np.flatnonzero(self.owned_plane_waves),
                 dtype=np.int32,
             )
-            for rank in range(self.mpi.size)
-        ]
-        self.owned_plane_waves = (
-            stick_owners[self.stick_indices] == self.mpi.rank
-        )
-        self.local_plane_wave_indices = np.asarray(
-            np.flatnonzero(self.owned_plane_waves),
-            dtype=np.int32,
-        )
-        self.local_slots = tuple(
-            axis[self.owned_plane_waves] for axis in self.slots
-        )
-        local_stick_lookup = np.full(
-            len(self.sticks), -1, dtype=np.int32
-        )
-        local_stick_lookup[self.sticks_by_rank[self.mpi.rank]] = np.arange(
-            len(self.sticks_by_rank[self.mpi.rank])
-        )
-        self.local_stick_positions = local_stick_lookup[
-            self.stick_indices[self.owned_plane_waves]
-        ]
+            self.local_slots = tuple(
+                axis[self.owned_plane_waves] for axis in slots
+            )
+            local_stick_lookup = np.full(
+                len(self.sticks), -1, dtype=np.int32
+            )
+            local_stick_lookup[
+                self.sticks_by_rank[self.mpi.rank]
+            ] = np.arange(len(self.sticks_by_rank[self.mpi.rank]))
+            self.local_stick_positions = local_stick_lookup[
+                self.stick_indices[self.owned_plane_waves]
+            ]
         if self.use_numba:
             from .acceleration import numba_kernels
 
@@ -153,7 +448,7 @@ class LocalPotentialWorkspace:
         if effort not in efforts:
             raise QEInputError(
                 "py_fft_planner must be 'estimate', 'measure', or 'patient'"
-            )
+        )
         self.planner_flag = efforts[effort]
         if self.backend == "pyfftw":
             try:
@@ -164,10 +459,126 @@ class LocalPotentialWorkspace:
                     "package; install qepy-pw[fft]"
                 ) from exc
             self._pyfftw = pyfftw
+            self._fft_alignment = int(pyfftw.simd_alignment)
         elif self.backend not in {"numpy", "scipy"}:
             raise QEInputError(
                 "py_fft_backend must be 'scipy', 'numpy', or 'pyfftw'"
             )
+        else:
+            self._fft_alignment = 0
+
+    def _scratch(
+        self,
+        name: str,
+        shape: tuple[int, ...],
+        *,
+        zero: bool = False,
+    ) -> np.ndarray:
+        return self.scratch_pool.complex_buffer(
+            name,
+            shape,
+            zero=zero,
+            alignment=(self._fft_alignment or None),
+        )
+
+    def _planned_local_transform(
+        self,
+        values: np.ndarray,
+        axes: tuple[int, ...],
+        direction: str,
+    ) -> np.ndarray | None:
+        """Run an in-place pyFFTW plan when the reusable array is aligned."""
+        if (
+            self.backend != "pyfftw"
+            or values.dtype != np.complex128
+            or not values.flags.c_contiguous
+            or not any(
+                int(values.ctypes.data) == int(buffer.ctypes.data)
+                for buffer in self.scratch_pool._complex.values()
+            )
+            or not self._pyfftw.is_byte_aligned(
+                values, n=self._fft_alignment
+            )
+        ):
+            return None
+        plan_values = values
+        if (
+            axes == tuple(range(len(axes)))
+            and values.ndim > len(axes) + 1
+        ):
+            # The remaining dimensions are independent transform batches.
+            # Flatten them into one dimension.  Besides reducing planner
+            # metadata, this avoids a pyFFTW/FFTW limitation seen for
+            # rank-3 one-dimensional and rank-4 two-dimensional in-place
+            # plans when SciPy's native libraries are already loaded.
+            plan_values = values.reshape(
+                values.shape[: len(axes)] + (-1,)
+            )
+        cache_key = (
+            "local",
+            direction,
+            plan_values.shape,
+            plan_values.strides,
+            axes,
+            self.threads,
+            self.planner_flag,
+            int(values.ctypes.data),
+        )
+        cached = self.scratch_pool._fftw_plans.get(cache_key)
+        if cached is None:
+            # Keep at most one shape per direction on this reusable buffer.
+            # Otherwise each transient Davidson block shape leaves a plan
+            # object retaining a view of the shared allocation.
+            for key in list(self.scratch_pool._fftw_plans):
+                if (
+                    key
+                    and key[0] == "local"
+                    and key[1] == direction
+                    and key[-1] == int(values.ctypes.data)
+                ):
+                    del self.scratch_pool._fftw_plans[key]
+            # FFTW_MEASURE/PATIENT may overwrite the planning array.
+            preserved = values.copy()
+            try:
+                plan = self._pyfftw.FFTW(
+                    plan_values,
+                    plan_values,
+                    axes=axes,
+                    direction=(
+                        "FFTW_FORWARD"
+                        if direction == "forward"
+                        else "FFTW_BACKWARD"
+                    ),
+                    flags=(self.planner_flag,),
+                    threads=self.threads,
+                )
+            except RuntimeError:
+                # Some FFTW builds reject a SIMD plan after native libraries
+                # have changed alignment assumptions (notably under pytest's
+                # MPI runner).  The unaligned plan remains genuinely in-place
+                # and is preferable to silently allocating SciPy temporaries.
+                plan = self._pyfftw.FFTW(
+                    plan_values,
+                    plan_values,
+                    axes=axes,
+                    direction=(
+                        "FFTW_FORWARD"
+                        if direction == "forward"
+                        else "FFTW_BACKWARD"
+                    ),
+                    flags=(self.planner_flag, "FFTW_UNALIGNED"),
+                    threads=self.threads,
+                )
+            values[...] = preserved
+            cached = (plan,)
+            self.scratch_pool._fftw_plans[cache_key] = cached
+        plan = cached[0]
+        # Keep NumPy/FFTW's conventional pair: backward transforms carry the
+        # 1/N normalization and forward transforms are unscaled.  In pyFFTW,
+        # passing ``normalise_idft=False`` instead normalizes the forward
+        # direction, so the option must remain true for both plan directions.
+        plan(normalise_idft=True)
+        return values
 
     def prepare_potential(self, potential_g: np.ndarray) -> np.ndarray:
         """Transform a fixed local potential once per Hamiltonian."""
@@ -186,6 +597,9 @@ class LocalPotentialWorkspace:
     def _backward_fft(
         self, values: np.ndarray, axes: tuple[int, ...]
     ) -> np.ndarray:
+        planned = self._planned_local_transform(values, axes, "backward")
+        if planned is not None:
+            return planned
         if self.backend in {"scipy", "pyfftw"}:
             return scipy_fft.ifftn(
                 values,
@@ -198,6 +612,9 @@ class LocalPotentialWorkspace:
     def _forward_fft(
         self, values: np.ndarray, axes: tuple[int, ...]
     ) -> np.ndarray:
+        planned = self._planned_local_transform(values, axes, "forward")
+        if planned is not None:
+            return planned
         if self.backend in {"scipy", "pyfftw"}:
             return scipy_fft.fftn(
                 values,
@@ -221,7 +638,7 @@ class LocalPotentialWorkspace:
         expected_rows = (
             len(self.local_plane_wave_indices)
             if self.mpi.size > 1
-            else len(self.indices)
+            else self.plane_waves
         )
         if vectors.ndim != 2 or vectors.shape[0] != expected_rows:
             raise ValueError(
@@ -229,18 +646,14 @@ class LocalPotentialWorkspace:
             )
         number_of_vectors = vectors.shape[1]
         if self.mpi.size == 1:
-            band_slots = (slice(None),) + self.slots
             if self.backend == "pyfftw" and use_scratch:
-                (
-                    reciprocal_input,
-                    real_grid,
-                    _product,
-                    _transformed,
-                    backward,
-                    _forward,
-                ) = self._planned_buffers(number_of_vectors)
-                reciprocal_input.fill(0.0)
-                reciprocal_input[band_slots] = vectors.T * self.size
+                real_grid, backward, _forward = self._planned_buffers(
+                    number_of_vectors
+                )
+                real_grid.fill(0.0)
+                real_grid.reshape(number_of_vectors, self.size)[
+                    :, self.linear_slots
+                ] = vectors.T * self.size
                 timer = (
                     self.timers.measure("fftw")
                     if self.timers is not None
@@ -257,7 +670,9 @@ class LocalPotentialWorkspace:
                         dtype=complex,
                     )
                 )
-                reciprocal_input[band_slots] = vectors.T * self.size
+                reciprocal_input.reshape(number_of_vectors, self.size)[
+                    :, self.linear_slots
+                ] = vectors.T * self.size
                 timer = (
                     self.timers.measure("fftw")
                     if self.timers is not None
@@ -276,7 +691,7 @@ class LocalPotentialWorkspace:
             number_of_vectors,
         )
         data = (
-            self.scratch_pool.complex_buffer(
+            self._scratch(
                 "inverse_sticks", stick_shape, zero=True
             )
             if use_scratch
@@ -296,7 +711,7 @@ class LocalPotentialWorkspace:
             real_slab = self._sticks_to_real_slabs(
                 data,
                 out=(
-                    self.scratch_pool.complex_buffer(
+                    self._scratch(
                         "real_slabs",
                         (
                             self.shape[0],
@@ -321,13 +736,17 @@ class LocalPotentialWorkspace:
     ) -> np.ndarray:
         """Transpose complete reciprocal Z-sticks to real-space Z slabs."""
         number_of_vectors = stick_data.shape[-1]
-        received = self.mpi.exchange_complex(
-            [
-                stick_data[
-                    self.mpi.slab_for_rank(self.shape[2], rank)
-                ]
-                for rank in range(self.mpi.size)
-            ]
+        assert self.transpose_plan is not None
+        send_counts, send_displacements, recv_counts, recv_displacements = (
+            self.transpose_plan.counts(number_of_vectors)
+        )
+        send = np.ascontiguousarray(stick_data).reshape(-1)
+        received = self.mpi.exchange_complex_planned(
+            send,
+            send_counts,
+            send_displacements,
+            recv_counts,
+            recv_displacements,
         )
         local_z = self.local_slab.stop - self.local_slab.start
         expected_shape = (
@@ -343,18 +762,18 @@ class LocalPotentialWorkspace:
                 raise ValueError("real-slab scratch buffer has wrong shape")
             result = out
             result.fill(0.0)
-        for source, block in enumerate(received):
-            source_sticks = self.sticks[self.sticks_by_rank[source]]
-            if len(source_sticks):
-                values = block.reshape(
-                    local_z, len(source_sticks), number_of_vectors
-                )
-                result[
-                    source_sticks[:, 0],
-                    source_sticks[:, 1],
-                    :,
-                    :,
-                ] = np.transpose(values, (1, 0, 2))
+        source_rows = received.reshape(-1, number_of_vectors)
+        destination_rows = result.reshape(-1, number_of_vectors)
+        if self.use_numba:
+            self._jit.scatter_indexed_rows(
+                source_rows,
+                self.transpose_plan.slab_point_indices,
+                destination_rows,
+            )
+        else:
+            destination_rows[
+                self.transpose_plan.slab_point_indices
+            ] = source_rows
         return result
 
     def _real_slabs_to_sticks(
@@ -364,23 +783,10 @@ class LocalPotentialWorkspace:
     ) -> np.ndarray:
         """Transpose real-space Z slabs to complete reciprocal Z-sticks."""
         number_of_vectors = real_data.shape[-1]
-        send_blocks = []
-        for destination in range(self.mpi.size):
-            destination_sticks = self.sticks[
-                self.sticks_by_rank[destination]
-            ]
-            send_blocks.append(
-                np.transpose(
-                    real_data[
-                    destination_sticks[:, 0],
-                    destination_sticks[:, 1],
-                    :,
-                    :,
-                    ],
-                    (1, 0, 2),
-                )
-            )
-        received = self.mpi.exchange_complex(send_blocks)
+        assert self.transpose_plan is not None
+        send_counts, send_displacements, recv_counts, recv_displacements = (
+            self.transpose_plan.counts(number_of_vectors, reverse=True)
+        )
         local_sticks = self.sticks_by_rank[self.mpi.rank]
         expected_shape = (
             self.shape[2],
@@ -388,18 +794,38 @@ class LocalPotentialWorkspace:
             number_of_vectors,
         )
         if out is None:
-            result = np.empty(expected_shape, dtype=complex)
+            result = self._scratch("grid_forward_sticks", expected_shape)
         else:
             if out.shape != expected_shape:
                 raise ValueError("stick scratch buffer has wrong shape")
             result = out
-        for source, block in enumerate(received):
-            z_slice = self.mpi.slab_for_rank(self.shape[2], source)
-            result[z_slice] = block.reshape(
-                z_slice.stop - z_slice.start,
-                len(local_sticks),
-                number_of_vectors,
+        send_size = int(np.sum(send_counts))
+        send, _unused_recv = self.mpi.complex_exchange_buffers(
+            send_size, 0
+        )
+        source_rows = np.asarray(real_data).reshape(-1, number_of_vectors)
+        send_rows = send.reshape(-1, number_of_vectors)
+        if self.use_numba:
+            self._jit.gather_indexed_rows(
+                source_rows,
+                self.transpose_plan.slab_point_indices,
+                send_rows,
             )
+        else:
+            np.take(
+                source_rows,
+                self.transpose_plan.slab_point_indices,
+                axis=0,
+                out=send_rows,
+            )
+        self.mpi.exchange_complex_planned(
+            send,
+            send_counts,
+            send_displacements,
+            recv_counts,
+            recv_displacements,
+            recv_buffer=result,
+        )
         return result
 
     def grid_to_coefficients(self, real_slab: np.ndarray) -> np.ndarray:
@@ -415,7 +841,31 @@ class LocalPotentialWorkspace:
             values = values[..., None]
         if values.shape[:3] != expected:
             raise ValueError("real data does not match this rank's FFT slab")
-        transformed = self._forward_fft(values, (0, 1))
+        if self.mpi.size == 1:
+            transformed = self._forward_fft(values, (0, 1))
+            transformed = self._forward_fft(transformed, (2,)) / self.size
+            result = transformed.reshape(
+                self.size, transformed.shape[-1]
+            )[self.linear_slots]
+            return result[:, 0] if was_scalar else result
+        if self.backend == "pyfftw" and not (
+            values.dtype == np.complex128
+            and values.flags.c_contiguous
+            and any(
+                int(values.ctypes.data) == int(buffer.ctypes.data)
+                for buffer in self.scratch_pool._complex.values()
+            )
+            and self._pyfftw.is_byte_aligned(
+                values, n=self._fft_alignment
+            )
+        ):
+            transformed = self._scratch(
+                "grid_real_slabs", values.shape
+            )
+            transformed[...] = values
+        else:
+            transformed = values
+        transformed = self._forward_fft(transformed, (0, 1))
         transformed = self._real_slabs_to_sticks(transformed)
         transformed = self._forward_fft(transformed, (0,)) / self.size
         result = transformed[
@@ -450,7 +900,7 @@ class LocalPotentialWorkspace:
             transformed = self._forward_fft(real_wavefunctions, (0, 1))
             transformed = self._real_slabs_to_sticks(
                 transformed,
-                out=self.scratch_pool.complex_buffer(
+                out=self._scratch(
                     "forward_sticks",
                     (
                         self.shape[2],
@@ -469,7 +919,7 @@ class LocalPotentialWorkspace:
         self, number_of_vectors: int
     ) -> np.ndarray:
         block_shape = (number_of_vectors,) + self.shape
-        return self.scratch_pool.complex_buffer(
+        return self._scratch(
             "serial_fft_input", block_shape, zero=True
         )
 
@@ -485,44 +935,37 @@ class LocalPotentialWorkspace:
         cached = self.scratch_pool._fftw_plans.get(cache_key)
         if cached is not None:
             return cached
+        # Serial plans own their full-grid work array. Retain only the active
+        # block size so an earlier, smaller Davidson block is released.
+        for key in list(self.scratch_pool._fftw_plans):
+            if key and key[0] != "local":
+                del self.scratch_pool._fftw_plans[key]
         pyfftw = self._pyfftw
         block_shape = (number_of_vectors,) + self.shape
-        reciprocal_input = pyfftw.empty_aligned(
-            block_shape, dtype="complex128"
-        )
-        real_output = pyfftw.empty_aligned(
-            block_shape, dtype="complex128"
-        )
-        product_input = pyfftw.empty_aligned(
-            block_shape, dtype="complex128"
-        )
-        reciprocal_output = pyfftw.empty_aligned(
+        # QE's vloc_psi uses one ``psic`` grid for G->R, multiplies the
+        # potential into it, then transforms that same grid R->G.  Mirror
+        # that layout here: an in-place complex FFT needs only one full-grid
+        # block instead of separate input/output blocks for both directions.
+        grid = pyfftw.empty_aligned(
             block_shape, dtype="complex128"
         )
         backward = pyfftw.FFTW(
-            reciprocal_input,
-            real_output,
+            grid,
+            grid,
             axes=(1, 2, 3),
             direction="FFTW_BACKWARD",
             flags=(self.planner_flag,),
             threads=self.threads,
         )
         forward = pyfftw.FFTW(
-            product_input,
-            reciprocal_output,
+            grid,
+            grid,
             axes=(1, 2, 3),
             direction="FFTW_FORWARD",
             flags=(self.planner_flag,),
             threads=self.threads,
         )
-        buffers = (
-            reciprocal_input,
-            real_output,
-            product_input,
-            reciprocal_output,
-            backward,
-            forward,
-        )
+        buffers = (grid, backward, forward)
         self.scratch_pool._fftw_plans[cache_key] = buffers
         return buffers
 
@@ -537,7 +980,7 @@ class LocalPotentialWorkspace:
         expected_rows = (
             len(self.local_plane_wave_indices)
             if self.mpi.size > 1
-            else len(self.indices)
+            else self.plane_waves
         )
         if vectors.ndim != 2 or vectors.shape[0] != expected_rows:
             raise ValueError(
@@ -559,7 +1002,9 @@ class LocalPotentialWorkspace:
                 )
             else:
                 reciprocal_input.fill(0.0)
-                reciprocal_input[(slice(None),) + self.slots] = vectors.T * self.size
+                reciprocal_input.reshape(number_of_vectors, self.size)[
+                    :, self.linear_slots
+                ] = vectors.T * self.size
             timer = (
                 self.timers.measure("fftw")
                 if self.timers is not None
@@ -604,26 +1049,25 @@ class LocalPotentialWorkspace:
                     1.0,
                 )
             else:
-                result = transformed[(slice(None),) + self.slots].T
+                result = transformed.reshape(
+                    number_of_vectors, self.size
+                )[:, self.linear_slots].T
         else:
-            (
-                reciprocal_input,
-                real_wavefunctions,
-                product,
-                transformed,
-                backward,
-                forward,
-            ) = self._planned_buffers(number_of_vectors)
+            grid, backward, forward = self._planned_buffers(
+                number_of_vectors
+            )
             if self.use_numba:
                 self._jit.scatter_scaled(
-                    reciprocal_input.reshape(number_of_vectors, self.size).T,
+                    grid.reshape(number_of_vectors, self.size).T,
                     self.linear_slots,
                     vectors,
                     float(self.size),
                 )
             else:
-                reciprocal_input.fill(0.0)
-                reciprocal_input[(slice(None),) + self.slots] = vectors.T * self.size
+                grid.fill(0.0)
+                grid.reshape(number_of_vectors, self.size)[
+                    :, self.linear_slots
+                ] = vectors.T * self.size
             timer = (
                 self.timers.measure("fftw")
                 if self.timers is not None
@@ -634,16 +1078,14 @@ class LocalPotentialWorkspace:
             if self.use_numba:
                 self._jit.multiply_real_complex(
                     real_potential.reshape(self.size),
-                    real_wavefunctions.reshape(
-                        number_of_vectors, self.size
-                    ).T,
-                    product.reshape(number_of_vectors, self.size).T,
+                    grid.reshape(number_of_vectors, self.size).T,
+                    grid.reshape(number_of_vectors, self.size).T,
                 )
             else:
                 np.multiply(
                     real_potential[None, ...],
-                    real_wavefunctions,
-                    out=product,
+                    grid,
+                    out=grid,
                 )
             timer = (
                 self.timers.measure("fftw")
@@ -655,25 +1097,26 @@ class LocalPotentialWorkspace:
             if self.use_numba:
                 result = np.empty_like(vectors)
                 self._jit.gather_scaled(
-                    transformed.reshape(number_of_vectors, self.size).T,
+                    grid.reshape(number_of_vectors, self.size).T,
                     self.linear_slots,
                     result,
                     1.0 / self.size,
                 )
             else:
-                result = transformed[(slice(None),) + self.slots].T / self.size
+                result = grid.reshape(number_of_vectors, self.size)[
+                    :, self.linear_slots
+                ].T
+                result /= self.size
         return result[:, 0] if was_vector else result
 
 
-def make_basis(reciprocal: np.ndarray, k_crystal: np.ndarray, ecut_ry: float) -> PlaneWaveBasis:
-    ecut_ha = 0.5 * ecut_ry
-    # For a non-orthogonal reciprocal basis, large integer coefficients can
-    # cancel.  The shortest row norm is therefore not a safe Miller-index
-    # bound.  Since ||n B|| >= sigma_min(B)||n||, the smallest singular value
-    # provides a rigorous search radius for every vector satisfying the
-    # kinetic cutoff.
-    minimum_stretch = float(np.linalg.svd(reciprocal, compute_uv=False)[-1])
-    bound = int(
+def _basis_bound(
+    reciprocal: np.ndarray,
+    k_crystal: np.ndarray,
+    ecut_ha: float,
+    minimum_stretch: float,
+) -> int:
+    return int(
         np.ceil(
             (
                 np.sqrt(2.0 * ecut_ha)
@@ -682,7 +1125,48 @@ def make_basis(reciprocal: np.ndarray, k_crystal: np.ndarray, ecut_ry: float) ->
             / minimum_stretch
         )
     ) + 1
-    integer = np.array(list(itertools.product(range(-bound, bound + 1), repeat=3)), dtype=int)
+
+
+def _miller_grid(bound: int) -> np.ndarray:
+    """Return the lexicographic Miller cube without Python tuple objects."""
+    side = 2 * bound + 1
+    grid = np.indices((side, side, side), dtype=np.int32)
+    grid -= bound
+    return np.moveaxis(grid, 0, -1).reshape(-1, 3)
+
+
+def make_bases(
+    reciprocal: np.ndarray,
+    k_crystal: np.ndarray,
+    ecut_ry: float,
+) -> list[PlaneWaveBasis]:
+    """Build multiple k-point bases from one globally ordered G catalog."""
+    reciprocal = np.asarray(reciprocal, dtype=float)
+    kpoints = np.asarray(k_crystal, dtype=float)
+    if kpoints.ndim == 1:
+        kpoints = kpoints[None, :]
+    if kpoints.ndim != 2 or kpoints.shape[1] != 3:
+        raise ValueError("k_crystal must have shape (3,) or (nk, 3)")
+    if not len(kpoints):
+        raise ValueError("at least one k point is required")
+    ecut_ha = 0.5 * ecut_ry
+    # For a non-orthogonal reciprocal basis, large integer coefficients can
+    # cancel.  The shortest row norm is therefore not a safe Miller-index
+    # bound.  Since ||n B|| >= sigma_min(B)||n||, the smallest singular value
+    # provides a rigorous search radius for every vector satisfying the
+    # kinetic cutoff.
+    minimum_stretch = float(np.linalg.svd(reciprocal, compute_uv=False)[-1])
+    bounds = np.array(
+        [
+            _basis_bound(
+                reciprocal, point, ecut_ha, minimum_stretch
+            )
+            for point in kpoints
+        ],
+        dtype=int,
+    )
+    maximum_bound = int(np.max(bounds))
+    integer = _miller_grid(maximum_bound)
     # QE ggen first orders the global reciprocal vectors by |G|^2, with
     # their original Miller-grid index breaking exact degeneracies. gk_sort
     # subsequently orders the retained vectors by |G+k|^2 and carries that
@@ -692,19 +1176,54 @@ def make_basis(reciprocal: np.ndarray, k_crystal: np.ndarray, ecut_ry: float) ->
     global_g2 = np.einsum("ij,ij->i", global_vectors, global_vectors)
     global_order = _qe_energy_order(global_g2)
     integer = integer[global_order]
-    vectors = (integer + k_crystal) @ reciprocal
-    kinetic = 0.5 * np.einsum("ij,ij->i", vectors, vectors)
-    keep = kinetic <= ecut_ha + 1.0e-12
-    integer, vectors, kinetic = integer[keep], vectors[keep], kinetic[keep]
-    # Stable sorting retains QE's global-G precedence for degenerate G+k.
-    order = _qe_energy_order(kinetic)
-    if not len(order):
-        raise QEInputError("ecutwfc produces an empty plane-wave basis")
-    return PlaneWaveBasis(
-        np.asarray(integer[order], dtype=np.int32),
-        vectors[order],
-        kinetic[order],
+    del global_vectors, global_g2, global_order
+    selected_global_indices: list[np.ndarray] = []
+    for point, bound in zip(kpoints, bounds):
+        if bound == maximum_bound:
+            candidate_global = np.arange(len(integer), dtype=np.int32)
+        else:
+            candidate_global = np.flatnonzero(
+                np.all(np.abs(integer) <= bound, axis=1)
+            ).astype(np.int32)
+        point_integer = integer[candidate_global]
+        vectors = (point_integer + point) @ reciprocal
+        kinetic = 0.5 * np.einsum("ij,ij->i", vectors, vectors)
+        keep = kinetic <= ecut_ha + 1.0e-12
+        candidate_global = candidate_global[keep]
+        kinetic = kinetic[keep]
+        # Stable sorting retains QE's global-G precedence for degenerate G+k.
+        order = _qe_energy_order(kinetic)
+        if not len(order):
+            raise QEInputError("ecutwfc produces an empty plane-wave basis")
+        selected_global_indices.append(
+            np.asarray(candidate_global[order], dtype=np.int32)
+        )
+    used = np.zeros(len(integer), dtype=bool)
+    for selected in selected_global_indices:
+        used[selected] = True
+    compact_global = np.flatnonzero(used).astype(np.int32)
+    remap = np.full(len(integer), -1, dtype=np.int32)
+    remap[compact_global] = np.arange(len(compact_global), dtype=np.int32)
+    catalog = PlaneWaveCatalog(
+        np.asarray(integer[compact_global], dtype=np.int32),
+        reciprocal.copy(),
     )
+    return [
+        PlaneWaveBasis(
+            catalog,
+            np.asarray(remap[selected], dtype=np.int32),
+            np.asarray(point, dtype=float),
+        )
+        for point, selected in zip(kpoints, selected_global_indices)
+    ]
+
+
+def make_basis(
+    reciprocal: np.ndarray,
+    k_crystal: np.ndarray,
+    ecut_ry: float,
+) -> PlaneWaveBasis:
+    return make_bases(reciprocal, k_crystal, ecut_ry)[0]
 
 
 def _qe_energy_order(
@@ -719,6 +1238,10 @@ def _qe_energy_order(
     """
     array = np.asarray(values, dtype=float)
     order = np.argsort(array, kind="stable")
+    if len(order) < 2 or np.all(
+        np.diff(array[order]) >= tolerance
+    ):
+        return order
     start = 0
     while start < len(order):
         stop = start + 1

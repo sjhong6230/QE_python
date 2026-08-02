@@ -41,6 +41,9 @@ def test_norm_conserving_projector_channels_and_hermiticity():
     orbitals = pseudo.atomic_orbitals(
         gk, np.array([0.2, 0.1, 0.3]), 20.0
     )
+    centered = pseudo.atomic_orbital_basis(gk, 20.0)
+    phase = np.exp(-1j * (gk @ np.array([0.2, 0.1, 0.3])))
+    assert np.array_equal(orbitals, centered * phase[:, None])
     assert orbitals.shape == (4, 1)
     assert np.all(np.isfinite(orbitals))
     assert np.linalg.norm(orbitals) > 0.0
@@ -56,8 +59,22 @@ def test_frozen_core_fourier_derivative_matches_finite_difference():
         pseudo.core_density_fourier(q[1:] + step, 20.0)
         - pseudo.core_density_fourier(q[1:] - step, 20.0)
     ) / (2.0 * step)
-    assert derivative[0] == 0.0
-    assert np.allclose(derivative, finite, atol=2.0e-11)
+    # QE differentiates its one-sided four-point cubic table even at q=0;
+    # the exact analytic derivative is zero but the interpolant leaves a
+    # tiny O(dq^3) endpoint value.
+    assert abs(derivative[0]) < 2.0e-8
+    assert np.allclose(derivative[1:], finite[1:], atol=2.0e-11)
+
+
+def test_frozen_core_uses_qe_dq_table_and_reuses_it():
+    pseudo = read_upf(Path(__file__).parent / "data" / "He.local-nc.UPF")
+    q = np.array([0.37, 0.91, 1.43])
+    first = pseudo.core_density_fourier(q, 20.0)
+    table = pseudo._core_density_table
+    assert table is not None
+    second = pseudo.core_density_fourier(q[::-1], 20.0)
+    assert pseudo._core_density_table is table
+    assert np.array_equal(second, first[::-1])
 
 
 def test_analytic_projector_gradient_including_polar_axis():

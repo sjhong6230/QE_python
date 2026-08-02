@@ -10,6 +10,7 @@ from qepy_pw.basis import (
     fft_shape,
     potential_matrix,
     make_basis,
+    make_bases,
 )
 from qepy_pw.diagonalization import (
     FactorizedProjectorTerm,
@@ -71,6 +72,35 @@ def test_make_basis_keeps_vectors_created_by_nonorthogonal_cancellation():
     )
     basis = make_basis(reciprocal, np.zeros(3), 1.1)
     assert np.any(np.all(basis.indices == np.array([5, -5, 0]), axis=1))
+
+
+def test_batched_basis_matches_independent_construction_exactly():
+    reciprocal = np.array(
+        [[1.0, 0.1, 0.0], [0.0, 0.9, 0.2], [0.1, 0.0, 1.1]]
+    )
+    kpoints = np.array(
+        [[0.0, 0.0, 0.0], [0.25, -0.5, 0.25], [-0.75, 0.25, 0.5]]
+    )
+    batched = make_bases(reciprocal, kpoints, 8.0)
+    independent = [
+        make_basis(reciprocal, point, 8.0) for point in kpoints
+    ]
+    for actual, expected in zip(batched, independent):
+        assert actual.catalog is batched[0].catalog
+        assert actual.global_indices.dtype == np.int32
+        assert np.array_equal(actual.indices, expected.indices)
+        assert np.array_equal(actual.vectors, expected.vectors)
+        assert np.array_equal(actual.kinetic, expected.kinetic)
+    compact_bytes = (
+        batched[0].catalog.indices.nbytes
+        + batched[0].catalog.reciprocal.nbytes
+        + sum(item.global_indices.nbytes for item in batched)
+    )
+    replicated_bytes = sum(
+        item.indices.nbytes + item.vectors.nbytes + item.kinetic.nbytes
+        for item in batched
+    )
+    assert compact_bytes < replicated_bytes
 
 
 def test_fft_local_potential_application_matches_dense_convolution():
@@ -296,7 +326,7 @@ def test_fft_scratch_pool_reuses_storage_and_indices_are_compact():
     )
     assert id(pool._complex["serial_fft_input"]) == buffer_id
     assert np.allclose(first, second)
-    assert workspace.indices.dtype == np.int32
+    assert not hasattr(workspace, "indices")
     assert workspace.linear_slots.dtype == np.int32
 
 
@@ -330,14 +360,36 @@ def test_planned_pyfftw_workspace_matches_numpy_backend():
     first_buffers = next(
         iter(fftw_workspace.scratch_pool._fftw_plans.values())
     )
+    assert len(first_buffers) == 3
+    grid, backward, forward = first_buffers
+    assert grid.shape == (vectors.shape[1],) + shape
+    assert grid.nbytes == vectors.shape[1] * np.prod(shape) * 16
+    assert np.shares_memory(backward.input_array, grid)
+    assert np.shares_memory(backward.output_array, grid)
+    assert np.shares_memory(forward.input_array, grid)
+    assert np.shares_memory(forward.output_array, grid)
     first_plan_ids = tuple(id(item) for item in first_buffers)
     repeated = fftw_workspace.apply(
         fftw_workspace.prepare_potential(potential_g), vectors
     )
     repeated_buffers = next(iter(fftw_workspace.scratch_pool._fftw_plans.values()))
     assert tuple(id(item) for item in repeated_buffers) == first_plan_ids
+    expanded_vectors = np.column_stack((vectors, vectors[:, 0]))
+    fftw_workspace.apply(
+        fftw_workspace.prepare_potential(potential_g), expanded_vectors
+    )
+    assert len(fftw_workspace.scratch_pool._fftw_plans) == 1
+    expanded_grid = next(
+        iter(fftw_workspace.scratch_pool._fftw_plans.values())
+    )[0]
+    assert expanded_grid.shape == (expanded_vectors.shape[1],) + shape
+    expected_grid = numpy_workspace.coefficients_to_grid(vectors)
+    actual_grid = fftw_workspace.coefficients_to_grid(
+        vectors, use_scratch=True
+    )
     assert np.allclose(fftw_result, numpy_result, atol=1.0e-12)
     assert np.allclose(repeated, numpy_result, atol=1.0e-12)
+    assert np.allclose(actual_grid, expected_grid, atol=1.0e-12)
 
 
 def test_scipy_overwrite_workspace_matches_numpy_backend():

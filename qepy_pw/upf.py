@@ -89,6 +89,15 @@ class LocalPotential:
     _atomic_wfc_table_volume: float = field(
         default=-1.0, init=False, repr=False
     )
+    _core_density_table: np.ndarray | None = field(
+        default=None, init=False, repr=False
+    )
+    _core_density_table_qmax: float = field(
+        default=-1.0, init=False, repr=False
+    )
+    _core_density_table_volume: float = field(
+        default=-1.0, init=False, repr=False
+    )
 
     def fourier(self, q: np.ndarray, volume: float) -> np.ndarray:
         """Return periodic V_loc(G), in Hartree, with QE's 1/Omega factor."""
@@ -367,48 +376,78 @@ class LocalPotential:
         return transformed.reshape(q_array.shape)
 
     def core_density_fourier(self, q: np.ndarray, volume: float) -> np.ndarray:
-        """Fourier coefficients of the frozen core density in a periodic cell."""
+        """QE-tabulated frozen-core Fourier coefficients."""
         q_array = np.asarray(q, dtype=float)
         if self.core_density is None:
             return np.zeros_like(q_array)
-        assert self.r is not None and self.rab is not None
         flat_q = q_array.reshape(-1)
-        unique_q, inverse = _unique_radial_arguments(flat_q)
-        integrand = spherical_jn(
-            0, np.multiply.outer(unique_q, self.r)
+        if not len(flat_q):
+            return np.empty_like(q_array)
+        table = self._ensure_core_density_table(flat_q, volume)
+        transformed, _ = _qe_cubic_interpolate_with_derivative(
+            table, flat_q, 0.01
         )
-        integrand *= (self.core_density * self.r**2)[None, :]
-        transformed = (
-            4.0
-            * np.pi
-            / volume
-            * _qe_simpson(integrand, self.rab, axis=1)
-        )
-        return transformed[inverse].reshape(q_array.shape)
+        return transformed.reshape(q_array.shape)
 
     def core_density_fourier_derivative(
         self, q: np.ndarray, volume: float
     ) -> np.ndarray:
-        """Radial derivative of the frozen-core Fourier coefficients."""
+        """QE derivative of the cubic frozen-core interpolation table."""
         q_array = np.asarray(q, dtype=float)
         if self.core_density is None:
             return np.zeros_like(q_array)
-        assert self.r is not None and self.rab is not None
         flat_q = q_array.reshape(-1)
-        unique_q, inverse = _unique_radial_arguments(flat_q)
-        qr = np.multiply.outer(unique_q, self.r)
-        radial_density = self.core_density * self.r**2
-        derivative_integrand = spherical_jn(1, qr)
-        derivative_integrand *= -(
-            self.r * radial_density
-        )[None, :]
-        derivative = (
-            4.0
-            * np.pi
-            / volume
-            * _qe_simpson(derivative_integrand, self.rab, axis=1)
+        if not len(flat_q):
+            return np.empty_like(q_array)
+        table = self._ensure_core_density_table(flat_q, volume)
+        _, derivative = _qe_cubic_interpolate_with_derivative(
+            table, flat_q, 0.01
         )
-        return derivative[inverse].reshape(q_array.shape)
+        return derivative.reshape(q_array.shape)
+
+    def _ensure_core_density_table(
+        self, q: np.ndarray, volume: float
+    ) -> np.ndarray:
+        """Build QE ``rhoc_mod:init_tab_rhc`` data through requested q."""
+        if self.core_density is None:
+            raise ValueError("NLCC table requested for a pseudo without NLCC")
+        assert self.r is not None and self.rab is not None
+        maximum_q = float(np.max(np.asarray(q, dtype=float)))
+        if (
+            self._core_density_table is None
+            or self._core_density_table_volume != float(volume)
+            or self._core_density_table_qmax + 1.0e-14 < maximum_q
+        ):
+            beyond = np.flatnonzero(self.r > 10.0)
+            count = int(beyond[0] + 1) if len(beyond) else len(self.r)
+            if count % 2 == 0:
+                count -= 1
+            count = max(1, count)
+            dq = 0.01
+            table_size = int(maximum_q / dq + 4)
+            table_q = np.arange(table_size, dtype=float) * dq
+            bessel = spherical_jn(
+                0, np.multiply.outer(table_q, self.r[:count])
+            )
+            table = (
+                4.0
+                * np.pi
+                / volume
+                * _qe_simpson(
+                    bessel
+                    * (
+                        self.core_density[:count]
+                        * self.r[:count] ** 2
+                    )[None, :],
+                    self.rab[:count],
+                    axis=1,
+                )
+            )
+            self._core_density_table = table
+            self._core_density_table_qmax = maximum_q
+            self._core_density_table_volume = float(volume)
+        assert self._core_density_table is not None
+        return self._core_density_table
 
     def projector_basis(
         self, gk: np.ndarray, volume: float
@@ -506,6 +545,16 @@ class LocalPotential:
         self, gk: np.ndarray, position: np.ndarray, volume: float
     ) -> np.ndarray:
         """Return QE-normalized reciprocal-space atomic trial orbitals."""
+        centered = self.atomic_orbital_basis(gk, volume)
+        if centered.shape[1] == 0:
+            return centered
+        phase = np.exp(-1j * (np.asarray(gk) @ np.asarray(position)))
+        return centered * phase[:, None]
+
+    def atomic_orbital_basis(
+        self, gk: np.ndarray, volume: float
+    ) -> np.ndarray:
+        """Return species-centered atomic trial orbitals without atom phases."""
         gk = np.asarray(gk, dtype=float)
         selected = [
             wavefunction
@@ -516,7 +565,6 @@ class LocalPotential:
             return np.empty((len(gk), 0), dtype=complex)
         assert self.r is not None and self.rab is not None
         q = np.linalg.norm(gk, axis=1)
-        phase = np.exp(-1j * (gk @ np.asarray(position)))
         prefactor = 4.0 * np.pi / np.sqrt(volume)
         # QE's species mesh ``msh`` is shortened while the UPF is read to
         # suppress the numerically noisy large-r tail.  Both the atomic
@@ -583,7 +631,6 @@ class LocalPotential:
                     radial
                     * harmonics[:, channel]
                     * angular_phase
-                    * phase
                 )
         return np.column_stack(columns)
 

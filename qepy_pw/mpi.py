@@ -395,6 +395,85 @@ class MPIContext:
             )
         ]
 
+    def complex_exchange_buffers(
+        self, send_size: int, recv_size: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return grow-only buffers for a planned complex exchange."""
+        if self._exchange_send_buffer.size < send_size:
+            self._exchange_send_buffer = np.empty(
+                send_size, dtype=np.complex128
+            )
+        if self._exchange_recv_buffer.size < recv_size:
+            self._exchange_recv_buffer = np.empty(
+                recv_size, dtype=np.complex128
+            )
+        return (
+            self._exchange_send_buffer[:send_size],
+            self._exchange_recv_buffer[:recv_size],
+        )
+
+    def exchange_complex_planned(
+        self,
+        send_buffer: np.ndarray,
+        send_counts: np.ndarray,
+        send_displacements: np.ndarray,
+        recv_counts: np.ndarray,
+        recv_displacements: np.ndarray,
+        *,
+        recv_buffer: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Execute one descriptor-driven complex Alltoallv.
+
+        Counts and displacements are prepared by the FFT descriptor, so the
+        hot path needs neither a Python-object count exchange nor temporary
+        block lists.
+        """
+        send = np.asarray(send_buffer, dtype=np.complex128).reshape(-1)
+        send_counts = np.asarray(send_counts, dtype=np.int64)
+        send_displacements = np.asarray(
+            send_displacements, dtype=np.int64
+        )
+        recv_counts = np.asarray(recv_counts, dtype=np.int64)
+        recv_displacements = np.asarray(
+            recv_displacements, dtype=np.int64
+        )
+        send_size = int(np.sum(send_counts))
+        recv_size = int(np.sum(recv_counts))
+        if send.size != send_size:
+            raise ValueError("planned MPI send buffer has the wrong size")
+        if recv_buffer is None:
+            _scratch_send, recv = self.complex_exchange_buffers(
+                0, recv_size
+            )
+        else:
+            recv = np.asarray(
+                recv_buffer, dtype=np.complex128
+            ).reshape(-1)
+            if recv.size != recv_size:
+                raise ValueError(
+                    "planned MPI receive buffer has the wrong size"
+                )
+        if self.size == 1:
+            recv[:] = send
+            return recv
+        from mpi4py import MPI
+
+        self.comm.Alltoallv(
+            [
+                send,
+                send_counts,
+                send_displacements,
+                MPI.C_DOUBLE_COMPLEX,
+            ],
+            [
+                recv,
+                recv_counts,
+                recv_displacements,
+                MPI.C_DOUBLE_COMPLEX,
+            ],
+        )
+        return recv
+
     def barrier(self) -> None:
         if self.size > 1:
             self.comm.Barrier()

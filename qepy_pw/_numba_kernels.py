@@ -62,6 +62,32 @@ def gather_scaled(
 
 
 @njit(cache=True, nogil=True)
+def gather_indexed_rows(
+    source: np.ndarray,
+    row_indices: np.ndarray,
+    destination: np.ndarray,
+) -> None:
+    """Pack indexed point rows into a contiguous MPI send matrix."""
+    for row in range(row_indices.size):
+        source_row = row_indices[row]
+        for vector in range(destination.shape[1]):
+            destination[row, vector] = source[source_row, vector]
+
+
+@njit(cache=True, nogil=True)
+def scatter_indexed_rows(
+    source: np.ndarray,
+    row_indices: np.ndarray,
+    destination: np.ndarray,
+) -> None:
+    """Scatter contiguous MPI receive rows into an FFT slab matrix."""
+    for row in range(row_indices.size):
+        destination_row = row_indices[row]
+        for vector in range(source.shape[1]):
+            destination[destination_row, vector] = source[row, vector]
+
+
+@njit(cache=True, nogil=True)
 def accumulate_density(
     density: np.ndarray,
     wavefunction: np.ndarray,

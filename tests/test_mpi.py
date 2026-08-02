@@ -1,6 +1,8 @@
 import numpy as np
+import pytest
 
-from qepy_pw.basis import LocalPotentialWorkspace
+from qepy_pw.basis import FFTGridDescriptor, LocalPotentialWorkspace
+from qepy_pw.diagonalization import _orthonormalize
 from qepy_pw.mpi import MPIContext
 
 
@@ -91,7 +93,83 @@ def test_qe_sticks_are_indexed_by_gx_gy_and_extend_along_gz():
     )
     workspace = LocalPotentialWorkspace(indices, (9, 9, 9))
     assert len(workspace.sticks) == 2
-    first_stick = workspace.stick_indices[0]
-    assert np.all(workspace.stick_indices[:3] == first_stick)
-    assert workspace.stick_indices[3] == workspace.stick_indices[4]
-    assert workspace.stick_indices[3] != first_stick
+    assert {tuple(stick) for stick in workspace.sticks} == {
+        (1, 7),
+        (0, 1),
+    }
+    # Serial workspaces intentionally retain only linear slots; reconstruct
+    # the pairs here to verify that Gz does not enter the stick identity.
+    slots = np.column_stack(
+        np.unravel_index(workspace.linear_slots, workspace.shape)
+    )
+    assert np.all(slots[:3, :2] == slots[0, :2])
+    assert np.all(slots[3:, :2] == slots[3, :2])
+    assert not np.array_equal(slots[0, :2], slots[3, :2])
+
+
+@pytest.mark.parametrize("backend", ["scipy", "pyfftw"])
+def test_distributed_fft_roundtrip_uses_shared_descriptor(backend):
+    mpi = MPIContext.world()
+    if mpi.size == 1:
+        pytest.skip("run this smoke test under mpiexec -n 2 or more")
+    if backend == "pyfftw":
+        pytest.importorskip("pyfftw")
+    shape = (8, 8, 8)
+    frequencies = (-2, -1, 0, 1, 2)
+    indices = np.asarray(
+        [
+            (gx, gy, gz)
+            for gx in frequencies
+            for gy in (-1, 0, 1)
+            for gz in (-1, 0, 1)
+        ],
+        dtype=np.int32,
+    )
+    descriptor = FFTGridDescriptor.build(indices, shape, mpi.size)
+    workspace = LocalPotentialWorkspace(
+        indices,
+        shape,
+        backend=backend,
+        planner_effort="estimate",
+        mpi=mpi,
+        descriptor=descriptor,
+    )
+    rows = workspace.local_plane_wave_indices
+    global_coefficients = (
+        np.arange(len(indices) * 2, dtype=float).reshape(len(indices), 2)
+        + 1j
+        * np.arange(len(indices) * 2, dtype=float)
+        .reshape(len(indices), 2)[::-1]
+    )
+    local = global_coefficients[rows]
+    grid = workspace.coefficients_to_grid(local, use_scratch=True)
+    recovered = workspace.grid_to_coefficients(grid)
+    np.testing.assert_allclose(recovered, local, atol=2.0e-12)
+
+
+def test_fused_distributed_orthonormalization_preserves_constraints():
+    mpi = MPIContext.world()
+    if mpi.size == 1:
+        pytest.skip("run this regression under mpiexec -n 2 or more")
+    rng = np.random.default_rng(812)
+    dimension = 47
+    against_global, _ = np.linalg.qr(
+        rng.normal(size=(dimension, 4))
+        + 1j * rng.normal(size=(dimension, 4))
+    )
+    candidates_global = (
+        rng.normal(size=(dimension, 3))
+        + 1j * rng.normal(size=(dimension, 3))
+    )
+    rows = mpi.slab(dimension)
+    result = _orthonormalize(
+        candidates_global[rows],
+        against=against_global[rows],
+        mpi=mpi,
+    )
+    gram = mpi.sum_array(result.conj().T @ result)
+    overlap = mpi.sum_array(
+        against_global[rows].conj().T @ result
+    )
+    np.testing.assert_allclose(gram, np.eye(3), atol=2.0e-12)
+    np.testing.assert_allclose(overlap, 0.0, atol=2.0e-12)
