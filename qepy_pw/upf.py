@@ -374,8 +374,10 @@ class LocalPotential:
         assert self.r is not None and self.rab is not None
         flat_q = q_array.reshape(-1)
         unique_q, inverse = _unique_radial_arguments(flat_q)
-        bessel = spherical_jn(0, np.multiply.outer(unique_q, self.r))
-        integrand = bessel * (self.core_density * self.r**2)[None, :]
+        integrand = spherical_jn(
+            0, np.multiply.outer(unique_q, self.r)
+        )
+        integrand *= (self.core_density * self.r**2)[None, :]
         transformed = (
             4.0
             * np.pi
@@ -383,6 +385,30 @@ class LocalPotential:
             * _qe_simpson(integrand, self.rab, axis=1)
         )
         return transformed[inverse].reshape(q_array.shape)
+
+    def core_density_fourier_derivative(
+        self, q: np.ndarray, volume: float
+    ) -> np.ndarray:
+        """Radial derivative of the frozen-core Fourier coefficients."""
+        q_array = np.asarray(q, dtype=float)
+        if self.core_density is None:
+            return np.zeros_like(q_array)
+        assert self.r is not None and self.rab is not None
+        flat_q = q_array.reshape(-1)
+        unique_q, inverse = _unique_radial_arguments(flat_q)
+        qr = np.multiply.outer(unique_q, self.r)
+        radial_density = self.core_density * self.r**2
+        derivative_integrand = spherical_jn(1, qr)
+        derivative_integrand *= -(
+            self.r * radial_density
+        )[None, :]
+        derivative = (
+            4.0
+            * np.pi
+            / volume
+            * _qe_simpson(derivative_integrand, self.rab, axis=1)
+        )
+        return derivative[inverse].reshape(q_array.shape)
 
     def projector_basis(
         self, gk: np.ndarray, volume: float

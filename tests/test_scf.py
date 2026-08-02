@@ -7,7 +7,7 @@ import pytest
 
 import qepy_pw.scf as scf_module
 from qepy_pw.errors import QEInputError, UnsupportedFeatureError
-from qepy_pw.input import Atom, KPoint, read_pw_input
+from qepy_pw.input import Atom, KPoint, Species, read_pw_input
 from qepy_pw.output import format_output
 from qepy_pw.scf import (
     SCFSetup,
@@ -208,6 +208,66 @@ def test_hellmann_feynman_force_and_stress_match_scf_energy_derivatives():
     output = format_output(pw, result)
     assert "Forces acting on atoms (cartesian axes, Ry/au)" in output
     assert "total   stress  (Ry/bohr**3)" in output
+
+
+def _finite_xx_stress(pw, strain=2.0e-4):
+    energies = []
+    for sign in (1.0, -1.0):
+        strained = copy.deepcopy(pw)
+        strained.control["tstress"] = False
+        deformation = np.eye(3)
+        deformation[0, 0] += sign * strain
+        strained.lattice = strained.lattice @ deformation
+        strained.atoms = [
+            Atom(atom.label, atom.position @ deformation)
+            for atom in strained.atoms
+        ]
+        energies.append(run_scf(strained).total_energy_ha)
+    return -(energies[0] - energies[1]) / (
+        2.0 * strain * pw.volume
+    )
+
+
+def test_pbe_analytic_stress_matches_scf_energy_derivative():
+    root = Path(__file__).parents[1]
+    pw = read_pw_input(root / "examples" / "h2.scf.in")
+    pw.system["input_dft"] = "PBE"
+    pw.electrons["conv_thr"] = 1.0e-10
+    pw.control["tstress"] = True
+
+    result = run_scf(pw)
+
+    assert result.stress_ha_per_bohr3 is not None
+    assert np.isclose(
+        result.stress_ha_per_bohr3[0, 0],
+        _finite_xx_stress(pw),
+        atol=1.0e-9,
+    )
+
+
+def test_nlcc_analytic_stress_matches_scf_energy_derivative():
+    root = Path(__file__).parents[1]
+    pw = read_pw_input(root / "examples" / "h2.scf.in")
+    pw.control["pseudo_dir"] = str(root / "tests" / "data")
+    pw.control["tstress"] = True
+    pw.system.update(
+        nat=1,
+        ntyp=1,
+        nbnd=1,
+        input_dft="PZ",
+    )
+    pw.electrons["conv_thr"] = 1.0e-10
+    pw.species = [Species("He", 4.0, "He.local-nc.UPF")]
+    pw.atoms = [Atom("He", np.array([6.0, 6.0, 6.0]))]
+
+    result = run_scf(pw)
+
+    assert result.stress_ha_per_bohr3 is not None
+    assert np.isclose(
+        result.stress_ha_per_bohr3[0, 0],
+        _finite_xx_stress(pw),
+        atol=3.0e-9,
+    )
 
 
 def test_real_qe_si_norm_conserving_upf_converges():

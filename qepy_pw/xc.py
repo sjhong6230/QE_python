@@ -69,6 +69,26 @@ def pbe_unpolarized(
     the spectral differential operators lets the SCF driver use either its
     serial FFT or distributed stick decomposition without gathering grids.
     """
+    gradient_array = np.asarray(gradient, dtype=float)
+    epsilon, local_potential, coefficient = pbe_unpolarized_components(
+        rho, gradient_array
+    )
+    flux = coefficient[None, ...] * gradient_array
+    potential = local_potential - np.asarray(divergence(flux), dtype=float)
+    return epsilon, potential
+
+
+def pbe_unpolarized_components(
+    rho: np.ndarray,
+    gradient: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return PBE energy, local potential, and gradient coefficient.
+
+    If ``f_xc = rho * epsilon_xc``, the final array is the scalar
+    coefficient ``c`` in ``d f_xc / d(grad rho) = c * grad rho``.  Keeping
+    this pointwise quantity available lets the SCF driver form both
+    ``-div(c grad rho)`` in the potential and QE's analytic GGA stress.
+    """
     density = np.abs(np.asarray(rho, dtype=float))
     gradient = np.asarray(gradient, dtype=float)
     if gradient.shape != (3, *density.shape):
@@ -162,9 +182,7 @@ def pbe_unpolarized(
         )
         coefficient[gradient_active] = v2_exchange + v2_correlation
 
-    flux = coefficient[None, ...] * gradient
-    potential = local_potential - np.asarray(divergence(flux), dtype=float)
-    return epsilon, potential
+    return epsilon, local_potential, coefficient
 
 
 def pz81_unpolarized(

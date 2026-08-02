@@ -46,6 +46,20 @@ def test_norm_conserving_projector_channels_and_hermiticity():
     assert np.linalg.norm(orbitals) > 0.0
 
 
+def test_frozen_core_fourier_derivative_matches_finite_difference():
+    pseudo = read_upf(Path(__file__).parent / "data" / "He.local-nc.UPF")
+    q = np.array([0.0, 0.4, 1.3, 2.1])
+    derivative = pseudo.core_density_fourier_derivative(q, 20.0)
+    step = 1.0e-5
+    finite = np.zeros_like(q)
+    finite[1:] = (
+        pseudo.core_density_fourier(q[1:] + step, 20.0)
+        - pseudo.core_density_fourier(q[1:] - step, 20.0)
+    ) / (2.0 * step)
+    assert derivative[0] == 0.0
+    assert np.allclose(derivative, finite, atol=2.0e-11)
+
+
 def test_analytic_projector_gradient_including_polar_axis():
     pseudo = read_upf(Path(__file__).parent / "data" / "He.local-nc.UPF")
     gk = np.array(

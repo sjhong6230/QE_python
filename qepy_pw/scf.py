@@ -44,7 +44,7 @@ from .occupations import (
 from .timing import TimingEntry, TimingRegistry
 from .mpi import MPIContext
 from .upf import LocalPotential, read_upf
-from .xc import pbe_unpolarized, pz81_unpolarized
+from .xc import pbe_unpolarized_components, pz81_unpolarized
 from .symmetry import (
     DensitySymmetrizer,
     fft_factors,
@@ -574,6 +574,18 @@ def _xc_energy_potential(
     if workspace is None or g_vectors is None:
         raise ValueError("PBE requires an FFT workspace and reciprocal vectors")
 
+    epsilon, potential, _gradient, _coefficient = _pbe_energy_potential_data(
+        density, workspace, g_vectors
+    )
+    return epsilon, potential
+
+
+def _pbe_energy_potential_data(
+    density: np.ndarray,
+    workspace: LocalPotentialWorkspace,
+    g_vectors: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return PBE energy/potential plus fields needed by GGA stress."""
     coefficients = workspace.grid_to_coefficients(density)
     gradient = np.moveaxis(
         workspace.coefficients_to_grid(
@@ -594,7 +606,13 @@ def _xc_energy_potential(
         )
         return np.sum(derivatives.real, axis=-1)
 
-    return pbe_unpolarized(density, gradient, divergence)
+    epsilon, local_potential, gradient_coefficient = (
+        pbe_unpolarized_components(density, gradient)
+    )
+    potential = local_potential - divergence(
+        gradient_coefficient[None, ...] * gradient
+    )
+    return epsilon, potential, gradient, gradient_coefficient
 
 
 def _hartree(
@@ -1012,6 +1030,7 @@ def _hellmann_feynman_stress(
     weights: np.ndarray,
     occupations: list[np.ndarray],
     density: np.ndarray,
+    core_density: np.ndarray,
     shape: tuple[int, int, int],
     charge_indices: np.ndarray,
     charge_workspace: LocalPotentialWorkspace,
@@ -1023,15 +1042,6 @@ def _hellmann_feynman_stress(
     charges: np.ndarray,
 ) -> np.ndarray:
     """Return analytic compressive-positive HF stress in Ha/bohr^3."""
-    if xc_functional != "pz":
-        raise UnsupportedFeatureError(
-            "analytic stress is currently implemented for LDA/PZ only"
-        )
-    if any(pseudo.has_nlcc for pseudo in pseudos.values()):
-        raise UnsupportedFeatureError(
-            "analytic NLCC stress is not yet implemented"
-        )
-
     volume = pw.volume
     stress = np.zeros((3, 3))
 
@@ -1110,23 +1120,89 @@ def _hellmann_feynman_stress(
         )
     stress += hartree_tensor + hartree_energy / volume * np.eye(3)
 
-    # LDA exchange-correlation contribution. At self-consistency the density
-    # response cancels, leaving QE's -(E_xc - integral rho V_xc)/Omega.
-    epsilon_xc, potential_xc = _xc_energy_potential(
-        density,
-        xc_functional,
-        use_numba=use_numba,
-        workspace=charge_workspace,
-        g_vectors=g_vectors,
-    )
+    # Exchange-correlation contribution. QE's diagonal term contains the
+    # valence-density potential integral, while Exc and every GGA gradient
+    # are evaluated at rho_valence + rho_core.
+    total_density = density + core_density
+    if xc_functional == "pbe":
+        (
+            epsilon_xc,
+            potential_xc,
+            density_gradient,
+            gradient_coefficient,
+        ) = _pbe_energy_potential_data(
+            total_density, charge_workspace, g_vectors
+        )
+    else:
+        epsilon_xc, potential_xc = _xc_energy_potential(
+            total_density,
+            xc_functional,
+            use_numba=use_numba,
+            workspace=charge_workspace,
+            g_vectors=g_vectors,
+        )
+        density_gradient = gradient_coefficient = None
     grid_scale = volume / np.prod(shape)
     xc_energy = grid_scale * mpi.sum_scalar(
-        float(np.sum(density * epsilon_xc))
+        float(np.sum(total_density * epsilon_xc))
     )
     xc_potential_energy = grid_scale * mpi.sum_scalar(
         float(np.sum(density * potential_xc))
     )
     stress -= (xc_energy - xc_potential_energy) / volume * np.eye(3)
+    if density_gradient is not None and gradient_coefficient is not None:
+        stress += mpi.sum_array(
+            np.einsum(
+                "...,i...,j...->ij",
+                gradient_coefficient,
+                density_gradient,
+                density_gradient,
+                optimize=True,
+            )
+        ) / np.prod(shape)
+
+    # Nonlinear core correction. This is QE's stres_cc: the diagonal term
+    # restores the frozen-core part omitted from vtxc, and the radial tensor
+    # differentiates each spherical core profile with respect to |G|.
+    if any(pseudo.has_nlcc for pseudo in pseudos.values()):
+        core_diagonal = mpi.sum_scalar(
+            float(np.sum(core_density * potential_xc))
+        ) / np.prod(shape)
+        core_tensor = np.zeros((3, 3))
+        potential_xc_g = charge_workspace.grid_to_coefficients(
+            potential_xc
+        )
+        for species in pw.species:
+            pseudo = pseudos[species.label]
+            if not pseudo.has_nlcc:
+                continue
+            radial_derivative = pseudo.core_density_fourier_derivative(
+                q, volume
+            )
+            positions = [
+                atom.position
+                for atom in pw.atoms
+                if atom.label == species.label
+            ]
+            structure = sum(
+                np.exp(-1j * (g_vectors @ position))
+                for position in positions
+            )
+            radial_weight = np.zeros_like(q)
+            radial_weight[radial_mask] = np.real(
+                np.conjugate(potential_xc_g[radial_mask])
+                * radial_derivative[radial_mask]
+                * structure[radial_mask]
+            ) / q[radial_mask]
+            core_tensor += mpi.sum_array(
+                np.einsum(
+                    "g,gi,gj->ij",
+                    radial_weight,
+                    g_vectors,
+                    g_vectors,
+                )
+            )
+        stress += core_tensor + core_diagonal * np.eye(3)
 
     # Norm-conserving nonlocal projectors. The diagonal term differentiates
     # beta's Omega^-1/2 normalization; the tensor term differentiates both
@@ -2433,6 +2509,7 @@ def _run_scf(
                     weights,
                     band_occupations,
                     rho,
+                    rho_core,
                     shape,
                     charge_indices,
                     charge_workspace,
