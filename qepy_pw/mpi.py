@@ -437,8 +437,19 @@ class MPIContext:
         recv_displacements = np.asarray(
             recv_displacements, dtype=np.int64
         )
-        send_size = int(np.sum(send_counts))
-        recv_size = int(np.sum(recv_counts))
+        # Planned displacement vectors are prefix sums.  Reading their last
+        # entry avoids two NumPy reductions in every distributed FFT
+        # transpose (tens of thousands of calls on an unreduced k mesh).
+        send_size = (
+            int(send_displacements[-1] + send_counts[-1])
+            if send_counts.size
+            else 0
+        )
+        recv_size = (
+            int(recv_displacements[-1] + recv_counts[-1])
+            if recv_counts.size
+            else 0
+        )
         if send.size != send_size:
             raise ValueError("planned MPI send buffer has the wrong size")
         if recv_buffer is None:

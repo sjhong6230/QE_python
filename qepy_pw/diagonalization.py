@@ -9,6 +9,7 @@ from typing import Callable
 import numpy as np
 from scipy.linalg import eigh
 from scipy.linalg.blas import zgemm
+from scipy.linalg.lapack import zhegv
 
 from .basis import LocalPotentialWorkspace, PlaneWaveBasis
 from .mpi import MPIContext
@@ -28,7 +29,50 @@ class FactorizedProjectorTerm:
     coupling: np.ndarray
 
 
-ProjectorTerm = MaterializedProjectorTerm | FactorizedProjectorTerm
+@dataclass(frozen=True)
+class PackedProjectorTerm:
+    """QE-style atom-packed beta matrix with a precomputed diagonal."""
+
+    beta: np.ndarray
+    coupling: np.ndarray
+    diagonal: np.ndarray
+
+
+ProjectorTerm = (
+    MaterializedProjectorTerm
+    | FactorizedProjectorTerm
+    | PackedProjectorTerm
+)
+
+
+def _lowest_generalized_eigh(
+    hamiltonian: np.ndarray,
+    overlap: np.ndarray,
+    roots: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Solve a small Hermitian generalized problem with low wrapper cost."""
+    dimension = hamiltonian.shape[0]
+    if dimension <= 32:
+        values, vectors, info = zhegv(
+            np.array(hamiltonian, dtype=complex, order="F", copy=True),
+            np.array(overlap, dtype=complex, order="F", copy=True),
+            itype=1,
+            jobz="V",
+            uplo="L",
+            overwrite_a=1,
+            overwrite_b=1,
+        )
+        if info:
+            raise np.linalg.LinAlgError(
+                f"LAPACK zhegv failed with info={info}"
+            )
+        return values[:roots], vectors[:, :roots]
+    return eigh(
+        hamiltonian,
+        overlap,
+        subset_by_index=(0, roots - 1),
+        check_finite=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -97,6 +141,20 @@ class PlaneWaveHamiltonian:
                     )
                 else:
                     localized_terms.append(term)
+            elif isinstance(term, PackedProjectorTerm):
+                if (
+                    self.mpi.size > 1
+                    and term.beta.shape[0] != self.local_rows.size
+                ):
+                    localized_terms.append(
+                        PackedProjectorTerm(
+                            np.asfortranarray(term.beta[self.local_rows]),
+                            term.coupling,
+                            term.diagonal[self.local_rows],
+                        )
+                    )
+                else:
+                    localized_terms.append(term)
             else:
                 beta, coupling = term
                 if (
@@ -112,6 +170,9 @@ class PlaneWaveHamiltonian:
         """Hamiltonian diagonal used by QE's ``usnldiag`` preconditioner."""
         result = self.local_kinetic + self.potential_average
         for term in self.projector_terms:
+            if isinstance(term, PackedProjectorTerm):
+                result = result + term.diagonal
+                continue
             if isinstance(term, FactorizedProjectorTerm):
                 beta = term.beta
                 coupling = term.coupling
@@ -156,7 +217,7 @@ class PlaneWaveHamiltonian:
             descriptors: list[
                 tuple[np.ndarray, np.ndarray, np.ndarray | None]
             ] = []
-            modulated = np.empty_like(vectors)
+            modulated: np.ndarray | None = None
             calbec_timer = (
                 self.timers.measure("h_psi:calbec")
                 if self.timers is not None
@@ -165,6 +226,8 @@ class PlaneWaveHamiltonian:
             with calbec_timer:
                 for term in self.projector_terms:
                     if isinstance(term, FactorizedProjectorTerm):
+                        if modulated is None:
+                            modulated = np.empty_like(vectors)
                         for atom in range(term.phases.shape[1]):
                             phase = term.phases[:, atom]
                             np.multiply(
@@ -184,7 +247,10 @@ class PlaneWaveHamiltonian:
                                 (term.beta, term.coupling, phase)
                             )
                     else:
-                        beta, coupling = term
+                        if isinstance(term, PackedProjectorTerm):
+                            beta, coupling = term.beta, term.coupling
+                        else:
+                            beta, coupling = term
                         overlap_blocks.append(
                             zgemm(
                                 1.0,
@@ -195,8 +261,13 @@ class PlaneWaveHamiltonian:
                         )
                         descriptors.append((beta, coupling, None))
                 counts = [block.shape[0] for block in overlap_blocks]
+                packed_overlaps = (
+                    overlap_blocks[0]
+                    if len(overlap_blocks) == 1
+                    else np.vstack(overlap_blocks)
+                )
                 all_overlaps = self.mpi.sum_array(
-                    np.vstack(overlap_blocks)
+                    packed_overlaps
                 )
             add_timer = (
                 self.timers.measure("add_vuspsi")
@@ -208,14 +279,20 @@ class PlaneWaveHamiltonian:
                 for count, descriptor in zip(counts, descriptors):
                     beta, coupling, phase = descriptor
                     overlaps = all_overlaps[offset : offset + count]
-                    contribution = zgemm(
-                        1.0,
-                        beta,
-                        coupling @ overlaps,
-                    )
-                    if phase is not None:
+                    coupled = coupling @ overlaps
+                    if phase is None:
+                        result = zgemm(
+                            1.0,
+                            beta,
+                            coupled,
+                            beta=1.0,
+                            c=result,
+                            overwrite_c=1,
+                        )
+                    else:
+                        contribution = zgemm(1.0, beta, coupled)
                         contribution *= phase[:, None]
-                    result += contribution
+                        result += contribution
                     offset += count
         return result[:, 0] if was_vector else result
 
@@ -260,8 +337,10 @@ def _orthonormalize(
             remaining_scale = float(
                 np.max(np.abs(np.diag(gram)), initial=0.0)
             )
-            smallest = float(
-                np.min(np.linalg.eigvalsh(gram), initial=0.0)
+            smallest = (
+                float(np.real(gram[0, 0]))
+                if gram.shape == (1, 1)
+                else float(np.min(np.linalg.eigvalsh(gram), initial=0.0))
             )
             if (
                 remaining_scale < 1.0e-8 * raw_scale
@@ -275,6 +354,11 @@ def _orthonormalize(
         else:
             gram = mpi.sum_array(block.conj().T @ block)
         gram = 0.5 * (gram + gram.conj().T)
+        if gram.shape == (1, 1):
+            squared_norm = float(np.real(gram[0, 0]))
+            if squared_norm <= 0.0:
+                return np.empty((block.shape[0], 0), dtype=complex)
+            return block / np.sqrt(squared_norm)
         squared, rotation = eigh(gram, check_finite=False)
         order = np.argsort(squared)[::-1]
         squared = np.maximum(np.real(squared[order]), 0.0)
@@ -294,6 +378,11 @@ def _orthonormalize(
     if against is not None and against.ndim == 2 and against.shape[1]:
         for _ in range(2):
             block -= against @ (against.conj().T @ block)
+    if block.shape[1] == 1:
+        norm = float(np.linalg.norm(block[:, 0]))
+        if norm == 0.0:
+            return np.empty((block.shape[0], 0), dtype=complex)
+        return block / norm
     left, singular_values, _ = np.linalg.svd(block, full_matrices=False)
     if not len(singular_values) or singular_values[0] == 0.0:
         return np.empty((block.shape[0], 0), dtype=complex)
@@ -327,6 +416,34 @@ def _qe_precondition(
     return (2.0 * residuals) / denominator_ry
 
 
+def _normalize_columns(
+    vectors: np.ndarray,
+    mpi: MPIContext,
+    threshold: float = 1.0e-14,
+) -> np.ndarray:
+    """Normalize a correction block as QE ``cegterg`` does."""
+    block = np.asarray(vectors, dtype=complex)
+    if block.ndim == 1:
+        block = block[:, None]
+    squared_norms = np.real(
+        mpi.sum_array(
+            np.einsum(
+                "ij,ij->j", block.real, block.real, optimize=False
+            )
+            + np.einsum(
+                "ij,ij->j", block.imag, block.imag, optimize=False
+            )
+        )
+    )
+    if not len(squared_norms):
+        return np.empty((block.shape[0], 0), dtype=complex)
+    scale = max(float(np.max(squared_norms)), 1.0e-300)
+    keep = squared_norms > threshold**2 * scale
+    if not np.any(keep):
+        return np.empty((block.shape[0], 0), dtype=complex)
+    return block[:, keep] / np.sqrt(squared_norms[keep])[None, :]
+
+
 def davidson(
     operator: BlockOperator,
     diagonal: np.ndarray,
@@ -340,6 +457,8 @@ def davidson(
     residual_energy_scale: float | None = None,
     occupied_roots: int | None = None,
     initial_is_ritz: bool = False,
+    initial_is_orthonormal: bool = False,
+    initial_eigenvalues: np.ndarray | None = None,
     mpi: MPIContext | None = None,
     global_dimension: int | None = None,
     global_row_indices: np.ndarray | None = None,
@@ -402,11 +521,11 @@ def davidson(
                 "(matrix size, at least number_of_roots)"
             )
 
-    if initial_is_ritz:
+    if initial_is_ritz or initial_is_orthonormal:
         # rotate_wfc has already returned orthonormal Ritz vectors in the
-        # required band order. SVD orthonormalization would apply another
-        # arbitrary unitary rotation, invalidating cegterg's lrot assumption
-        # that hc is diagonal and vc is the identity.
+        # required band order; converged vectors from the preceding SCF step
+        # are orthonormal as well. Reorthogonalizing either block adds a
+        # global Gram reduction and may apply an arbitrary unitary rotation.
         basis = np.asarray(
             trial[:, :number_of_roots], dtype=complex
         ).copy()
@@ -429,7 +548,7 @@ def davidson(
     )
     active_columns = basis.shape[1]
     basis_storage = np.empty(
-        (local_dimension, maximum_subspace), dtype=complex
+        (local_dimension, maximum_subspace), dtype=complex, order="F"
     )
     applied_storage = np.empty_like(basis_storage)
     basis_storage[:, :active_columns] = basis
@@ -491,11 +610,10 @@ def davidson(
             if timers is not None
             else nullcontext()
         ):
-            roots, coefficients = eigh(
+            roots, coefficients = _lowest_generalized_eigh(
                 projected_storage[:active_columns, :active_columns],
                 overlap_storage[:active_columns, :active_columns],
-                subset_by_index=(0, number_of_roots - 1),
-                check_finite=False,
+                number_of_roots,
             )
         with (
             timers.measure("cegterg:upda")
@@ -511,10 +629,15 @@ def davidson(
         # QE cegterg(lrot=.true.) trusts rotate_wfc: it does not perform a
         # second initial reduced diagonalization, but starts from the rotated
         # vectors and diagonal projected energies with vc=I.
-        projected_diagonal = mpi.sum_array(
-            np.sum(basis.conj() * applied_basis, axis=0)
-        )
-        values = np.real(projected_diagonal[:number_of_roots])
+        if initial_eigenvalues is None:
+            projected_diagonal = mpi.sum_array(
+                np.sum(basis.conj() * applied_basis, axis=0)
+            )
+            values = np.real(projected_diagonal[:number_of_roots])
+        else:
+            values = np.asarray(
+                initial_eigenvalues[:number_of_roots], dtype=float
+            )
         ritz_vectors = basis[:, :number_of_roots]
         applied_ritz = applied_basis[:, :number_of_roots]
         residuals = (
@@ -522,8 +645,24 @@ def davidson(
         )
     else:
         values, ritz_vectors, applied_ritz, residuals = ritz_pairs()
-    residual_norms = np.sqrt(
-        np.real(mpi.sum_array(np.sum(np.abs(residuals) ** 2, axis=0)))
+    track_residual_norms = (
+        residual_factor is not None or residual_energy_scale is not None
+    )
+
+    def reduced_residual_norms(block: np.ndarray) -> np.ndarray:
+        local_squared = np.einsum(
+            "ij,ij->j", block.real, block.real, optimize=False
+        ) + np.einsum(
+            "ij,ij->j", block.imag, block.imag, optimize=False
+        )
+        return np.sqrt(
+            np.real(mpi.sum_array(local_squared))
+        )
+
+    residual_norms = (
+        reduced_residual_norms(residuals)
+        if track_residual_norms
+        else np.empty(number_of_roots, dtype=float)
     )
     completed_iterations = 0
     number_unconverged = number_of_roots
@@ -542,23 +681,19 @@ def davidson(
                 values[unconverged],
                 diagonal,
             )
-        # QE's cegterg retains a nonorthogonal correction space and solves a
-        # generalized reduced problem.  That is safe with QE's incrementally
-        # maintained overlap matrix, but in this matrix-free Python solver it
-        # can become nearly rank deficient while Ritz values appear stationary.
-        # A rank-revealing, twice-projected basis preserves the same correction
-        # span and prevents false convergence from ill-conditioned overlaps.
-        corrections = _orthonormalize(
-            corrections,
-            against=basis,
-            mpi=mpi,
-        )
+        # QE normalizes each preconditioned residual but deliberately keeps
+        # the correction block nonorthogonal.  The generalized reduced
+        # eigenproblem already contains its overlap matrix; projecting the
+        # corrections against the full Davidson basis adds large BLAS work
+        # and another collective without changing their useful span.
+        corrections = _normalize_columns(corrections, mpi)
         if corrections.shape[1] == 0:
             break
         old_columns = active_columns
         active_columns += corrections.shape[1]
         basis_storage[:, old_columns:active_columns] = corrections
         basis = basis_storage[:, :active_columns]
+        corrections = basis_storage[:, old_columns:active_columns]
         applied_corrections = operator(corrections)
         applied_storage[:, old_columns:active_columns] = (
             applied_corrections
@@ -567,11 +702,8 @@ def davidson(
         hamiltonian_applications += corrections.shape[1]
         update_projected(old_columns)
         values, ritz_vectors, applied_ritz, residuals = ritz_pairs()
-        residual_norms = np.sqrt(
-            np.real(
-                mpi.sum_array(np.sum(np.abs(residuals) ** 2, axis=0))
-            )
-        )
+        if track_residual_norms:
+            residual_norms = reduced_residual_norms(residuals)
         converged = (
             np.abs(values - previous_values) < root_tolerances
         )
@@ -591,6 +723,8 @@ def davidson(
         unconverged = ~converged
         number_unconverged = int(np.count_nonzero(~converged))
         if number_unconverged == 0:
+            if not track_residual_norms:
+                residual_norms = reduced_residual_norms(residuals)
             return DavidsonResult(
                 values,
                 ritz_vectors,
@@ -624,6 +758,8 @@ def davidson(
                     active_columns, dtype=complex
                 )
 
+    if not track_residual_norms:
+        residual_norms = reduced_residual_norms(residuals)
     return DavidsonResult(
         values,
         ritz_vectors,

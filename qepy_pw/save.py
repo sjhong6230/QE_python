@@ -20,6 +20,7 @@ import numpy as np
 
 from .errors import QEInputError
 from .input import PWInput
+from .mpi import MPIContext
 from .scf import SCFResult
 from .version import __version__
 
@@ -622,13 +623,29 @@ def _write_wavefunction(
     kpoint_index: int,
 ) -> None:
     """Write one scalar k point using QE's native ``wfcN.hdf5`` layout."""
-    h5py = _hdf5_module()
     coefficients = np.asarray(
         result.wavefunctions[kpoint_index], dtype=np.complex128
     )
     miller = np.asarray(
         result.wavefunction_miller_indices[kpoint_index], dtype=np.int32
     )
+    _write_wavefunction_data(
+        path, pw, result, kpoint_index, coefficients, miller
+    )
+
+
+def _write_wavefunction_data(
+    path: Path,
+    pw: PWInput,
+    result: SCFResult,
+    kpoint_index: int,
+    coefficients: np.ndarray,
+    miller: np.ndarray,
+) -> None:
+    """Write one already-collected wavefunction matrix."""
+    h5py = _hdf5_module()
+    coefficients = np.asarray(coefficients, dtype=np.complex128)
+    miller = np.asarray(miller, dtype=np.int32)
     eigenvalues = np.asarray(result.eigenvalues_ha[kpoint_index])
     if miller.ndim != 2 or miller.shape[1] != 3:
         raise QEInputError("wavefunction Miller indices must have shape (npw, 3)")
@@ -679,11 +696,148 @@ def _temporary_path(directory: Path, final_name: str) -> Path:
     return Path(name)
 
 
-def write_qe_save(pw: PWInput, result: SCFResult) -> Path | None:
+def _atomic_write(
+    save_directory: Path,
+    final_name: str,
+    writer: Any,
+) -> None:
+    temporary = _temporary_path(save_directory, final_name)
+    try:
+        writer(temporary)
+        os.replace(temporary, save_directory / final_name)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _finish_save_directory(
+    save_directory: Path,
+    pw: PWInput,
+    wavefunction_count: int,
+) -> None:
+    stale_results = save_directory / "results.hdf5"
+    if stale_results.exists():
+        stale_results.unlink()
+    expected_wavefunctions = {
+        f"wfc{index + 1}.hdf5" for index in range(wavefunction_count)
+    }
+    for stale_wavefunction in save_directory.glob("wfc*.hdf5"):
+        if stale_wavefunction.name not in expected_wavefunctions:
+            stale_wavefunction.unlink()
+    for species in pw.species:
+        source = pw.pseudo_dir / species.pseudo_file
+        destination = save_directory / Path(species.pseudo_file).name
+        if source.resolve() != destination.resolve():
+            shutil.copy2(source, destination)
+
+
+def _write_qe_save_distributed(
+    pw: PWInput,
+    result: SCFResult,
+    mpi: MPIContext,
+) -> Path | None:
+    """Collect, write, and release one distributed k point at a time."""
+    kpoints = len(pw.kpoints)
+    validation_error: str | None = None
+    if len(result.wavefunctions) != kpoints:
+        validation_error = (
+            "distributed saved wavefunctions do not cover every k point"
+        )
+    elif len(result.wavefunction_row_indices) != kpoints:
+        validation_error = (
+            "distributed wavefunction row maps do not cover every k point"
+        )
+    elif mpi.is_root and len(result.wavefunction_miller_indices) != kpoints:
+        validation_error = (
+            "root Miller-index maps do not cover every k point"
+        )
+    validation_errors = mpi.comm.allgather(validation_error)
+    first_error = next(
+        (error for error in validation_errors if error is not None), None
+    )
+    if first_error is not None:
+        raise QEInputError(first_error)
+
+    save_directory = resolve_save_directory(pw)
+    setup_error: str | None = None
+    if mpi.is_root:
+        try:
+            save_directory.mkdir(parents=True, exist_ok=True)
+            _atomic_write(
+                save_directory,
+                "charge-density.hdf5",
+                lambda path: _write_charge_density(path, pw, result),
+            )
+        except Exception as exc:  # propagate root I/O failure to every rank
+            setup_error = str(exc)
+    setup_error = mpi.broadcast(setup_error)
+    if setup_error is not None:
+        raise QEInputError(f"cannot initialize distributed save: {setup_error}")
+
+    for kpoint_index, total_rows in enumerate(result.plane_waves_per_k):
+        gathered = mpi.gather_indexed_rows_root(
+            result.wavefunctions[kpoint_index],
+            result.wavefunction_row_indices[kpoint_index],
+            int(total_rows),
+        )
+        write_error: str | None = None
+        if mpi.is_root:
+            try:
+                miller = result.wavefunction_miller_indices[kpoint_index]
+                _atomic_write(
+                    save_directory,
+                    f"wfc{kpoint_index + 1}.hdf5",
+                    lambda path, coefficients=gathered, indices=miller, index=kpoint_index: (
+                        _write_wavefunction_data(
+                            path,
+                            pw,
+                            result,
+                            index,
+                            coefficients,
+                            indices,
+                        )
+                    ),
+                )
+            except Exception as exc:
+                write_error = str(exc)
+        write_error = mpi.broadcast(write_error)
+        if write_error is not None:
+            raise QEInputError(
+                f"cannot write distributed wavefunction {kpoint_index + 1}: "
+                f"{write_error}"
+            )
+
+    finish_error: str | None = None
+    if mpi.is_root:
+        try:
+            _atomic_write(
+                save_directory,
+                "data-file-schema.xml",
+                lambda path: _write_xml(path, pw, result),
+            )
+            _finish_save_directory(save_directory, pw, kpoints)
+        except Exception as exc:
+            finish_error = str(exc)
+    finish_error = mpi.broadcast(finish_error)
+    if finish_error is not None:
+        raise QEInputError(f"cannot finalize distributed save: {finish_error}")
+    return save_directory if mpi.is_root else None
+
+
+def write_qe_save(
+    pw: PWInput,
+    result: SCFResult,
+    mpi: MPIContext | None = None,
+) -> Path | None:
     """Write QE-style XML, density, wavefunctions, and UPFs."""
 
     if not saving_enabled(pw):
         return None
+    if result.wavefunctions_distributed:
+        if mpi is None or mpi.size <= 1:
+            raise QEInputError(
+                "distributed wavefunctions require their MPI context when saving"
+            )
+        return _write_qe_save_distributed(pw, result, mpi)
     save_directory = resolve_save_directory(pw)
     save_directory.mkdir(parents=True, exist_ok=True)
     if len(result.wavefunctions) != len(result.wavefunction_miller_indices):
@@ -711,20 +865,9 @@ def write_qe_save(pw: PWInput, result: SCFResult) -> Path | None:
             writer(temporary, pw, result)
             os.replace(temporary, save_directory / final_name)
             temporary_files.remove(temporary)
-        stale_results = save_directory / "results.hdf5"
-        if stale_results.exists():
-            stale_results.unlink()
-        expected_wavefunctions = {
-            f"wfc{index + 1}.hdf5" for index in range(len(result.wavefunctions))
-        }
-        for stale_wavefunction in save_directory.glob("wfc*.hdf5"):
-            if stale_wavefunction.name not in expected_wavefunctions:
-                stale_wavefunction.unlink()
-        for species in pw.species:
-            source = pw.pseudo_dir / species.pseudo_file
-            destination = save_directory / Path(species.pseudo_file).name
-            if source.resolve() != destination.resolve():
-                shutil.copy2(source, destination)
+        _finish_save_directory(
+            save_directory, pw, len(result.wavefunctions)
+        )
     finally:
         for temporary in temporary_files:
             temporary.unlink(missing_ok=True)

@@ -78,7 +78,7 @@ is restricted to the spherical `ecutrho` charge-density set.
 
 The QE-compatible default `diagonalization='david'` selects restarted block
 Davidson iteration. `diago_david_ndim` controls the maximum subspace as a
-multiple of the requested band count and defaults to 4. Local-potential
+multiple of the requested band count and defaults to 2. Local-potential
 products are evaluated on the FFT grid, while norm-conserving nonlocal terms
 are applied in their compact projector form. Converged wavefunctions seed the
 next SCF iteration. `diagonalization='dense'` is retained as a Python-only
@@ -125,13 +125,12 @@ scatter arrays and product arrays are reused by block size, and the fixed
 local potential is transformed to real space once per Hamiltonian rather
 than once per `Hpsi`. Davidson now follows QE's Ritz-update ordering, reports
 both subspace iterations and actual `Hpsi` vector counts, locks converged
-roots, and refreshes from the current Ritz vectors. A residual safety gate
-is retained because eigenvalue-only acceptance was found to destabilize the
-Python Broyden trajectory. With the reproducible NumPy backend, the complete
-Si calculation converged in 59 iterations and 79.05 s at
-`-21.28499062 Ry`.
+roots, and refreshes from the current Ritz vectors. Optional residual safety
+gates remain available, but the default convergence test is QE's
+consecutive-Ritz-value test.
 
-SciPy pocketfft is the default local FFT backend. It uses overwrite-capable
+When pyFFTW is installed it is selected automatically; otherwise SciPy
+pocketfft is the default local FFT backend. SciPy uses overwrite-capable
 complex transforms so reciprocal coefficients, real-space wavefunctions, and
 forward-transform input can reuse storage. The reproducibility comparison
 backend remains available with `py_fft_backend='numpy'`.
@@ -143,10 +142,21 @@ thread count. Set `py_blas_threads` explicitly to opt into threaded linear
 algebra; `py_fft_threads` independently controls the optional pyFFTW/SciPy
 FFT worker count and also defaults to one.
 
-Like QE, the Davidson path builds the factorized Kleinman--Bylander projector
-basis only for the current k point and releases it after that solve. Projector
-overlaps use BLAS conjugate-transpose operations and one fused MPI reduction
-per `Hpsi`; there is no all-k projector-cache mode.
+Like QE, the Davidson path builds the Kleinman--Bylander projector basis only
+for the current k point and releases it after that solve. Up to 64 projector
+channels are packed into one all-atom matrix with a block-diagonal `PP_DIJ`,
+so one pair of BLAS products replaces the species/atom/channel loop. Larger
+projector sets retain the memory-bounded factorized path. Projector overlaps
+use one fused MPI reduction per `Hpsi`; there is no all-k projector cache.
+
+The current Davidson implementation also mirrors several details of QE's
+`cegterg`: new preconditioned residuals are normalized rather than projected
+against the complete nonorthogonal subspace, an already orthonormal set of
+previous SCF Ritz vectors is accepted without a redundant Gram/SVD pass, and
+residual norms are reduced on every step only when an optional residual gate
+is enabled. Small generalized Ritz problems call LAPACK `zhegv` directly.
+The starting Rayleigh--Ritz matrices share one collective, and their
+eigenvalues seed the first Davidson convergence comparison.
 
 All k-point bases map into one globally ordered G-vector catalog and
 materialize Cartesian vectors only for the current solve. The density-grid
@@ -189,21 +199,23 @@ The alternatives for `py_fft_planner` are `estimate`, `measure`, and
 blocks of 4, 8, and 12 vectors took respectively 41.3, 71.5, and 121.2 ms
 with NumPy; 30.5, 61.0, and 96.0 ms with one-worker SciPy; and 28.5, 58.9,
 and 82.5 ms with one-thread planned pyFFTW. SciPy gives most of the FFTW
-benefit without an optional dependency and is therefore the default.
+benefit without an optional dependency and is therefore the fallback when
+pyFFTW is not installed.
 
 The Python-specific Davidson controls are:
 
-- `py_davidson_maxiter` (default 100);
-- `py_davidson_residual_factor` (default zero, using QE's
-  consecutive-Ritz-value test; set it positive to add a residual gate);
-- `py_davidson_residual_energy_scale` (default 10 Ha; also requires
+- `py_davidson_maxiter` (default 20);
+- `py_davidson_residual_factor` (disabled by default; set it positive to add
+  a residual-norm gate to QE's consecutive-Ritz-value test);
+- `py_davidson_residual_energy_scale` (disabled by default; when positive,
+  also requires
   `max(residual_norm)^2 < scale*ethr` to reject false Ritz-value
-  convergence; set it to zero to reproduce QE's stopping rule).
+  convergence).
 
-The energy-scaled residual safeguard is a Python reliability extension and
-is not part of QE's ordinary Davidson stopping rule. The value 10 was selected
-from the unreduced 216-k-point Si validation: it retains protection from false
-Ritz convergence while reproducing QE's 28-step SCF convergence count.
+The residual safeguards are Python reliability extensions and are not part
+of QE's ordinary Davidson stopping rule. Leaving both controls unspecified
+avoids a small-norm `MPI_Allreduce` at each subspace expansion; final residual
+norms are still evaluated and reported.
 
 Version 0.6.6 adds optional Numba compilation for the scalar/indexed work
 that remains around the library kernels: FFT-grid coefficient
@@ -317,12 +329,14 @@ occupations, optional forces/stress, and timing information.
 Each irreducible k point is written to a QE-layout `wfcN.hdf5` file containing
 its physical Cartesian k vector, reciprocal-basis metadata, ordered Miller
 indices, and the complex `evc` band-by-plane-wave coefficient matrix. In MPI
-runs, distributed non-contiguous plane-wave rows are gathered only to rank
-zero after the final SCF iteration.
+runs, final non-contiguous plane-wave rows remain distributed. One k-point
+matrix at a time is gathered to rank zero, written atomically, and released;
+the save path never assembles all k-point matrices simultaneously.
 Referenced UPF pseudopotentials are copied into the save directory. No
 qepy-specific results container is added. Library callers can use
-`write_qe_save(pw, result)` explicitly; filesystem writes remain root-only in
-MPI command-line runs.
+`write_qe_save(pw, result)` explicitly in serial. In MPI, every rank must call
+`write_qe_save(pw, result, mpi=mpi)` because the per-k-point gathers are
+collective; filesystem writes remain root-only.
 
 `restart_mode='restart'` requires and loads both the saved density and every
 saved k-point wavefunction. With `restart_mode='from_scratch'`,
@@ -343,7 +357,7 @@ allocator fragmentation. At completion, the code also reports the measured
 peak resident set size of the largest rank and the sum of all rank high-water
 marks.
 
-FFT storage is bounded to the currently active Davidson block size rather than
+FFT storage is bounded by the largest active Davidson block rather than
 retaining one full grid for every block size encountered. All sequential
 k-point workspaces are constructed lazily and share one process-local
 distributed-FFT scratch pool and one immutable grid descriptor. Both serial
@@ -351,8 +365,14 @@ and distributed paths multiply inverse-FFT wavefunctions in place. MPI
 exchanges reuse grow-only buffers, collective sums operate in place, and
 Miller, slot, and stick metadata use 32-bit indices. The pyFFTW backend also
 uses planned in-place one- and two-dimensional transforms around the
-distributed transpose; changing block size replaces the previous plan and
-buffer cache.
+distributed transpose. Plans for the encountered block sizes are retained,
+but their array views share one grow-only aligned allocation; growing that
+allocation invalidates and safely rebuilds the affected plans. Thus changing
+Davidson block size does not repeatedly pay `FFTW_MEASURE` planning time and
+does not retain a full-grid allocation for every block size. With saving
+enabled, serial output reuses the final SCF
+eigenvector matrices instead of copying them, while MPI output adds only one
+complete k-point matrix to rank zero's transient write workspace.
 
 Each SCF iteration emits a QE-shaped real-time memory block with process RSS,
 node-available memory, and separate estimates for density/potential grids,
@@ -365,7 +385,9 @@ The footer follows QE's cumulative timing hierarchy. It reports `init_run`,
 `cdiaghg`, Davidson overlap/update/restart work, `h_psi`, projector work,
 `vloc_psi`, and FFT transforms with CPU time, wall time, and call counts.
 Occupied wavefunctions are transformed as one block during `sum_band`, which
-reduces repeated FFT setup, MPI transpose, and allocation overhead.
+reduces repeated FFT setup, MPI transpose, and allocation overhead. Density
+accumulation squares the dead FFT wavefunction buffer in place before the
+band reduction, avoiding a second complex grid-sized temporary.
 
 If Ubuntu provides a version-specific Python package, such as Python 3.14,
 the required package may be named `python3.14-venv`. The quoted `pw.py`

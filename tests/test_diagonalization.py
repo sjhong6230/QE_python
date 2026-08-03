@@ -14,6 +14,7 @@ from qepy_pw.basis import (
 )
 from qepy_pw.diagonalization import (
     FactorizedProjectorTerm,
+    PackedProjectorTerm,
     PlaneWaveHamiltonian,
     davidson,
 )
@@ -185,6 +186,26 @@ def test_factorized_multiatom_projectors_match_materialized_operator():
     compact = PlaneWaveHamiltonian(
         basis, potential_g, factorized
     )
+    packed_beta = np.asfortranarray(
+        np.column_stack(
+            [beta * phases[:, atom, None] for atom in range(phases.shape[1])]
+        )
+    )
+    packed_coupling = np.kron(np.eye(phases.shape[1]), coupling)
+    packed_diagonal = phases.shape[1] * np.real(
+        np.einsum(
+            "gi,ij,gj->g", beta, coupling, beta.conj(), optimize=True
+        )
+    )
+    packed = PlaneWaveHamiltonian(
+        basis,
+        potential_g,
+        (
+            PackedProjectorTerm(
+                packed_beta, packed_coupling, packed_diagonal
+            ),
+        ),
+    )
     assert np.allclose(
         compact.apply(vectors),
         reference.apply(vectors),
@@ -194,6 +215,12 @@ def test_factorized_multiatom_projectors_match_materialized_operator():
         compact.diagonal,
         reference.diagonal,
         atol=1.0e-12,
+    )
+    assert np.allclose(
+        packed.apply(vectors), reference.apply(vectors), atol=1.0e-12
+    )
+    assert np.allclose(
+        packed.diagonal, reference.diagonal, atol=1.0e-12
     )
 
 
@@ -387,6 +414,15 @@ def test_planned_pyfftw_workspace_matches_numpy_backend():
     actual_grid = fftw_workspace.coefficients_to_grid(
         vectors, use_scratch=True
     )
+    assert len(fftw_workspace.scratch_pool._fftw_plans) == 2
+    assert fftw_workspace.scratch_pool.nbytes == expanded_grid.nbytes
+    planned_grids = [
+        buffers[0]
+        for key, buffers in fftw_workspace.scratch_pool._fftw_plans.items()
+        if key[0] == "serial"
+    ]
+    assert len(planned_grids) == 2
+    assert np.shares_memory(planned_grids[0], planned_grids[1])
     assert np.allclose(fftw_result, numpy_result, atol=1.0e-12)
     assert np.allclose(repeated, numpy_result, atol=1.0e-12)
     assert np.allclose(actual_grid, expected_grid, atol=1.0e-12)

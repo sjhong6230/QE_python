@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from contextlib import nullcontext
+from math import prod
 
 import numpy as np
 from scipy.fft import next_fast_len
@@ -20,10 +21,18 @@ class PlaneWaveCatalog:
 
     indices: np.ndarray
     reciprocal: np.ndarray
+    _vectors: np.ndarray = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "_vectors",
+            np.asarray(self.indices @ self.reciprocal, dtype=float),
+        )
 
     @property
     def vectors(self) -> np.ndarray:
-        return self.indices @ self.reciprocal
+        return self._vectors
 
 
 @dataclass(frozen=True, init=False)
@@ -92,9 +101,11 @@ class PlaneWaveBasis:
             assert self._legacy_vectors is not None
             return self._legacy_vectors
         assert self.k_crystal is not None
+        assert self.global_indices is not None
         return (
-            self.indices + self.k_crystal[None, :]
-        ) @ self.catalog.reciprocal
+            self.catalog.vectors[self.global_indices]
+            + self.k_crystal @ self.catalog.reciprocal
+        )
 
     @property
     def kinetic(self) -> np.ndarray:
@@ -112,9 +123,7 @@ class PlaneWaveBasis:
         if self.catalog is None:
             return self
         indices = self.indices
-        vectors = (
-            indices + self.k_crystal[None, :]
-        ) @ self.catalog.reciprocal
+        vectors = self.vectors
         kinetic = 0.5 * np.einsum("ij,ij->i", vectors, vectors)
         return PlaneWaveBasis(indices, vectors, kinetic)
 
@@ -273,6 +282,7 @@ class FFTScratchPool:
     def __init__(self) -> None:
         self._complex: dict[str, np.ndarray] = {}
         self._complex_alignment: dict[str, int] = {}
+        self._complex_pointers: set[int] = set()
         self._fftw_plans: dict[
             tuple[object, ...], tuple[object, ...]
         ] = {}
@@ -285,7 +295,7 @@ class FFTScratchPool:
         zero: bool = False,
         alignment: int | None = None,
     ) -> np.ndarray:
-        size = int(np.prod(shape))
+        size = prod(shape)
         buffer = self._complex.get(name)
         requested_alignment = 0 if alignment is None else int(alignment)
         if (
@@ -295,12 +305,9 @@ class FFTScratchPool:
         ):
             if buffer is not None:
                 old_pointer = int(buffer.ctypes.data)
+                self._complex_pointers.discard(old_pointer)
                 for key in list(self._fftw_plans):
-                    if (
-                        key
-                        and key[0] == "local"
-                        and key[-1] == old_pointer
-                    ):
+                    if key and key[-1] == old_pointer:
                         del self._fftw_plans[key]
             if requested_alignment:
                 import pyfftw
@@ -312,6 +319,7 @@ class FFTScratchPool:
                 buffer = np.empty(size, dtype=np.complex128)
             self._complex[name] = buffer
             self._complex_alignment[name] = requested_alignment
+            self._complex_pointers.add(int(buffer.ctypes.data))
         view = buffer[:size].reshape(shape)
         if zero:
             view.fill(0.0)
@@ -488,17 +496,12 @@ class LocalPotentialWorkspace:
         direction: str,
     ) -> np.ndarray | None:
         """Run an in-place pyFFTW plan when the reusable array is aligned."""
+        pointer = int(values.ctypes.data)
         if (
             self.backend != "pyfftw"
             or values.dtype != np.complex128
             or not values.flags.c_contiguous
-            or not any(
-                int(values.ctypes.data) == int(buffer.ctypes.data)
-                for buffer in self.scratch_pool._complex.values()
-            )
-            or not self._pyfftw.is_byte_aligned(
-                values, n=self._fft_alignment
-            )
+            or pointer not in self.scratch_pool._complex_pointers
         ):
             return None
         plan_values = values
@@ -522,21 +525,10 @@ class LocalPotentialWorkspace:
             axes,
             self.threads,
             self.planner_flag,
-            int(values.ctypes.data),
+            pointer,
         )
         cached = self.scratch_pool._fftw_plans.get(cache_key)
         if cached is None:
-            # Keep at most one shape per direction on this reusable buffer.
-            # Otherwise each transient Davidson block shape leaves a plan
-            # object retaining a view of the shared allocation.
-            for key in list(self.scratch_pool._fftw_plans):
-                if (
-                    key
-                    and key[0] == "local"
-                    and key[1] == direction
-                    and key[-1] == int(values.ctypes.data)
-                ):
-                    del self.scratch_pool._fftw_plans[key]
             # FFTW_MEASURE/PATIENT may overwrite the planning array.
             preserved = values.copy()
             try:
@@ -799,7 +791,11 @@ class LocalPotentialWorkspace:
             if out.shape != expected_shape:
                 raise ValueError("stick scratch buffer has wrong shape")
             result = out
-        send_size = int(np.sum(send_counts))
+        send_size = (
+            int(send_displacements[-1] + send_counts[-1])
+            if send_counts.size
+            else 0
+        )
         send, _unused_recv = self.mpi.complex_exchange_buffers(
             send_size, 0
         )
@@ -851,13 +847,8 @@ class LocalPotentialWorkspace:
         if self.backend == "pyfftw" and not (
             values.dtype == np.complex128
             and values.flags.c_contiguous
-            and any(
-                int(values.ctypes.data) == int(buffer.ctypes.data)
-                for buffer in self.scratch_pool._complex.values()
-            )
-            and self._pyfftw.is_byte_aligned(
-                values, n=self._fft_alignment
-            )
+            and int(values.ctypes.data)
+            in self.scratch_pool._complex_pointers
         ):
             transformed = self._scratch(
                 "grid_real_slabs", values.shape
@@ -926,30 +917,25 @@ class LocalPotentialWorkspace:
     def _planned_buffers(
         self, number_of_vectors: int
     ) -> tuple[object, ...]:
+        block_shape = (number_of_vectors,) + self.shape
+        grid = self._scratch("serial_fft_grid", block_shape)
+        pointer = int(grid.ctypes.data)
         cache_key = (
+            "serial",
             self.shape,
             number_of_vectors,
             self.threads,
             self.planner_flag,
+            pointer,
         )
         cached = self.scratch_pool._fftw_plans.get(cache_key)
         if cached is not None:
             return cached
-        # Serial plans own their full-grid work array. Retain only the active
-        # block size so an earlier, smaller Davidson block is released.
-        for key in list(self.scratch_pool._fftw_plans):
-            if key and key[0] != "local":
-                del self.scratch_pool._fftw_plans[key]
-        pyfftw = self._pyfftw
-        block_shape = (number_of_vectors,) + self.shape
-        # QE's vloc_psi uses one ``psic`` grid for G->R, multiplies the
-        # potential into it, then transforms that same grid R->G.  Mirror
-        # that layout here: an in-place complex FFT needs only one full-grid
-        # block instead of separate input/output blocks for both directions.
-        grid = pyfftw.empty_aligned(
-            block_shape, dtype="complex128"
-        )
-        backward = pyfftw.FFTW(
+        # All block-size plans reference views of one grow-only aligned
+        # allocation.  Davidson revisits only a few sizes, so retaining the
+        # small FFTW plan objects avoids repeated FFTW_MEASURE work without
+        # retaining another full-grid payload for each size.
+        backward = self._pyfftw.FFTW(
             grid,
             grid,
             axes=(1, 2, 3),
@@ -957,7 +943,7 @@ class LocalPotentialWorkspace:
             flags=(self.planner_flag,),
             threads=self.threads,
         )
-        forward = pyfftw.FFTW(
+        forward = self._pyfftw.FFTW(
             grid,
             grid,
             axes=(1, 2, 3),

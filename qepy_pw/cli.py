@@ -42,8 +42,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(text, end="", flush=True)
 
         result = run_scf(pw, progress=report, mpi=mpi)
+        save_directory = write_qe_save(pw, result, mpi=mpi)
         if mpi.is_root:
-            save_directory = write_qe_save(pw, result)
             if save_directory is not None:
                 print(
                     f"\n     Writing XML/HDF5 data to output data dir "

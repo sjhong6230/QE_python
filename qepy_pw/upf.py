@@ -459,11 +459,21 @@ class LocalPotential:
         q = np.linalg.norm(gk, axis=1)
         radial = self.radial_projector_fourier(q, volume)
         columns: list[np.ndarray] = []
-        identities: list[tuple[int, int, int]] = []
+        identities: list[tuple[int, int, int]] | None = (
+            [] if self._expanded_projector_coupling is None else None
+        )
+        # UPFs commonly contain several radial projectors with the same l.
+        # Their angular factors are identical for a given k point, so build
+        # each l block once instead of repeating the SciPy ufunc dispatch.
+        harmonics_by_l: dict[int, np.ndarray] = {}
         for projector_index, projector in enumerate(self.projectors):
-            harmonics = _qe_real_spherical_harmonics(
-                projector.angular_momentum, gk, q
-            )
+            angular_momentum = projector.angular_momentum
+            harmonics = harmonics_by_l.get(angular_momentum)
+            if harmonics is None:
+                harmonics = _qe_real_spherical_harmonics(
+                    angular_momentum, gk, q
+                )
+                harmonics_by_l[angular_momentum] = harmonics
             angular_phase = (-1j) ** projector.angular_momentum
             for channel in range(2 * projector.angular_momentum + 1):
                 columns.append(
@@ -471,12 +481,14 @@ class LocalPotential:
                     * harmonics[:, channel]
                     * angular_phase
                 )
-                identities.append(
-                    (projector_index, projector.angular_momentum, channel)
-                )
+                if identities is not None:
+                    identities.append(
+                        (projector_index, projector.angular_momentum, channel)
+                    )
         beta_matrix = np.asfortranarray(np.column_stack(columns))
         coupling = self._expanded_projector_coupling
         if coupling is None:
+            assert identities is not None
             coupling = np.zeros((len(columns), len(columns)))
             for i, (radial_i, l_i, m_i) in enumerate(identities):
                 for j, (radial_j, l_j, m_j) in enumerate(identities):

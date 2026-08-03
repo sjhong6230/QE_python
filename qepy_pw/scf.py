@@ -25,8 +25,10 @@ from .basis import (
 )
 from .diagonalization import (
     FactorizedProjectorTerm,
+    PackedProjectorTerm,
     PlaneWaveHamiltonian,
     ProjectorTerm,
+    _lowest_generalized_eigh,
     davidson,
 )
 from .errors import QEInputError, UnsupportedFeatureError
@@ -134,9 +136,12 @@ class SCFResult:
     mpi_processes: int = 1
     wavefunctions: list[np.ndarray] = field(default_factory=list)
     wavefunction_miller_indices: list[np.ndarray] = field(default_factory=list)
+    wavefunction_row_indices: list[np.ndarray] = field(default_factory=list)
+    wavefunctions_distributed: bool = False
 
 
 ProgressCallback = Callable[[str, SCFSetup | SCFIteration], None]
+_PACKED_PROJECTOR_CHANNEL_LIMIT = 64
 
 
 @dataclass(frozen=True)
@@ -275,6 +280,40 @@ def _collect_wavefunctions_root(
     return collected, miller_indices
 
 
+def _final_wavefunction_payload(
+    eigenvectors: list[np.ndarray],
+    bases: list[PlaneWaveBasis],
+    workspaces: Sequence[LocalPotentialWorkspace],
+    mpi: MPIContext,
+) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], bool]:
+    """Return serial wavefunctions or rank-local rows for streaming MPI I/O."""
+    if mpi.size == 1:
+        # The serial eigenvectors already use the global basis order.  They
+        # are no longer mutated after this point, so returning the existing
+        # matrices avoids a second all-k resident copy for disk_io != 'none'.
+        return (
+            list(eigenvectors),
+            [np.asarray(basis.indices, dtype=np.int32) for basis in bases],
+            [],
+            False,
+        )
+
+    # Do not gather every complete k-point matrix into rank zero.  The CLI
+    # save path collectively gathers one matrix, writes it, and releases it
+    # before advancing to the next k point.  Only rank zero needs the global
+    # Miller order; all ranks retain their compact row maps.
+    miller = (
+        [np.asarray(basis.indices, dtype=np.int32) for basis in bases]
+        if mpi.is_root
+        else []
+    )
+    rows = [
+        np.asarray(workspaces[index].local_plane_wave_indices, dtype=np.int32)
+        for index in range(len(bases))
+    ]
+    return list(eigenvectors), miller, rows, True
+
+
 class _QERandom:
     """Quantum ESPRESSO ``random_numbers:randy`` stream."""
 
@@ -387,11 +426,12 @@ def _nonlocal_projector_terms(
     basis: PlaneWaveBasis,
     *,
     factorized: bool = False,
+    packed: bool = False,
     local_rows: np.ndarray | None = None,
 ) -> tuple[ProjectorTerm, ...]:
     """Build the compact atom-projector representation of the nonlocal term."""
     basis_vectors = basis.vectors
-    if factorized:
+    if factorized or packed:
         terms: list[ProjectorTerm] = []
         vectors = (
             basis_vectors
@@ -424,6 +464,53 @@ def _nonlocal_projector_terms(
                     coupling,
                 )
             )
+        if packed and terms:
+            factorized_terms = [
+                term
+                for term in terms
+                if isinstance(term, FactorizedProjectorTerm)
+            ]
+            total_channels = sum(
+                term.beta.shape[1] * term.phases.shape[1]
+                for term in factorized_terms
+            )
+            if total_channels > _PACKED_PROJECTOR_CHANNEL_LIMIT:
+                return tuple(terms)
+            packed_beta = np.empty(
+                (len(vectors), total_channels),
+                dtype=complex,
+                order="F",
+            )
+            packed_coupling = np.zeros(
+                (total_channels, total_channels), dtype=float
+            )
+            packed_diagonal = np.zeros(len(vectors), dtype=float)
+            offset = 0
+            for term in factorized_terms:
+                packed_diagonal += term.phases.shape[1] * np.real(
+                    np.einsum(
+                        "gi,ij,gj->g",
+                        term.beta,
+                        term.coupling,
+                        term.beta.conj(),
+                        optimize=True,
+                    )
+                )
+                channels = term.beta.shape[1]
+                for atom in range(term.phases.shape[1]):
+                    block = slice(offset, offset + channels)
+                    np.multiply(
+                        term.beta,
+                        term.phases[:, atom, None],
+                        out=packed_beta[:, block],
+                    )
+                    packed_coupling[block, block] = term.coupling
+                    offset += channels
+            return (
+                PackedProjectorTerm(
+                    packed_beta, packed_coupling, packed_diagonal
+                ),
+            )
         return tuple(terms)
     terms: list[ProjectorTerm] = []
     for atom in pw.atoms:
@@ -454,6 +541,14 @@ def _local_projector_terms(
                     term.coupling,
                 )
             )
+        elif isinstance(term, PackedProjectorTerm):
+            localized.append(
+                PackedProjectorTerm(
+                    np.asfortranarray(term.beta[local_rows]),
+                    term.coupling,
+                    term.diagonal[local_rows],
+                )
+            )
         else:
             beta, coupling = term
             localized.append(
@@ -467,7 +562,16 @@ def _nonlocal_hamiltonian(
 ) -> np.ndarray:
     """Materialize the nonlocal operator for the diagnostic dense solver."""
     result = np.zeros((size, size), dtype=complex)
-    for beta, coupling in terms:
+    for term in terms:
+        if isinstance(term, FactorizedProjectorTerm):
+            for atom in range(term.phases.shape[1]):
+                beta = term.beta * term.phases[:, atom, None]
+                result += (beta @ term.coupling) @ beta.conj().T
+            continue
+        if isinstance(term, PackedProjectorTerm):
+            beta, coupling = term.beta, term.coupling
+        else:
+            beta, coupling = term
         result += (beta @ coupling) @ beta.conj().T
     # Roundoff in transforms should not leak into the Hermitian eigensolver.
     return 0.5 * (result + result.conj().T)
@@ -549,22 +653,27 @@ def _rotate_starting_subspace(
     trials: np.ndarray,
     number_of_bands: int,
     mpi: MPIContext | None = None,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     """Reproduce QE ``wfcinit:rotate_wfc`` before the first Davidson call."""
     atomic_basis = np.asarray(trials, dtype=complex)
     mpi = mpi if mpi is not None else MPIContext()
     applied = operator.apply(atomic_basis)
-    projected = mpi.sum_array(atomic_basis.conj().T @ applied)
-    overlap = mpi.sum_array(atomic_basis.conj().T @ atomic_basis)
+    projected_local = atomic_basis.conj().T @ applied
+    overlap_local = atomic_basis.conj().T @ atomic_basis
+    split = projected_local.size
+    reduced = mpi.sum_array(
+        np.concatenate((projected_local.ravel(), overlap_local.ravel()))
+    )
+    projected = reduced[:split].reshape(projected_local.shape)
+    overlap = reduced[split:].reshape(overlap_local.shape)
     projected = 0.5 * (projected + projected.conj().T)
     overlap = 0.5 * (overlap + overlap.conj().T)
-    _, rotation = eigh(
+    values, rotation = _lowest_generalized_eigh(
         projected,
         overlap,
-        subset_by_index=(0, number_of_bands - 1),
-        check_finite=False,
+        number_of_bands,
     )
-    return atomic_basis @ rotation
+    return atomic_basis @ rotation, values
 
 
 def _frozen_core_density(
@@ -1051,11 +1160,25 @@ def _density_from_states(
             timers.stop("sum_band:wfc", transform_started)
         accumulate_started = timers.start() if timers is not None else None
         if jit is None:
-            rho_local += weight * np.sum(
-                np.abs(psi) ** 2
-                * band_occupations[None, None, None, :band_count],
-                axis=-1,
-            )
+            active_occupations = band_occupations[:band_count]
+            # ``psi`` is FFT scratch and is dead after this accumulation.
+            # Form |psi|^2 in place, avoiding a full-size complex conjugate
+            # temporary at every k point.
+            np.square(psi.real, out=psi.real)
+            np.square(psi.imag, out=psi.imag)
+            np.add(psi.real, psi.imag, out=psi.real)
+            if np.all(active_occupations == active_occupations[0]):
+                density_contribution = active_occupations[0] * np.sum(
+                    psi.real, axis=-1
+                )
+            else:
+                density_contribution = np.einsum(
+                    "...b,b->...",
+                    psi.real,
+                    active_occupations,
+                    optimize=False,
+                )
+            rho_local += weight * density_contribution
         else:
             jit.accumulate_density_weighted_bands(
                 rho_local.ravel(),
@@ -1766,13 +1889,21 @@ def _run_scf(
         for species in pw.species
         if pseudo_by_label[species.label].number_of_projector_channels
     ]
+    packed_projector_channels = sum(
+        channels * atoms for channels, atoms in projector_species_layout
+    )
+    factorized_projector_columns = sum(
+        channels + atoms for channels, atoms in projector_species_layout
+    )
+    projector_columns = (
+        packed_projector_channels
+        if packed_projector_channels <= _PACKED_PROJECTOR_CHANNEL_LIMIT
+        else factorized_projector_columns
+    )
     projector_workspace_bytes = max(
         (
             local_rows
-            * sum(
-                channels + atoms
-                for channels, atoms in projector_species_layout
-            )
+            * projector_columns
             * 16
             for local_rows in local_plane_wave_counts
         ),
@@ -1824,7 +1955,7 @@ def _run_scf(
     if save_wavefunctions and mpi.size > 1:
         estimated_workspace = max(
             estimated_workspace,
-            sum(sizes) * nbnd * np.dtype(np.complex128).itemsize,
+            max(sizes) * nbnd * np.dtype(np.complex128).itemsize,
         )
     setup = SCFSetup(
         kpoints=len(bases),
@@ -2217,6 +2348,7 @@ def _run_scf(
                     pseudo_by_label,
                     basis,
                     factorized=True,
+                    packed=True,
                     local_rows=(
                         local_workspace.local_plane_wave_indices
                         if mpi.size > 1
@@ -2237,6 +2369,7 @@ def _run_scf(
                     potential_average=v_ion_average,
                 )
                 trial_vectors = previous_eigenvectors[kpoint_index]
+                trial_eigenvalues = None
                 if trial_vectors is None:
                     wfcinit_started = timers.start()
                     starting = _atomic_starting_orbitals(
@@ -2250,11 +2383,11 @@ def _run_scf(
                         starting = starting[
                             operator.local_rows
                         ]
-                    trial_vectors = _rotate_starting_subspace(
-                        operator,
-                        starting,
-                        nbnd,
-                        mpi,
+                    (
+                        trial_vectors,
+                        trial_eigenvalues,
+                    ) = _rotate_starting_subspace(
+                        operator, starting, nbnd, mpi
                     )
                     timers.stop("wfcinit", wfcinit_started)
                     del starting
@@ -2280,7 +2413,14 @@ def _run_scf(
                     # Atomic trials have just been Rayleigh-Ritz rotated.
                     # File orbitals may accompany a different starting
                     # potential and must therefore be projected again.
-                    initial_is_ritz=iteration == 1 and not loaded_wavefunctions,
+                    initial_is_ritz=(
+                        iteration == 1 and not loaded_wavefunctions
+                    ),
+                    # rotate_wfc, restart data, and the preceding SCF solve
+                    # all supply orthonormal vectors even when a fresh
+                    # reduced diagonalization is required.
+                    initial_is_orthonormal=True,
+                    initial_eigenvalues=trial_eigenvalues,
                     mpi=mpi,
                     global_dimension=len(basis),
                     global_row_indices=operator.local_rows,
@@ -2317,7 +2457,13 @@ def _run_scf(
             eigenvalues.append(values)
             eigenvectors.append(vectors)
             if diagonalization != "dense":
-                del operator, projector_terms, solution, trial_vectors
+                del (
+                    operator,
+                    projector_terms,
+                    solution,
+                    trial_vectors,
+                    trial_eigenvalues,
+                )
         timers.stop("c_bands", bands_started)
         if occupations_mode == "smearing":
             fermi_energy, band_occupations, smearing_energy = (
@@ -2689,16 +2835,22 @@ def _run_scf(
                 )
                 timers.stop("stress", stress_started)
             if save_wavefunctions:
-                final_wavefunctions, final_miller_indices = (
-                    _collect_wavefunctions_root(
-                        eigenvectors,
-                        bases,
-                        local_workspaces,
-                        mpi,
-                    )
+                (
+                    final_wavefunctions,
+                    final_miller_indices,
+                    final_wavefunction_rows,
+                    wavefunctions_distributed,
+                ) = _final_wavefunction_payload(
+                    eigenvectors,
+                    bases,
+                    local_workspaces,
+                    mpi,
                 )
             else:
-                final_wavefunctions, final_miller_indices = [], []
+                final_wavefunctions = []
+                final_miller_indices = []
+                final_wavefunction_rows = []
+                wavefunctions_distributed = False
             peak_per_rank, peak_all_ranks = _peak_memory_across_ranks(mpi)
             return SCFResult(
                 converged=True,
@@ -2719,22 +2871,30 @@ def _run_scf(
                 mpi_processes=mpi.size,
                 wavefunctions=final_wavefunctions,
                 wavefunction_miller_indices=final_miller_indices,
+                wavefunction_row_indices=final_wavefunction_rows,
+                wavefunctions_distributed=wavefunctions_distributed,
             )
         old_energy = energy
         iteration += 1
     timers.stop("electrons", electrons_started)
     result_density = mpi.gather_z_slabs_root(rho, shape)
     if save_wavefunctions:
-        final_wavefunctions, final_miller_indices = (
-            _collect_wavefunctions_root(
-                eigenvectors,
-                bases,
-                local_workspaces,
-                mpi,
-            )
+        (
+            final_wavefunctions,
+            final_miller_indices,
+            final_wavefunction_rows,
+            wavefunctions_distributed,
+        ) = _final_wavefunction_payload(
+            eigenvectors,
+            bases,
+            local_workspaces,
+            mpi,
         )
     else:
-        final_wavefunctions, final_miller_indices = [], []
+        final_wavefunctions = []
+        final_miller_indices = []
+        final_wavefunction_rows = []
+        wavefunctions_distributed = False
     peak_per_rank, peak_all_ranks = _peak_memory_across_ranks(mpi)
     return SCFResult(
         converged=False,
@@ -2753,4 +2913,6 @@ def _run_scf(
         mpi_processes=mpi.size,
         wavefunctions=final_wavefunctions,
         wavefunction_miller_indices=final_miller_indices,
+        wavefunction_row_indices=final_wavefunction_rows,
+        wavefunctions_distributed=wavefunctions_distributed,
     )

@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from dataclasses import dataclass
 import time
-from typing import Iterator
 
 
 @dataclass
@@ -15,21 +13,34 @@ class TimingEntry:
     calls: int = 0
 
 
+class _Measurement:
+    """Small context manager avoiding generator allocation in hot kernels."""
+
+    __slots__ = ("registry", "name", "cpu_start", "wall_start")
+
+    def __init__(self, registry: "TimingRegistry", name: str) -> None:
+        self.registry = registry
+        self.name = name
+        self.cpu_start = 0.0
+        self.wall_start = 0.0
+
+    def __enter__(self) -> None:
+        self.cpu_start = time.process_time()
+        self.wall_start = time.perf_counter()
+
+    def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
+        entry = self.registry.entries.setdefault(self.name, TimingEntry())
+        entry.cpu_seconds += time.process_time() - self.cpu_start
+        entry.wall_seconds += time.perf_counter() - self.wall_start
+        entry.calls += 1
+
+
 class TimingRegistry:
     def __init__(self) -> None:
         self.entries: dict[str, TimingEntry] = {}
 
-    @contextmanager
-    def measure(self, name: str) -> Iterator[None]:
-        cpu_start = time.process_time()
-        wall_start = time.perf_counter()
-        try:
-            yield
-        finally:
-            entry = self.entries.setdefault(name, TimingEntry())
-            entry.cpu_seconds += time.process_time() - cpu_start
-            entry.wall_seconds += time.perf_counter() - wall_start
-            entry.calls += 1
+    def measure(self, name: str) -> _Measurement:
+        return _Measurement(self, name)
 
     def start(self) -> tuple[float, float]:
         return time.process_time(), time.perf_counter()
