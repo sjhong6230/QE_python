@@ -23,6 +23,7 @@ from .input import PWInput
 from .mpi import MPIContext
 from .scf import SCFResult
 from .version import __version__
+from .xc import canonical_xc_name
 
 
 QES_NAMESPACE = "http://www.quantum-espresso.org/ns/qes/qes-1.0"
@@ -134,8 +135,17 @@ def _atomic_structure(parent: ET.Element, pw: PWInput) -> None:
 
 def _dft(parent: ET.Element, pw: PWInput) -> None:
     dft = ET.SubElement(parent, _qes("dft"))
-    requested = str(pw.system.get("input_dft", "PZ")).upper()
-    functional = "SLA PW PBX PBC" if "PBE" in requested else "SLA PZ NOGX NOGC"
+    selected = canonical_xc_name(
+        pw.system.get("_resolved_xc", pw.system.get("input_dft", "PZ"))
+    ) or "pz"
+    functional = {
+        "pz": "SLA PZ NOGX NOGC",
+        "pw": "SLA PW NOGX NOGC",
+        "pbe": "SLA PW PBX PBC",
+        "pbesol": "SLA PW PSX PSC",
+        "revpbe": "SLA PW REVX PBC",
+        "rpbe": "SLA PW HHNX PBC",
+    }[selected]
     _text(dft, "functional", functional)
 
 
@@ -208,8 +218,22 @@ def _input_xml(root: ET.Element, pw: PWInput, result: SCFResult) -> None:
         ("max_nstep", pw.electrons.get("electron_maxstep", 100)),
         ("tq_smoothing", False),
         ("tbeta_smoothing", False),
-        ("diago_thr_init", pw.electrons.get("diago_thr_init", 1.0e-2)),
-        ("diago_full_acc", False),
+        (
+            "diago_thr_init",
+            pw.electrons.get(
+                "diago_thr_init",
+                1.0e-5
+                if str(pw.electrons.get("startingpot", "atomic")).lower()
+                == "file"
+                else 1.0e-2,
+            ),
+        ),
+        ("diago_cg_maxiter", pw.electrons.get("diago_cg_maxiter", 20)),
+        ("diago_david_ndim", pw.electrons.get("diago_david_ndim", 2)),
+        ("diago_rmm_ndim", pw.electrons.get("diago_rmm_ndim", 4)),
+        ("diago_rmm_conv", pw.electrons.get("diago_rmm_conv", False)),
+        ("diago_gs_nblock", pw.electrons.get("diago_gs_nblock", 16)),
+        ("diago_full_acc", pw.electrons.get("diago_full_acc", False)),
     )
     for tag, value in electron_values:
         _text(electrons, tag, value)

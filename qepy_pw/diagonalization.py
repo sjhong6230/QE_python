@@ -7,11 +7,8 @@ from contextlib import nullcontext
 from typing import Callable
 
 import numpy as np
-from scipy.linalg import eigh
-from scipy.linalg.blas import zgemm
-from scipy.linalg.lapack import zhegv
 
-from .basis import LocalPotentialWorkspace, PlaneWaveBasis
+from .basis import LocalPotentialWorkspace, PlaneWaveBasis, _load_native_fft
 from .mpi import MPIContext
 from .timing import TimingRegistry
 
@@ -50,29 +47,29 @@ def _lowest_generalized_eigh(
     overlap: np.ndarray,
     roots: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Solve a small Hermitian generalized problem with low wrapper cost."""
-    dimension = hamiltonian.shape[0]
-    if dimension <= 32:
-        values, vectors, info = zhegv(
-            np.array(hamiltonian, dtype=complex, order="F", copy=True),
-            np.array(overlap, dtype=complex, order="F", copy=True),
-            itype=1,
-            jobz="V",
-            uplo="L",
-            overwrite_a=1,
-            overwrite_b=1,
-        )
-        if info:
-            raise np.linalg.LinAlgError(
-                f"LAPACK zhegv failed with info={info}"
-            )
-        return values[:roots], vectors[:, :roots]
-    return eigh(
-        hamiltonian,
-        overlap,
-        subset_by_index=(0, roots - 1),
-        check_finite=False,
+    """Solve a small Hermitian generalized problem without importing SciPy.
+
+    Davidson's reduced matrices are only a few tens of rows in normal SCF
+    runs.  A Cholesky reduction followed by NumPy's LAPACK-backed ``eigh``
+    avoids the sizeable per-rank SciPy extension-module baseline while doing
+    the same Hermitian-definite transformation as LAPACK ``zhegv``.
+    """
+    native_result = _load_native_fft().generalized_eigh(
+        hamiltonian, overlap, roots
     )
+    if native_result is not None:
+        return native_result
+    hamiltonian = np.asarray(hamiltonian, dtype=complex)
+    overlap = np.asarray(overlap, dtype=complex)
+    cholesky = np.linalg.cholesky(overlap)
+    left_reduced = np.linalg.solve(cholesky, hamiltonian)
+    reduced = np.linalg.solve(
+        np.conjugate(cholesky), left_reduced.T
+    ).T
+    reduced = 0.5 * (reduced + reduced.conj().T)
+    values, transformed = np.linalg.eigh(reduced)
+    vectors = np.linalg.solve(cholesky.conj().T, transformed)
+    return values[:roots], vectors[:, :roots]
 
 
 @dataclass(frozen=True)
@@ -97,6 +94,7 @@ class PlaneWaveHamiltonian:
         local_workspace: LocalPotentialWorkspace | None = None,
         timers: TimingRegistry | None = None,
         real_potential: np.ndarray | None = None,
+        native_potential_layout: bool = False,
         potential_average: float | None = None,
     ) -> None:
         self.basis = basis
@@ -112,6 +110,7 @@ class PlaneWaveHamiltonian:
             if real_potential is not None
             else self.local_workspace.prepare_potential(potential_g)
         )
+        self.native_potential_layout = bool(native_potential_layout)
         self.potential_average = (
             float(potential_average)
             if potential_average is not None
@@ -205,19 +204,29 @@ class PlaneWaveHamiltonian:
         result = self.local_kinetic[:, None] * vectors
         if self.timers is None:
             result += self.local_workspace.apply(
-                self.real_potential, vectors
+                self.real_potential,
+                vectors,
+                native_potential_layout=self.native_potential_layout,
             )
         else:
             with self.timers.measure("vloc_psi"):
                 result += self.local_workspace.apply(
-                    self.real_potential, vectors
+                    self.real_potential,
+                    vectors,
+                    native_potential_layout=self.native_potential_layout,
                 )
+        descriptors: list[
+            tuple[np.ndarray, np.ndarray, np.ndarray | None]
+        ] = []
+        counts: list[int] = []
+        all_overlaps: np.ndarray | None = None
         if self.projector_terms:
             overlap_blocks: list[np.ndarray] = []
-            descriptors: list[
-                tuple[np.ndarray, np.ndarray, np.ndarray | None]
-            ] = []
-            modulated: np.ndarray | None = None
+            # One Npw-by-nband buffer serves both the conjugated overlap
+            # input and the nonlocal contribution.  In particular, avoid
+            # materializing beta.conj(), whose size grows with the number of
+            # atoms/projectors and was previously hidden inside BLAS wrappers.
+            nonlocal_buffer = np.empty_like(vectors)
             calbec_timer = (
                 self.timers.measure("h_psi:calbec")
                 if self.timers is not None
@@ -226,23 +235,17 @@ class PlaneWaveHamiltonian:
             with calbec_timer:
                 for term in self.projector_terms:
                     if isinstance(term, FactorizedProjectorTerm):
-                        if modulated is None:
-                            modulated = np.empty_like(vectors)
                         for atom in range(term.phases.shape[1]):
                             phase = term.phases[:, atom]
+                            np.conjugate(vectors, out=nonlocal_buffer)
                             np.multiply(
-                                vectors,
-                                np.conjugate(phase)[:, None],
-                                out=modulated,
+                                nonlocal_buffer,
+                                phase[:, None],
+                                out=nonlocal_buffer,
                             )
-                            overlap_blocks.append(
-                                zgemm(
-                                    1.0,
-                                    term.beta,
-                                    modulated,
-                                    trans_a=2,
-                                )
-                            )
+                            overlap = term.beta.T @ nonlocal_buffer
+                            np.conjugate(overlap, out=overlap)
+                            overlap_blocks.append(overlap)
                             descriptors.append(
                                 (term.beta, term.coupling, phase)
                             )
@@ -251,14 +254,10 @@ class PlaneWaveHamiltonian:
                             beta, coupling = term.beta, term.coupling
                         else:
                             beta, coupling = term
-                        overlap_blocks.append(
-                            zgemm(
-                                1.0,
-                                beta,
-                                vectors,
-                                trans_a=2,
-                            )
-                        )
+                        np.conjugate(vectors, out=nonlocal_buffer)
+                        overlap = beta.T @ nonlocal_buffer
+                        np.conjugate(overlap, out=overlap)
+                        overlap_blocks.append(overlap)
                         descriptors.append((beta, coupling, None))
                 counts = [block.shape[0] for block in overlap_blocks]
                 packed_overlaps = (
@@ -269,6 +268,8 @@ class PlaneWaveHamiltonian:
                 all_overlaps = self.mpi.sum_array(
                     packed_overlaps
                 )
+        if self.projector_terms:
+            assert all_overlaps is not None
             add_timer = (
                 self.timers.measure("add_vuspsi")
                 if self.timers is not None
@@ -280,19 +281,10 @@ class PlaneWaveHamiltonian:
                     beta, coupling, phase = descriptor
                     overlaps = all_overlaps[offset : offset + count]
                     coupled = coupling @ overlaps
-                    if phase is None:
-                        result = zgemm(
-                            1.0,
-                            beta,
-                            coupled,
-                            beta=1.0,
-                            c=result,
-                            overwrite_c=1,
-                        )
-                    else:
-                        contribution = zgemm(1.0, beta, coupled)
-                        contribution *= phase[:, None]
-                        result += contribution
+                    np.matmul(beta, coupled, out=nonlocal_buffer)
+                    if phase is not None:
+                        nonlocal_buffer *= phase[:, None]
+                    result += nonlocal_buffer
                     offset += count
         return result[:, 0] if was_vector else result
 
@@ -359,7 +351,7 @@ def _orthonormalize(
             if squared_norm <= 0.0:
                 return np.empty((block.shape[0], 0), dtype=complex)
             return block / np.sqrt(squared_norm)
-        squared, rotation = eigh(gram, check_finite=False)
+        squared, rotation = np.linalg.eigh(gram)
         order = np.argsort(squared)[::-1]
         squared = np.maximum(np.real(squared[order]), 0.0)
         rotation = rotation[:, order]
@@ -405,15 +397,11 @@ def _qe_precondition(
     # not a harmless common rescaling: it produces different correction
     # vectors and, at the deliberately loose first-iteration threshold,
     # different Ritz values.
-    x_ry = 2.0 * (
-        diagonal[:, None] - eigenvalues[None, :]
+    return _load_native_fft().qe_precondition(
+        np.asarray(residuals, dtype=np.complex128),
+        np.ascontiguousarray(eigenvalues, dtype=np.float64),
+        np.ascontiguousarray(diagonal, dtype=np.float64),
     )
-    denominator_ry = 0.5 * (
-        1.0
-        + x_ry
-        + np.sqrt(1.0 + (x_ry - 1.0) ** 2)
-    )
-    return (2.0 * residuals) / denominator_ry
 
 
 def _normalize_columns(
@@ -425,15 +413,9 @@ def _normalize_columns(
     block = np.asarray(vectors, dtype=complex)
     if block.ndim == 1:
         block = block[:, None]
+    native = _load_native_fft()
     squared_norms = np.real(
-        mpi.sum_array(
-            np.einsum(
-                "ij,ij->j", block.real, block.real, optimize=False
-            )
-            + np.einsum(
-                "ij,ij->j", block.imag, block.imag, optimize=False
-            )
-        )
+        mpi.sum_array(native.column_squared_norms(block))
     )
     if not len(squared_norms):
         return np.empty((block.shape[0], 0), dtype=complex)
@@ -441,7 +423,12 @@ def _normalize_columns(
     keep = squared_norms > threshold**2 * scale
     if not np.any(keep):
         return np.empty((block.shape[0], 0), dtype=complex)
-    return block[:, keep] / np.sqrt(squared_norms[keep])[None, :]
+    selected = np.ascontiguousarray(np.flatnonzero(keep), dtype=np.int64)
+    return native.normalize_selected_columns(
+        block,
+        np.ascontiguousarray(squared_norms, dtype=np.float64),
+        selected,
+    )
 
 
 def davidson(
@@ -650,10 +637,8 @@ def davidson(
     )
 
     def reduced_residual_norms(block: np.ndarray) -> np.ndarray:
-        local_squared = np.einsum(
-            "ij,ij->j", block.real, block.real, optimize=False
-        ) + np.einsum(
-            "ij,ij->j", block.imag, block.imag, optimize=False
+        local_squared = _load_native_fft().column_squared_norms(
+            np.asarray(block, dtype=np.complex128)
         )
         return np.sqrt(
             np.real(mpi.sum_array(local_squared))
@@ -768,4 +753,393 @@ def davidson(
         False,
         number_unconverged,
         hamiltonian_applications,
+    )
+
+
+def _iterative_root_tolerances(
+    number_of_roots: int,
+    tolerance: float,
+    occupied_roots: int | None,
+    full_accuracy: bool,
+) -> np.ndarray:
+    if occupied_roots is None or full_accuracy:
+        occupied_roots = number_of_roots
+    if not 0 <= occupied_roots <= number_of_roots:
+        raise ValueError(
+            "occupied_roots must be between zero and number_of_roots"
+        )
+    tolerances = np.full(
+        number_of_roots, max(5.0 * tolerance, 5.0e-6)
+    )
+    tolerances[:occupied_roots] = tolerance
+    return tolerances
+
+
+def _column_norms(vectors: np.ndarray, mpi: MPIContext) -> np.ndarray:
+    local = _load_native_fft().column_squared_norms(
+        np.asarray(vectors, dtype=np.complex128)
+    )
+    return np.sqrt(np.maximum(np.real(mpi.sum_array(local)), 0.0))
+
+
+def _global_inner(
+    left: np.ndarray, right: np.ndarray, mpi: MPIContext
+) -> complex:
+    return complex(
+        mpi.sum_array(
+            np.asarray([np.vdot(left, right)], dtype=np.complex128)
+        )[0]
+    )
+
+
+def _initial_iterative_subspace(
+    operator: BlockOperator,
+    number_of_roots: int,
+    initial_vectors: np.ndarray,
+    mpi: MPIContext,
+    *,
+    initial_is_orthonormal: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    trial = np.asarray(initial_vectors, dtype=complex)
+    if trial.ndim != 2 or trial.shape[1] < number_of_roots:
+        raise ValueError(
+            "initial_vectors must contain at least number_of_roots columns"
+        )
+    vectors = (
+        trial[:, :number_of_roots].copy()
+        if initial_is_orthonormal
+        else _orthonormalize(trial, mpi=mpi)[:, :number_of_roots]
+    )
+    if vectors.shape[1] < number_of_roots:
+        raise ValueError("initial vectors are linearly dependent")
+    applied = operator(vectors)
+    projected = mpi.sum_array(vectors.conj().T @ applied)
+    projected = 0.5 * (projected + projected.conj().T)
+    values, rotation = np.linalg.eigh(projected)
+    rotation = rotation[:, :number_of_roots]
+    return (
+        vectors @ rotation,
+        np.real(values[:number_of_roots]),
+        applied @ rotation,
+        number_of_roots,
+    )
+
+
+def conjugate_gradient(
+    operator: BlockOperator,
+    diagonal: np.ndarray,
+    number_of_roots: int,
+    *,
+    initial_vectors: np.ndarray,
+    tolerance: float = 1.0e-8,
+    max_iterations: int = 20,
+    occupied_roots: int | None = None,
+    full_accuracy: bool = False,
+    initial_is_orthonormal: bool = False,
+    mpi: MPIContext | None = None,
+) -> DavidsonResult:
+    """QE-style preconditioned band-by-band conjugate-gradient solver."""
+    if tolerance <= 0.0:
+        raise ValueError("diagonalization tolerance must be positive")
+    if max_iterations < 1:
+        raise ValueError("diago_cg_maxiter must be at least 1")
+    mpi = mpi if mpi is not None else MPIContext()
+    vectors, values, applied, applications = _initial_iterative_subspace(
+        operator,
+        number_of_roots,
+        initial_vectors,
+        mpi,
+        initial_is_orthonormal=initial_is_orthonormal,
+    )
+    root_tolerances = _iterative_root_tolerances(
+        number_of_roots,
+        tolerance,
+        occupied_roots,
+        full_accuracy,
+    )
+    unconverged = 0
+    iteration_sum = 0
+    for band in range(number_of_roots):
+        psi = vectors[:, band].copy()
+        hpsi = applied[:, band].copy()
+        if band:
+            lower = vectors[:, :band]
+            coefficients = mpi.sum_array(lower.conj().T @ psi)
+            psi -= lower @ coefficients
+            hpsi -= applied[:, :band] @ coefficients
+            norm = np.sqrt(
+                max(float(np.real(_global_inner(psi, psi, mpi))), 1.0e-300)
+            )
+            psi /= norm
+            hpsi /= norm
+        energy = float(np.real(_global_inner(psi, hpsi, mpi)))
+        previous_direction: np.ndarray | None = None
+        converged = False
+        for iteration in range(1, max_iterations + 1):
+            residual = hpsi - energy * psi
+            correction = _qe_precondition(
+                residual[:, None], np.array([energy]), diagonal
+            )[:, 0]
+            candidates = (
+                correction[:, None]
+                if previous_direction is None
+                else np.column_stack((correction, previous_direction))
+            )
+            against = np.column_stack((vectors[:, :band], psi))
+            candidates = _orthonormalize(
+                candidates, against=against, mpi=mpi
+            )
+            if not candidates.shape[1]:
+                break
+            h_candidates = operator(candidates)
+            applications += candidates.shape[1]
+            small_basis = np.column_stack((psi, candidates))
+            h_small_basis = np.column_stack((hpsi, h_candidates))
+            h_small = mpi.sum_array(
+                small_basis.conj().T @ h_small_basis
+            )
+            s_small = mpi.sum_array(
+                small_basis.conj().T @ small_basis
+            )
+            roots, coefficients = _lowest_generalized_eigh(
+                h_small, s_small, 1
+            )
+            old_energy = energy
+            coefficient = coefficients[:, 0]
+            previous_direction = candidates @ coefficient[1:]
+            psi = small_basis @ coefficient
+            hpsi = h_small_basis @ coefficient
+            energy = float(roots[0])
+            if abs(energy - old_energy) < root_tolerances[band]:
+                converged = True
+                iteration_sum += iteration
+                break
+        if not converged:
+            unconverged += 1
+            iteration_sum += max_iterations
+        vectors[:, band] = psi
+        applied[:, band] = hpsi
+        values[band] = energy
+    order = np.argsort(values)
+    values = values[order]
+    vectors = vectors[:, order]
+    applied = applied[:, order]
+    residuals = applied - vectors * values[None, :]
+    return DavidsonResult(
+        values,
+        vectors,
+        _column_norms(residuals, mpi),
+        max(1, int(round(iteration_sum / number_of_roots))),
+        unconverged == 0,
+        unconverged,
+        applications,
+    )
+
+
+def parallel_orbital(
+    operator: BlockOperator,
+    diagonal: np.ndarray,
+    number_of_roots: int,
+    *,
+    initial_vectors: np.ndarray,
+    tolerance: float = 1.0e-8,
+    max_iterations: int = 20,
+    occupied_roots: int | None = None,
+    full_accuracy: bool = False,
+    initial_is_orthonormal: bool = False,
+    mpi: MPIContext | None = None,
+) -> DavidsonResult:
+    """Parallel orbital-updating iteration with a bounded 2N Ritz space."""
+    if tolerance <= 0.0 or max_iterations < 1:
+        raise ValueError("invalid ParO diagonalization controls")
+    mpi = mpi if mpi is not None else MPIContext()
+    vectors, values, applied, applications = _initial_iterative_subspace(
+        operator,
+        number_of_roots,
+        initial_vectors,
+        mpi,
+        initial_is_orthonormal=initial_is_orthonormal,
+    )
+    root_tolerances = _iterative_root_tolerances(
+        number_of_roots, tolerance, occupied_roots, full_accuracy
+    )
+    unconverged = np.ones(number_of_roots, dtype=bool)
+    residuals = applied - vectors * values[None, :]
+    for iteration in range(1, max_iterations + 1):
+        corrections = _qe_precondition(
+            residuals[:, unconverged],
+            values[unconverged],
+            diagonal,
+        )
+        corrections = _orthonormalize(
+            corrections, against=vectors, mpi=mpi
+        )
+        if not corrections.shape[1]:
+            break
+        applied_corrections = operator(corrections)
+        applications += corrections.shape[1]
+        basis = np.column_stack((vectors, corrections))
+        h_basis = np.column_stack((applied, applied_corrections))
+        h_small = mpi.sum_array(basis.conj().T @ h_basis)
+        s_small = mpi.sum_array(basis.conj().T @ basis)
+        new_values, coefficients = _lowest_generalized_eigh(
+            h_small, s_small, number_of_roots
+        )
+        old_values = values
+        vectors = basis @ coefficients
+        applied = h_basis @ coefficients
+        values = new_values
+        residuals = applied - vectors * values[None, :]
+        unconverged = np.abs(values - old_values) >= root_tolerances
+        if not np.any(unconverged):
+            return DavidsonResult(
+                values,
+                vectors,
+                _column_norms(residuals, mpi),
+                iteration,
+                True,
+                0,
+                applications,
+            )
+    return DavidsonResult(
+        values,
+        vectors,
+        _column_norms(residuals, mpi),
+        max_iterations,
+        False,
+        int(np.count_nonzero(unconverged)),
+        applications,
+    )
+
+
+def _blocked_orthonormalize(
+    vectors: np.ndarray, block_size: int, mpi: MPIContext
+) -> np.ndarray:
+    blocks: list[np.ndarray] = []
+    for start in range(0, vectors.shape[1], block_size):
+        against = np.column_stack(blocks) if blocks else None
+        block = _orthonormalize(
+            vectors[:, start : start + block_size],
+            against=against,
+            mpi=mpi,
+        )
+        if block.shape[1]:
+            blocks.append(block)
+    return np.column_stack(blocks) if blocks else np.empty(
+        (vectors.shape[0], 0), dtype=complex
+    )
+
+
+def rmm_diis(
+    operator: BlockOperator,
+    diagonal: np.ndarray,
+    number_of_roots: int,
+    *,
+    initial_vectors: np.ndarray,
+    tolerance: float = 1.0e-8,
+    max_iterations: int = 20,
+    history_dimension: int = 4,
+    converge: bool = False,
+    gram_schmidt_block: int = 16,
+    occupied_roots: int | None = None,
+    full_accuracy: bool = False,
+    initial_is_orthonormal: bool = False,
+    mpi: MPIContext | None = None,
+) -> DavidsonResult:
+    """Residual-minimization method with per-band DIIS histories."""
+    if history_dimension < 2:
+        raise ValueError("diago_rmm_ndim must be at least 2")
+    if gram_schmidt_block < 1:
+        raise ValueError("diago_gs_nblock must be at least 1")
+    mpi = mpi if mpi is not None else MPIContext()
+    vectors, values, applied, applications = _initial_iterative_subspace(
+        operator,
+        number_of_roots,
+        initial_vectors,
+        mpi,
+        initial_is_orthonormal=initial_is_orthonormal,
+    )
+    tolerances = _iterative_root_tolerances(
+        number_of_roots, tolerance, occupied_roots, full_accuracy
+    )
+    vector_history: list[list[np.ndarray]] = [
+        [] for _ in range(number_of_roots)
+    ]
+    residual_history: list[list[np.ndarray]] = [
+        [] for _ in range(number_of_roots)
+    ]
+    residuals = applied - vectors * values[None, :]
+    unconverged = np.ones(number_of_roots, dtype=bool)
+    limit = max_iterations if converge else 1
+    for iteration in range(1, limit + 1):
+        trial = vectors.copy()
+        for band in range(number_of_roots):
+            vector_history[band].append(vectors[:, band].copy())
+            residual_history[band].append(residuals[:, band].copy())
+            if len(vector_history[band]) > history_dimension:
+                vector_history[band].pop(0)
+                residual_history[band].pop(0)
+            count = len(vector_history[band])
+            if count > 1:
+                phi = np.column_stack(vector_history[band])
+                res = np.column_stack(residual_history[band])
+                residual_gram = mpi.sum_array(res.conj().T @ res)
+                overlap = mpi.sum_array(phi.conj().T @ phi)
+                _, coefficients = _lowest_generalized_eigh(
+                    residual_gram, overlap, 1
+                )
+                trial[:, band] = phi @ coefficients[:, 0]
+        trial = _blocked_orthonormalize(
+            trial, gram_schmidt_block, mpi
+        )
+        if trial.shape[1] < number_of_roots:
+            break
+        trial = trial[:, :number_of_roots]
+        h_trial = operator(trial)
+        applications += number_of_roots
+        h_small = mpi.sum_array(trial.conj().T @ h_trial)
+        h_small = 0.5 * (h_small + h_small.conj().T)
+        new_values, rotation = np.linalg.eigh(h_small)
+        old_values = values
+        values = np.real(new_values[:number_of_roots])
+        rotation = rotation[:, :number_of_roots]
+        vectors = trial @ rotation
+        applied = h_trial @ rotation
+        residuals = applied - vectors * values[None, :]
+        corrections = _qe_precondition(residuals, values, diagonal)
+        corrections = _orthonormalize(
+            corrections, against=vectors, mpi=mpi
+        )
+        if corrections.shape[1]:
+            h_corrections = operator(corrections)
+            applications += corrections.shape[1]
+            basis = np.column_stack((vectors, corrections))
+            h_basis = np.column_stack((applied, h_corrections))
+            h_small = mpi.sum_array(basis.conj().T @ h_basis)
+            s_small = mpi.sum_array(basis.conj().T @ basis)
+            values, coefficients = _lowest_generalized_eigh(
+                h_small, s_small, number_of_roots
+            )
+            vectors = basis @ coefficients
+            applied = h_basis @ coefficients
+            residuals = applied - vectors * values[None, :]
+        unconverged = np.abs(values - old_values) >= tolerances
+        if not np.any(unconverged):
+            return DavidsonResult(
+                values,
+                vectors,
+                _column_norms(residuals, mpi),
+                iteration,
+                True,
+                0,
+                applications,
+            )
+    return DavidsonResult(
+        values,
+        vectors,
+        _column_norms(residuals, mpi),
+        limit,
+        not converge,
+        0 if not converge else int(np.count_nonzero(unconverged)),
+        applications,
     )

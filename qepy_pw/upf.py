@@ -13,27 +13,15 @@ import re
 import xml.etree.ElementTree as ET
 
 import numpy as np
-from scipy.special import erf, spherical_jn
-
-try:
-    # SciPy >= 1.15; argument order is (l, m, theta, phi).
-    from scipy.special import sph_harm_y as _scipy_sph_harm_y
-
-    def _complex_spherical_harmonic(
-        l: int, m: int, theta: np.ndarray, phi: np.ndarray
-    ) -> np.ndarray:
-        return _scipy_sph_harm_y(l, m, theta, phi)
-
-except ImportError:
-    # SciPy < 1.15; deprecated argument order is (m, l, phi, theta).
-    from scipy.special import sph_harm as _scipy_sph_harm
-
-    def _complex_spherical_harmonic(
-        l: int, m: int, theta: np.ndarray, phi: np.ndarray
-    ) -> np.ndarray:
-        return _scipy_sph_harm(m, l, phi, theta)
 
 from .errors import QEInputError, UnsupportedFeatureError
+from .special import erf, spherical_harmonic, spherical_jn
+
+
+def _complex_spherical_harmonic(
+    l: int, m: int, theta: np.ndarray, phi: np.ndarray
+) -> np.ndarray:
+    return spherical_harmonic(l, m, theta, phi)
 
 
 @dataclass(frozen=True)
@@ -63,6 +51,9 @@ class LocalPotential:
     rab: np.ndarray | None
     vloc_ry: np.ndarray | None
     coulomb: bool
+    generated: str = ""
+    pseudo_type: str = "NC"
+    mesh_size: int = 0
     core_density: np.ndarray | None = None
     atomic_density: np.ndarray | None = None
     projectors: tuple[RadialProjector, ...] = ()
@@ -98,6 +89,69 @@ class LocalPotential:
     _core_density_table_volume: float = field(
         default=-1.0, init=False, repr=False
     )
+    _local_potential_table: np.ndarray | None = field(
+        default=None, init=False, repr=False
+    )
+    _local_potential_table_qmax: float = field(
+        default=-1.0, init=False, repr=False
+    )
+    _local_potential_table_volume: float = field(
+        default=-1.0, init=False, repr=False
+    )
+
+    def _ensure_local_potential_table(
+        self, maximum_q: float, volume: float
+    ) -> np.ndarray:
+        """Build QE's dq=.01 short-range Vloc table only when it must grow."""
+        assert (
+            self.r is not None
+            and self.rab is not None
+            and self.vloc_ry is not None
+        )
+        if (
+            self._local_potential_table is not None
+            and self._local_potential_table_volume == float(volume)
+            and self._local_potential_table_qmax + 1.0e-14 >= maximum_q
+        ):
+            return self._local_potential_table
+        beyond = np.flatnonzero(self.r > 10.0)
+        count = int(beyond[0] + 1) if len(beyond) else len(self.r)
+        if count % 2 == 0:
+            count -= 1
+        count = max(1, count)
+        r = self.r[:count]
+        rab = self.rab[:count]
+        v_ha = 0.5 * self.vloc_ry[:count]
+        dq = 0.01
+        table_size = int(maximum_q / dq + 4)
+        table_q = np.arange(table_size, dtype=float) * dq
+        short_radial = r * v_ha + self.z_valence * erf(r)
+        table = np.empty(table_size, dtype=float)
+        prefactor = 4.0 * np.pi / volume
+        # The complete q-by-r matrix can be tens of MiB at high cutoffs even
+        # though the retained QE table is only one dimensional.  Integrate in
+        # bounded q blocks so initialization does not create an artificial RSS
+        # high-water mark.
+        for begin in range(0, table_size, 128):
+            end = min(begin + 128, table_size)
+            q_block = table_q[begin:end]
+            qr = np.multiply.outer(q_block, r)
+            sinc = np.ones_like(qr)
+            np.divide(
+                np.sin(qr),
+                q_block[:, None],
+                out=sinc,
+                where=q_block[:, None] != 0.0,
+            )
+            if begin == 0:
+                sinc[0] = r
+            table[begin:end] = prefactor * _qe_simpson(
+                sinc * short_radial[None, :], rab, axis=1
+            )
+        self._local_potential_table = table
+        self._local_potential_table_qmax = maximum_q
+        self._local_potential_table_volume = float(volume)
+        return self._local_potential_table
 
     def fourier(self, q: np.ndarray, volume: float) -> np.ndarray:
         """Return periodic V_loc(G), in Hartree, with QE's 1/Omega factor."""
@@ -133,21 +187,7 @@ class LocalPotential:
         positive = unique_q > 1.0e-12
         maximum_q = float(np.max(unique_q[positive])) if np.any(positive) else 0.0
         dq = 0.01
-        table_size = int(maximum_q / dq + 4)
-        table_q = np.arange(table_size, dtype=float) * dq
-        qr = np.multiply.outer(table_q, r)
-        sinc = np.ones_like(qr)
-        np.divide(
-            np.sin(qr),
-            table_q[:, None],
-            out=sinc,
-            where=table_q[:, None] != 0.0,
-        )
-        sinc[0] = r
-        short_radial = r * v_ha + self.z_valence * erf(r)
-        table = prefactor * _qe_simpson(
-            sinc * short_radial[None, :], rab, axis=1
-        )
+        table = self._ensure_local_potential_table(maximum_q, volume)
         if np.any(~positive):
             result[~positive] = prefactor * _qe_simpson(
                 r * (r * v_ha + self.z_valence), rab
@@ -194,29 +234,11 @@ class LocalPotential:
         )
         if not np.any(positive):
             return values, derivative
-        beyond = np.flatnonzero(self.r > 10.0)
-        count = int(beyond[0] + 1) if len(beyond) else len(self.r)
-        if count % 2 == 0:
-            count -= 1
-        count = max(1, count)
-        r = self.r[:count]
-        rab = self.rab[:count]
-        v_ha = 0.5 * self.vloc_ry[:count]
         prefactor = 4.0 * np.pi / volume
         positive_q = q_array[positive]
         dq = 0.01
-        table_size = int(float(np.max(positive_q)) / dq + 4)
-        table_q = np.arange(table_size, dtype=float) * dq
-        qr = np.multiply.outer(table_q, r)
-        sinc = np.ones_like(qr)
-        np.divide(
-            np.sin(qr), table_q[:, None], out=sinc,
-            where=table_q[:, None] != 0.0,
-        )
-        sinc[0] = r
-        short_radial = r * v_ha + self.z_valence * erf(r)
-        table = prefactor * _qe_simpson(
-            sinc * short_radial[None, :], rab, axis=1
+        table = self._ensure_local_potential_table(
+            float(np.max(positive_q)), volume
         )
         _, table_derivative = _qe_cubic_interpolate_with_derivative(
             table, positive_q, dq
@@ -285,17 +307,12 @@ class LocalPotential:
             self._projector_table_volume = float(volume)
         table = self._projector_table
         assert table is not None
-        scaled = q / dq
-        lower = np.floor(scaled).astype(int)
-        fraction = scaled - lower
-        u = 1.0 - fraction
-        v = 2.0 - fraction
-        w = 3.0 - fraction
-        return (
-            table[lower] * (u * v * w / 6.0)[:, None]
-            + table[lower + 1] * (fraction * v * w / 2.0)[:, None]
-            - table[lower + 2] * (fraction * u * w / 2.0)[:, None]
-            + table[lower + 3] * (fraction * u * v / 6.0)[:, None]
+        from .basis import _load_native_fft
+
+        return _load_native_fft().qe_cubic_interpolate(
+            np.ascontiguousarray(table, dtype=np.float64),
+            np.ascontiguousarray(q, dtype=np.float64),
+            dq,
         )
 
     def radial_projector_fourier_with_derivative(
@@ -456,40 +473,64 @@ class LocalPotential:
         gk = np.asarray(gk, dtype=float)
         if not self.projectors:
             return np.empty((len(gk), 0), dtype=complex), np.empty((0, 0))
-        q = np.linalg.norm(gk, axis=1)
+        from .basis import _load_native_fft
+
+        q = _load_native_fft().row_norms3(gk)
         radial = self.radial_projector_fourier(q, volume)
         columns: list[np.ndarray] = []
         identities: list[tuple[int, int, int]] | None = (
             [] if self._expanded_projector_coupling is None else None
         )
+        projector_columns = [
+            (projector_index, projector.angular_momentum, channel)
+            for projector_index, projector in enumerate(self.projectors)
+            for channel in range(2 * projector.angular_momentum + 1)
+        ]
+        if all(l_value <= 2 for _, l_value, _ in projector_columns):
+            maps = np.asarray(projector_columns, dtype=np.int32)
+            beta_matrix = _load_native_fft().assemble_low_l_projectors(
+                radial,
+                gk,
+                q,
+                np.ascontiguousarray(maps[:, 0]),
+                np.ascontiguousarray(maps[:, 1]),
+                np.ascontiguousarray(maps[:, 2]),
+            )
+            if identities is not None:
+                identities.extend(projector_columns)
+        else:
+            beta_matrix = None
         # UPFs commonly contain several radial projectors with the same l.
         # Their angular factors are identical for a given k point, so build
         # each l block once instead of repeating the SciPy ufunc dispatch.
-        harmonics_by_l: dict[int, np.ndarray] = {}
-        for projector_index, projector in enumerate(self.projectors):
-            angular_momentum = projector.angular_momentum
-            harmonics = harmonics_by_l.get(angular_momentum)
-            if harmonics is None:
-                harmonics = _qe_real_spherical_harmonics(
-                    angular_momentum, gk, q
-                )
-                harmonics_by_l[angular_momentum] = harmonics
-            angular_phase = (-1j) ** projector.angular_momentum
-            for channel in range(2 * projector.angular_momentum + 1):
-                columns.append(
-                    radial[:, projector_index]
-                    * harmonics[:, channel]
-                    * angular_phase
-                )
-                if identities is not None:
-                    identities.append(
-                        (projector_index, projector.angular_momentum, channel)
+        if beta_matrix is None:
+            harmonics_by_l: dict[int, np.ndarray] = {}
+            for projector_index, projector in enumerate(self.projectors):
+                angular_momentum = projector.angular_momentum
+                harmonics = harmonics_by_l.get(angular_momentum)
+                if harmonics is None:
+                    harmonics = _qe_real_spherical_harmonics(
+                        angular_momentum, gk, q
                     )
-        beta_matrix = np.asfortranarray(np.column_stack(columns))
+                    harmonics_by_l[angular_momentum] = harmonics
+                angular_phase = (-1j) ** projector.angular_momentum
+                for channel in range(2 * projector.angular_momentum + 1):
+                    columns.append(
+                        radial[:, projector_index]
+                        * harmonics[:, channel]
+                        * angular_phase
+                    )
+                    if identities is not None:
+                        identities.append(
+                            (projector_index, projector.angular_momentum, channel)
+                        )
+            beta_matrix = np.asfortranarray(np.column_stack(columns))
         coupling = self._expanded_projector_coupling
         if coupling is None:
             assert identities is not None
-            coupling = np.zeros((len(columns), len(columns)))
+            coupling = np.zeros(
+                (beta_matrix.shape[1], beta_matrix.shape[1])
+            )
             for i, (radial_i, l_i, m_i) in enumerate(identities):
                 for j, (radial_j, l_j, m_j) in enumerate(identities):
                     if l_i == l_j and m_i == m_j:
@@ -515,7 +556,10 @@ class LocalPotential:
         radial_direction = np.zeros_like(gk)
         nonzero = q > 1.0e-14
         radial_direction[nonzero] = gk[nonzero] / q[nonzero, None]
-        gradients: list[np.ndarray] = []
+        gradient_matrix = np.empty(
+            (len(gk), beta.shape[1], 3), dtype=np.complex128
+        )
+        gradient_column = 0
         for projector_index, projector in enumerate(self.projectors):
             harmonics, harmonic_gradient = (
                 _qe_real_spherical_harmonics_with_gradient(
@@ -524,7 +568,7 @@ class LocalPotential:
             )
             angular_phase = (-1j) ** projector.angular_momentum
             for channel in range(2 * projector.angular_momentum + 1):
-                gradients.append(
+                gradient_matrix[:, gradient_column, :] = (
                     angular_phase
                     * (
                         radial_derivative[:, projector_index, None]
@@ -534,7 +578,10 @@ class LocalPotential:
                         * harmonic_gradient[:, channel, :]
                     )
                 )
-        return beta, coupling, np.stack(gradients, axis=1)
+                gradient_column += 1
+        if gradient_column != beta.shape[1]:
+            raise ValueError("projector gradient channel count is inconsistent")
+        return beta, coupling, gradient_matrix
 
     def atomic_projectors(
         self, gk: np.ndarray, position: np.ndarray, volume: float
@@ -666,6 +713,19 @@ def _qe_real_spherical_harmonics(
         if lengths is None
         else np.asarray(lengths)
     )
+    # QE's ylmr2 evaluates the low-order real harmonics as Cartesian
+    # polynomials. These are the overwhelmingly common norm-conserving
+    # projector channels and avoid dispatching SciPy's general complex
+    # spherical-harmonic ufunc for every k point and SCF iteration. At q=0,
+    # match the former theta=phi=0 convention by choosing the +z direction.
+    if angular_momentum <= 2:
+        from .basis import _load_native_fft
+
+        return _load_native_fft().low_l_real_harmonics(
+            angular_momentum,
+            vectors,
+            np.ascontiguousarray(q, dtype=np.float64),
+        )
     safe = q > 1.0e-14
     theta = np.zeros(len(q))
     theta[safe] = np.arccos(np.clip(vectors[safe, 2] / q[safe], -1.0, 1.0))
@@ -992,6 +1052,9 @@ def read_upf(path: str | Path) -> LocalPotential:
         rab=None if coulomb else rab,
         vloc_ry=None if coulomb else vloc,
         coulomb=coulomb,
+        generated=attrs.get("generated", ""),
+        pseudo_type=attrs.get("pseudo_type", "NC"),
+        mesh_size=int(float(attrs.get("mesh_size", str(len(r))))),
         core_density=nlcc,
         atomic_density=rhoatom,
         projectors=tuple(projectors),

@@ -3,27 +3,45 @@
 from __future__ import annotations
 
 import itertools
+from math import erfc
 
 import numpy as np
-from scipy.special import erfc
+
+from .mpi import MPIContext
 
 
 def _integer_vectors_within_cutoff(
     reciprocal: np.ndarray, cutoff_g2: float
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return complete Miller/G-vector sets with |G|^2 <= cutoff_g2."""
+    """Return complete Miller/G-vector sets with |G|^2 <= cutoff_g2.
+
+    Enumerate one first-index slice at a time.  Materializing the bounding
+    cube as a Python list of integer tuples creates a large, cutoff-dependent
+    transient allocation exactly when the converged SCF state is still live.
+    The sliced construction retains the same lexicographic x/y/z order while
+    bounding temporary storage by one square cross-section.
+    """
     minimum_stretch = float(
         np.linalg.svd(reciprocal, compute_uv=False)[-1]
     )
     bound = int(np.ceil(np.sqrt(cutoff_g2) / minimum_stretch)) + 1
-    miller = np.array(
-        list(itertools.product(range(-bound, bound + 1), repeat=3)),
-        dtype=int,
-    )
-    vectors = miller @ reciprocal
-    g2 = np.einsum("ij,ij->i", vectors, vectors)
-    keep = g2 <= cutoff_g2 + 1.0e-12
-    return vectors[keep], g2[keep]
+    axis = np.arange(-bound, bound + 1, dtype=np.int32)
+    yz = np.empty((axis.size * axis.size, 2), dtype=np.int32)
+    yz[:, 0] = np.repeat(axis, axis.size)
+    yz[:, 1] = np.tile(axis, axis.size)
+    miller_slice = np.empty((len(yz), 3), dtype=np.int32)
+    miller_slice[:, 1:] = yz
+    vector_chunks: list[np.ndarray] = []
+    squared_chunks: list[np.ndarray] = []
+    for first in axis:
+        miller_slice[:, 0] = first
+        vectors = miller_slice @ reciprocal
+        squared = np.einsum("ij,ij->i", vectors, vectors)
+        keep = squared <= cutoff_g2 + 1.0e-12
+        if np.any(keep):
+            vector_chunks.append(vectors[keep])
+            squared_chunks.append(squared[keep])
+    return np.concatenate(vector_chunks), np.concatenate(squared_chunks)
 
 
 def ewald_energy(
@@ -126,6 +144,9 @@ def ewald_forces(
     positions: np.ndarray,
     charges: np.ndarray,
     ecutrho_ry: float,
+    *,
+    reciprocal_vectors: np.ndarray | None = None,
+    mpi: MPIContext | None = None,
 ) -> np.ndarray:
     """Return the analytic derivative ``-dE_ewald/dR`` in Ha/bohr.
 
@@ -155,35 +176,39 @@ def ewald_forces(
             raise RuntimeError("optimal Ewald alpha not found")
 
     forces = np.zeros_like(positions)
-    g_vectors, g2 = _integer_vectors_within_cutoff(
-        reciprocal, ecutrho_ry
-    )
+    if reciprocal_vectors is None:
+        g_vectors, g2 = _integer_vectors_within_cutoff(
+            reciprocal, ecutrho_ry
+        )
+    else:
+        g_vectors = np.asarray(reciprocal_vectors, dtype=float)
+        g2 = np.einsum("ij,ij->i", g_vectors, g_vectors)
     nonzero = g2 > 1.0e-14
-    g_vectors = g_vectors[nonzero]
-    g2 = g2[nonzero]
+    safe_g2 = g2.copy()
+    safe_g2[~nonzero] = np.inf
     phases = np.exp(-1j * (positions @ g_vectors.T))
     structure = np.sum(charges[:, None] * phases, axis=0)
     reciprocal_weight = (
         2.0
         * np.pi
         / volume
-        * np.exp(-g2 / (4.0 * alpha))
-        / g2
+        * np.exp(-safe_g2 / (4.0 * alpha))
+        / safe_g2
     )
+    reciprocal_forces = np.zeros_like(forces)
+    conjugate_structure = np.conjugate(structure)
     for atom, charge in enumerate(charges):
-        derivative_structure = (
-            -1j
-            * charge
-            * phases[atom, :, None]
-            * g_vectors
+        derivative_weight = 2.0 * np.real(
+            conjugate_structure * (-1j * charge * phases[atom])
         )
-        derivative_norm = 2.0 * np.real(
-            np.conjugate(structure)[:, None]
-            * derivative_structure
+        reciprocal_forces[atom] -= np.einsum(
+            "g,gi->i",
+            reciprocal_weight * derivative_weight,
+            g_vectors,
         )
-        forces[atom] -= np.sum(
-            reciprocal_weight[:, None] * derivative_norm, axis=0
-        )
+    if mpi is not None:
+        reciprocal_forces = mpi.sum_array(reciprocal_forces)
+    forces += reciprocal_forces
 
     radius = 4.0 / np.sqrt(alpha)
     minimum_stretch = float(
@@ -236,6 +261,9 @@ def ewald_stress(
     positions: np.ndarray,
     charges: np.ndarray,
     ecutrho_ry: float,
+    *,
+    reciprocal_vectors: np.ndarray | None = None,
+    mpi: MPIContext | None = None,
 ) -> np.ndarray:
     """Return analytic compressive-positive Ewald stress in Ha/bohr**3."""
     lattice = np.asarray(lattice, dtype=float)
@@ -259,12 +287,16 @@ def ewald_stress(
         if alpha <= 0.0:
             raise RuntimeError("optimal Ewald alpha not found")
 
-    g_vectors, g2 = _integer_vectors_within_cutoff(
-        reciprocal, ecutrho_ry
-    )
+    if reciprocal_vectors is None:
+        g_vectors, g2 = _integer_vectors_within_cutoff(
+            reciprocal, ecutrho_ry
+        )
+    else:
+        g_vectors = np.asarray(reciprocal_vectors, dtype=float)
+        g2 = np.einsum("ij,ij->i", g_vectors, g_vectors)
     nonzero = g2 > 1.0e-14
-    g_vectors = g_vectors[nonzero]
-    g2 = g2[nonzero]
+    safe_g2 = g2.copy()
+    safe_g2[~nonzero] = np.inf
     structure = np.sum(
         charges[:, None]
         * np.exp(-1j * (positions @ g_vectors.T)),
@@ -272,22 +304,23 @@ def ewald_stress(
     )
     reciprocal_terms = (
         np.abs(structure) ** 2
-        * np.exp(-g2 / (4.0 * alpha))
-        / g2
+        * np.exp(-safe_g2 / (4.0 * alpha))
+        / safe_g2
     )
-    reciprocal_scalar = (
-        -total_charge**2 / (4.0 * alpha)
-        + float(np.sum(reciprocal_terms))
+    reciprocal_sum = float(np.sum(reciprocal_terms))
+    reciprocal_tensor = np.einsum(
+        "g,gi,gj->ij",
+        reciprocal_terms * (1.0 / (4.0 * alpha) + 1.0 / safe_g2),
+        g_vectors,
+        g_vectors,
     )
+    if mpi is not None:
+        reciprocal_sum = mpi.sum_scalar(reciprocal_sum)
+        reciprocal_tensor = mpi.sum_array(reciprocal_tensor)
+    reciprocal_scalar = -total_charge**2 / (4.0 * alpha) + reciprocal_sum
     stress = 2.0 * np.pi / volume**2 * (
         reciprocal_scalar * np.eye(3)
-        - 2.0
-        * np.einsum(
-            "g,gi,gj->ij",
-            reciprocal_terms * (1.0 / (4.0 * alpha) + 1.0 / g2),
-            g_vectors,
-            g_vectors,
-        )
+        - 2.0 * reciprocal_tensor
     )
 
     radius = 4.0 / np.sqrt(alpha)

@@ -5,6 +5,56 @@ from __future__ import annotations
 import numpy as np
 
 
+LDA_FUNCTIONALS = frozenset({"pz", "pw"})
+GGA_FUNCTIONALS = frozenset({"pbe", "pbesol", "revpbe", "rpbe"})
+SUPPORTED_XC_FUNCTIONALS = LDA_FUNCTIONALS | GGA_FUNCTIONALS
+
+
+def canonical_xc_name(name: object) -> str | None:
+    """Return the supported QE functional represented by ``name``.
+
+    In addition to the ordinary ``input_dft`` names, this recognizes the
+    four-component strings stored in UPF headers.
+    """
+    normalized = "".join(
+        character
+        for character in str(name).lower()
+        if character.isalnum()
+    )
+    aliases = {
+        "lda": "pz",
+        "pz": "pz",
+        "pz81": "pz",
+        "perdewzunger": "pz",
+        "slapznogxnogc": "pz",
+        "pw": "pw",
+        "pw92": "pw",
+        "perdewwang": "pw",
+        "ldapw": "pw",
+        "slapwnogxnogc": "pw",
+        "pbe": "pbe",
+        "perdewburkeernzerhof": "pbe",
+        "slapwpbxpbc": "pbe",
+        "pbesol": "pbesol",
+        "pbesolid": "pbesol",
+        "slapwpsxpsc": "pbesol",
+        "revpbe": "revpbe",
+        "revisedpbe": "revpbe",
+        "slapwrevxpbc": "revpbe",
+        "rpbe": "rpbe",
+        "slapwhhnxpbc": "rpbe",
+    }
+    return aliases.get(normalized)
+
+
+_PBE_FAMILY_PARAMETERS = {
+    "pbe": (0.804, 0.2195149727645171, 0.06672455060314922, "rational"),
+    "pbesol": (0.804, 10.0 / 81.0, 0.046, "rational"),
+    "revpbe": (1.245, 0.2195149727645171, 0.06672455060314922, "rational"),
+    "rpbe": (0.804, 0.2195149727645171, 0.06672455060314922, "exponential"),
+}
+
+
 def pw92_unpolarized(
     rho: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -60,8 +110,9 @@ def pbe_unpolarized(
     rho: np.ndarray,
     gradient: np.ndarray,
     divergence,
+    functional: str = "pbe",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return spin-unpolarized PBE ``(epsilon_xc, v_xc)`` in Hartree.
+    """Return a spin-unpolarized PBE-family XC energy and potential.
 
     ``gradient`` has shape ``(3, *rho.shape)`` and contains Cartesian
     derivatives in bohr^-1. ``divergence`` must apply the matching periodic
@@ -71,7 +122,7 @@ def pbe_unpolarized(
     """
     gradient_array = np.asarray(gradient, dtype=float)
     epsilon, local_potential, coefficient = pbe_unpolarized_components(
-        rho, gradient_array
+        rho, gradient_array, functional=functional
     )
     flux = coefficient[None, ...] * gradient_array
     potential = local_potential - np.asarray(divergence(flux), dtype=float)
@@ -81,8 +132,9 @@ def pbe_unpolarized(
 def pbe_unpolarized_components(
     rho: np.ndarray,
     gradient: np.ndarray,
+    functional: str = "pbe",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return PBE energy, local potential, and gradient coefficient.
+    """Return PBE-family energy, local potential, and gradient coefficient.
 
     If ``f_xc = rho * epsilon_xc``, the final array is the scalar
     coefficient ``c`` in ``d f_xc / d(grad rho) = c * grad rho``.  Keeping
@@ -91,6 +143,12 @@ def pbe_unpolarized_components(
     """
     density = np.abs(np.asarray(rho, dtype=float))
     gradient = np.asarray(gradient, dtype=float)
+    try:
+        kappa, mu, beta, exchange_form = _PBE_FAMILY_PARAMETERS[functional]
+    except KeyError as exc:
+        raise ValueError(
+            f"unsupported PBE-family functional {functional!r}"
+        ) from exc
     if gradient.shape != (3, *density.shape):
         raise ValueError("gradient must have shape (3, *rho.shape)")
 
@@ -114,19 +172,25 @@ def pbe_unpolarized_components(
         n = density[gradient_active]
         grad = np.sqrt(sigma[gradient_active])
 
-        # PBE exchange gradient correction (QE XClib ``pbex``, iflag=1).
+        # PBE-family exchange correction (QE XClib ``pbex``).
         kf = 3.093667726280136 * np.cbrt(n)
         dsg = 0.5 / kf
         reduced_gradient = grad * dsg / n
-        kappa = 0.804
-        mu = 0.2195149727645171
-        denominator = 1.0 + mu * reduced_gradient**2 / kappa
-        enhancement_correction = kappa - kappa / denominator
+        scaled_gradient = mu * reduced_gradient**2 / kappa
+        if exchange_form == "rational":
+            denominator = 1.0 + scaled_gradient
+            enhancement_correction = kappa - kappa / denominator
+            derivative_enhancement = (
+                2.0 * mu * reduced_gradient / denominator**2
+            )
+        else:
+            exponential = np.exp(-scaled_gradient)
+            enhancement_correction = kappa * (1.0 - exponential)
+            derivative_enhancement = (
+                2.0 * mu * reduced_gradient * exponential
+            )
         exchange_uniform = -(0.75 / np.pi) * kf
         exchange_per_particle = exchange_uniform * enhancement_correction
-        derivative_enhancement = (
-            2.0 * mu * reduced_gradient / denominator**2
-        )
         v1_exchange = (
             exchange_per_particle
             + (exchange_uniform / 3.0) * enhancement_correction
@@ -149,7 +213,6 @@ def pbe_unpolarized_components(
         ks = 1.128379167095513 * np.sqrt(kf_correlation)
         t = grad / (2.0 * ks * n)
         gamma = 0.0310906908696548950
-        beta = 0.06672455060314922
         ec_active = ec[gradient_active]
         vc_active = vc[gradient_active]
         exponential = np.exp(-ec_active / gamma)
@@ -185,20 +248,30 @@ def pbe_unpolarized_components(
     return epsilon, local_potential, coefficient
 
 
+def pw92_lda_unpolarized(
+    rho: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return Slater exchange plus PW92 LDA correlation in Hartree."""
+    density = np.abs(np.asarray(rho, dtype=float))
+    epsilon = np.zeros_like(density)
+    potential = np.zeros_like(density)
+    active = density > 1.0e-10
+    if np.any(active):
+        n = density[active]
+        rs = 0.6203504908994 / np.cbrt(n)
+        exchange = (-0.687247939924714 * (2.0 / 3.0)) / rs
+        epsilon[active] = exchange
+        potential[active] = (4.0 / 3.0) * exchange
+    correlation, correlation_potential = pw92_unpolarized(density)
+    epsilon += correlation
+    potential += correlation_potential
+    return epsilon, potential
+
+
 def pz81_unpolarized(
-    rho: np.ndarray, *, use_numba: bool = False
+    rho: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return (epsilon_xc, v_xc) in Hartree for an unpolarized density."""
-    if use_numba:
-        from .acceleration import numba_kernels
-
-        density = np.asarray(rho, dtype=float)
-        epsilon_xc = np.empty_like(density)
-        potential_xc = np.empty_like(density)
-        numba_kernels().pz81_unpolarized(
-            density.ravel(), epsilon_xc.ravel(), potential_xc.ravel()
-        )
-        return epsilon_xc, potential_xc
     # Match QE's XClib LDA driver: it evaluates the functional at |rho|,
     # and returns exactly zero below rho_threshold_lda.
     density = np.abs(np.asarray(rho, dtype=float))

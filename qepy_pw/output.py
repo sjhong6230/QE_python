@@ -1,10 +1,15 @@
-"""QE-shaped text reporting for the Python scalar-SCF driver."""
+"""QE-shaped text reporting for the spinless SCF driver.
+
+Keeping presentation here prevents numerical code from accumulating print
+branches and gives the CLI and regression-reference generator one formatter.
+"""
 
 from __future__ import annotations
 
 from datetime import datetime
 import hashlib
 import io
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -12,9 +17,84 @@ from .constants import EV_PER_HARTREE
 from .input import PWInput
 from .memory import format_bytes
 from .occupations import default_number_of_bands
-from .scf import SCFIteration, SCFResult, SCFSetup
 from .upf import read_upf
+from .xc import canonical_xc_name
 from . import __version__
+
+if TYPE_CHECKING:
+    from .scf import (
+        ProgressKind,
+        ProgressPayload,
+        SCFIteration,
+        SCFResult,
+        SCFSetup,
+    )
+
+
+def _clean_zero(value: float, tolerance: float = 5.0e-12) -> float:
+    """Avoid negative zero in fields where QE prints an exact zero."""
+    return 0.0 if abs(value) < tolerance else float(value)
+
+
+def _qe_symmetry_operations(pw: PWInput):
+    """Return operations in a stable, QE-like order, with identity first."""
+    identity = np.eye(3, dtype=int)
+    return tuple(
+        sorted(
+            pw.symmetry_operations,
+            key=lambda op: (
+                0 if np.array_equal(op.matrix, identity) and np.allclose(op.translation, 0.0) else 1,
+                0 if np.allclose(op.translation, 0.0) else 1,
+                tuple(int(value) for value in op.matrix.ravel()),
+                tuple(float(value) for value in op.translation),
+            ),
+        )
+    )
+
+
+def _format_symmetry(out: io.StringIO, pw: PWInput) -> None:
+    operations = _qe_symmetry_operations(pw)
+    fractional = sum(not np.allclose(op.translation, 0.0) for op in operations)
+    has_inversion = any(np.array_equal(op.matrix, -np.eye(3, dtype=int)) for op in operations)
+    if len(operations) == 1:
+        print("\n     No symmetry found", file=out)
+        return
+    inversion = ", with inversion," if has_inversion else ","
+    suffix = (
+        f" ({fractional:d} have fractional translation)" if fractional else ""
+    )
+    print(f"\n     {len(operations):d} Sym. Ops.{inversion} found{suffix}", file=out)
+    if str(pw.control.get("verbosity", "low")).lower() != "high":
+        return
+    print("\n\n                                    s                        frac. trans.", file=out)
+    inverse_lattice = np.linalg.inv(pw.lattice)
+    for index, operation in enumerate(operations, start=1):
+        is_identity = np.array_equal(operation.matrix, np.eye(3, dtype=int))
+        label = "identity" if is_identity else "crystal symmetry"
+        print(f"\n      isym = {index:2d}     {label:<45s}\n", file=out)
+        translation = np.asarray(operation.translation, dtype=float)
+        has_translation = not np.allclose(translation, 0.0)
+        for row_index, row in enumerate(operation.matrix):
+            prefix = f" cryst.   s({index:2d}) = (" if row_index == 0 else "                  ("
+            tail = ""
+            if has_translation:
+                marker = "    f =(" if row_index == 0 else "       ("
+                tail = f"{marker} {_clean_zero(translation[row_index]):10.7f} )"
+            print(f"{prefix}{row[0]:6d}{row[1]:11d}{row[2]:11d}      ){tail}", file=out)
+        cartesian = inverse_lattice @ operation.matrix @ pw.lattice
+        cart_translation = translation @ pw.lattice / float(
+            pw.system.get("celldm(1)", np.linalg.norm(pw.lattice[0]))
+        )
+        print(file=out)
+        for row_index, row in enumerate(cartesian):
+            prefix = f" cart.    s({index:2d}) = (" if row_index == 0 else "                  ("
+            tail = ""
+            if has_translation:
+                marker = "    f =(" if row_index == 0 else "       ("
+                tail = f"{marker} {_clean_zero(cart_translation[row_index]):10.7f} )"
+            values = [_clean_zero(value) for value in row]
+            print(f"{prefix}{values[0]:11.7f}{values[1]:11.7f}{values[2]:11.7f} ){tail}", file=out)
+        print(file=out)
 
 
 def format_header(pw: PWInput) -> str:
@@ -47,10 +127,10 @@ def format_header(pw: PWInput) -> str:
     print(f"     number of atomic types    = {len(pw.species):12d}", file=out)
     print(f"     number of electrons       = {nelec:12.2f}", file=out)
     print(f"     number of Kohn-Sham states= {nbnd:12d}", file=out)
-    print(f"     kinetic-energy cutoff     = {float(pw.system['ecutwfc']):12.4f} Ry", file=out)
+    print(f"     kinetic-energy cutoff     = {float(pw.system['ecutwfc']):12.4f}  Ry", file=out)
     print(
         f"     charge-density cutoff     = "
-        f"{float(pw.system.get('ecutrho', 4.0 * float(pw.system['ecutwfc']))):12.4f} Ry",
+        f"{float(pw.system.get('ecutrho', 4.0 * float(pw.system['ecutwfc']))):12.4f}  Ry",
         file=out,
     )
     print(
@@ -58,30 +138,40 @@ def format_header(pw: PWInput) -> str:
         f"{float(pw.electrons.get('conv_thr', 1.0e-6)):12.1E}",
         file=out,
     )
-    resolved_xc = str(pw.system.get("_resolved_xc", "")).lower()
-    if not resolved_xc:
-        requested = str(pw.system.get("input_dft", "")).lower()
-        pseudo_functionals = " ".join(
-            pseudo.functional.lower() for pseudo in pseudos.values()
-        )
-        resolved_xc = (
-            "pbe"
-            if (
-                "pbe" in requested
-                or "pbe" in pseudo_functionals
-                or (
-                    "pbx" in pseudo_functionals
-                    and "pbc" in pseudo_functionals
-                )
-            )
-            else "pz"
-        )
-    xc_label = (
-        "SLA  PW   PBX  PBC"
-        if resolved_xc == "pbe"
-        else "SLA  PZ   NOGX NOGC"
+    print(
+        f"     mixing beta               = "
+        f"{float(pw.electrons.get('mixing_beta', 0.7)):12.4f}", file=out
     )
-    print(f"     Exchange-correlation      =  {xc_label}", file=out)
+    print(
+        f"     number of iterations used = "
+        f"{int(pw.electrons.get('mixing_ndim', 8)):12d}  "
+        f"{str(pw.electrons.get('mixing_mode', 'plain')):<9s} mixing",
+        file=out,
+    )
+    resolved_xc = canonical_xc_name(pw.system.get("_resolved_xc", ""))
+    if resolved_xc is None and "input_dft" in pw.system:
+        resolved_xc = canonical_xc_name(pw.system["input_dft"])
+    if resolved_xc is None:
+        pseudo_xc = {
+            canonical
+            for pseudo in pseudos.values()
+            if (canonical := canonical_xc_name(pseudo.functional)) is not None
+        }
+        resolved_xc = pseudo_xc.pop() if len(pseudo_xc) == 1 else "pz"
+    xc_output = {
+        "pz": ("PZ", "1   1   0   0"),
+        "pw": ("PW", "1   4   0   0"),
+        "pbe": ("PBE", "1   4   3   4"),
+        "pbesol": ("PBEsol", "1   4  10   8"),
+        "revpbe": ("revPBE", "1   4   4   4"),
+        "rpbe": ("RPBE", "1   4  44   4"),
+    }
+    short_xc, xc_indices = xc_output[resolved_xc]
+    print(f"     Exchange-correlation= {short_xc}", file=out)
+    print(
+        f"                           (   {xc_indices}   0   0   0)",
+        file=out,
+    )
     print(
         f"\n     celldm(1)= {alat:10.6f}  "
         + "  ".join(
@@ -122,46 +212,26 @@ def format_header(pw: PWInput) -> str:
             f"     Pseudo is Norm-conserving, Zval = {pseudo.z_valence:5.1f}",
             file=out,
         )
-        print(
-            f"     Using {len(pseudo.projectors):d} radial beta functions, "
-            f"{pseudo.number_of_projector_channels:d} (l,m) channels",
-            file=out,
-        )
+        if pseudo.generated:
+            print(f"     Generated using {pseudo.generated}", file=out)
+        if pseudo.mesh_size or pseudo.projectors:
+            print(f"     Using radial grid of {pseudo.mesh_size:d} points,  "
+                  f"{len(pseudo.projectors):d} beta functions with: ", file=out)
         if pseudo.projectors:
-            print(
-                "     Angular momenta: "
-                + " ".join(
-                    f"l({projector.index})={projector.angular_momentum}"
-                    for projector in pseudo.projectors
-                ),
-                file=out,
-            )
-        print(
-            "     Nonlinear core correction = "
-            + ("present" if pseudo.has_nlcc else "absent"),
-            file=out,
-        )
-        print(
-            "     Atomic starting density   = "
-            + ("present" if pseudo.has_atomic_density else "uniform fallback"),
-            file=out,
-        )
-        print(
-            f"     Atomic starting orbitals  = "
-            f"{pseudo.number_of_atomic_orbitals:d}",
-            file=out,
-        )
+            for projector in pseudo.projectors:
+                print(f"                l({projector.index}) = {projector.angular_momentum:3d}", file=out)
     print(
-        "\n     atomic species   valence       mass     pseudopotential",
+        "\n     atomic species   valence    mass     pseudopotential",
         file=out,
     )
-    for species in pw.species:
+    for index, species in enumerate(pw.species, start=1):
         print(
-            f"     {species.label:<8s}"
-            f"{pseudos[species.label].z_valence:12.2f}"
-            f"{species.mass:12.5f}     {species.pseudo_file}",
+            f"     {species.label:<16s}"
+            f"{pseudos[species.label].z_valence:4.2f}"
+            f"{species.mass:12.5f}     {species.label}({index:5.2f})",
             file=out,
         )
+    _format_symmetry(out, pw)
     inverse_lattice = np.linalg.inv(pw.lattice)
     print("\n   Cartesian axes", file=out)
     print(
@@ -172,7 +242,7 @@ def format_header(pw: PWInput) -> str:
         cart = atom.position / alat
         print(
             f"     {index:5d}        {atom.label:<4s}   tau({index:4d}) = ("
-            f" {cart[0]:11.7f} {cart[1]:11.7f} {cart[2]:11.7f} )",
+            f" {cart[0]:11.7f} {cart[1]:11.7f} {cart[2]:11.7f}  )",
             file=out,
         )
     print("\n   Crystallographic axes", file=out)
@@ -184,65 +254,11 @@ def format_header(pw: PWInput) -> str:
         crystal = atom.position @ inverse_lattice
         print(
             f"     {index:5d}        {atom.label:<4s}   tau({index:4d}) = ("
-            f" {crystal[0]:11.7f} {crystal[1]:11.7f} {crystal[2]:11.7f} )",
+            f" {crystal[0]:10.7f} {crystal[1]:10.7f} {crystal[2]:10.7f}  )",
             file=out,
         )
-    mixing_mode = str(pw.electrons.get("mixing_mode", "plain")).lower()
-    diagonalization = str(
-        pw.electrons.get("diagonalization", "david")
-    ).lower()
-    print(
-        f"\n     diagonalization           = {diagonalization}",
-        file=out,
-    )
-    print(
-        f"     charge mixing mode        = {mixing_mode}",
-        file=out,
-    )
-    print(
-        f"     mixing beta               = "
-        f"{float(pw.electrons.get('mixing_beta', 0.7)):12.4f}",
-        file=out,
-    )
-    if mixing_mode in {"plain", "default"}:
-        print(
-            f"     Broyden history dimension = "
-            f"{int(pw.electrons.get('mixing_ndim', 8)):12d}",
-            file=out,
-        )
-    print(f"\n     number of symmetry operations = {len(pw.symmetry_operations):5d}", file=out)
-    identity = (
-        len(pw.symmetry_operations) == 1
-        and np.array_equal(
-            pw.symmetry_operations[0].matrix, np.eye(3, dtype=int)
-        )
-    )
-    if identity:
-        print("     No symmetry found", file=out)
-    if str(pw.control.get("verbosity", "low")).lower() == "high":
-        for index, operation in enumerate(
-            pw.symmetry_operations, start=1
-        ):
-            print(
-                f"\n      isym = {index:3d}     crystal symmetry, "
-                f"frac. trans. = ("
-                f" {operation.translation[0]:9.6f}"
-                f" {operation.translation[1]:9.6f}"
-                f" {operation.translation[2]:9.6f} )",
-                file=out,
-            )
-            for row_index, row in enumerate(operation.matrix):
-                prefix = " cryst.   s = (" if row_index == 0 else "                ("
-                print(
-                    f"{prefix} {row[0]:4d} {row[1]:4d} {row[2]:4d} )",
-                    file=out,
-                )
     if pw.full_kpoint_count != len(pw.kpoints):
-        print(
-            f"     number of k points= {len(pw.kpoints):5d} "
-            f"(reduced from {pw.full_kpoint_count})\n",
-            file=out,
-        )
+        print(f"     number of k points= {len(pw.kpoints):5d}\n", file=out)
     else:
         print(f"     number of k points= {len(pw.kpoints):5d}\n", file=out)
     print("                       cart. coord. in units 2pi/alat", file=out)
@@ -268,10 +284,21 @@ def format_header(pw: PWInput) -> str:
 
 def format_setup(setup: SCFSetup) -> str:
     out = io.StringIO()
-    if setup.diagonalization == "david":
-        print("     Davidson iterative-solver setup", file=out)
-    else:
+    solver_names = {
+        "david": "Davidson",
+        "cg": "CG",
+        "paro": "ParO",
+        "rmm-davidson": "RMM-DIIS/Davidson",
+        "rmm-paro": "RMM-DIIS/ParO",
+    }
+    if setup.diagonalization == "dense":
         print("     Dense reference-solver setup", file=out)
+    else:
+        print(
+            f"     {solver_names[setup.diagonalization]} "
+            "iterative-solver setup",
+            file=out,
+        )
     print(f"     active k points           = {setup.kpoints:12d}", file=out)
     print(
         f"     plane waves per k point   = {setup.min_plane_waves:6d} to "
@@ -301,7 +328,7 @@ def format_setup(setup: SCFSetup) -> str:
     )
     print("\n     Using Slab Decomposition", file=out)
     print(
-        f"     FFT backend              = {setup.fft_backend}",
+        "     FFT backend              = Cython/MPI/FFTW",
         file=out,
     )
     print(
@@ -309,30 +336,32 @@ def format_setup(setup: SCFSetup) -> str:
         file=out,
     )
     print(
-        "     Numba scalar kernels    = "
-        + ("enabled" if setup.numba_enabled else "disabled"),
+        f"     Threads per MPI process  = {setup.threads_per_process:12d}",
         file=out,
     )
-    if setup.fft_backend == "pyfftw":
-        print(
-            f"     FFTW planner/threads      = "
-            f"{setup.fft_planner}/{setup.fft_threads}",
-            file=out,
-        )
+    for message in setup.starting_messages:
+        print(f"     {message}", file=out)
     if setup.starting_wavefunctions == "file":
-        print("     Starting wfcs read from file", file=out)
+        print("     Starting wfcs from file", file=out)
     elif setup.starting_wavefunctions == "random":
-        print("     Starting wfcs are random wfcs", file=out)
+        print("     Starting wfcs are random", file=out)
     else:
-        qualifier = (
-            "randomized atomic wfcs"
-            if setup.starting_wavefunctions == "atomic+random"
-            else "atomic wfcs"
-        )
-        print(
-            f"     Starting wfcs are {setup.atomic_orbitals:4d} {qualifier}",
-            file=out,
-        )
+        atomic = setup.atomic_orbitals
+        missing = max(0, setup.number_of_bands - atomic)
+        if setup.starting_wavefunctions == "atomic":
+            line = f"     Starting wfcs are {atomic:4d} atomic wfcs"
+            if missing:
+                line += f" + {missing:4d} random wfcs"
+        elif atomic:
+            line = (
+                f"     Starting wfcs are {atomic:4d} "
+                "randomized atomic wfcs"
+            )
+            if missing:
+                line += f" + {missing:4d} random wfcs"
+        else:
+            line = "     Starting wfcs are random"
+        print(line, file=out)
     if setup.starting_potential == "file":
         print("\n     Initial potential from file", file=out)
     else:
@@ -350,39 +379,45 @@ def format_setup(setup: SCFSetup) -> str:
         )
         print("     full Hamiltonian matrices =      avoided", file=out)
         print(file=out)
-    else:
+    elif setup.diagonalization == "dense":
         print(
             f"     dense work proxy sum(N^3) = {setup.dense_work:12d}\n",
             file=out,
         )
-    persistent_mb = setup.estimated_persistent_bytes_per_rank / 1.0e6
-    maximum_mb = (
+    else:
+        print("     full Hamiltonian matrices =      avoided", file=out)
+        print(file=out)
+    estimated_array = (
         setup.estimated_persistent_bytes_per_rank
         + setup.estimated_peak_workspace_bytes_per_rank
-    ) / 1.0e6
-    print(
-        f"     Estimated static dynamical RAM per process > "
-        f"{persistent_mb:10.2f} MB",
-        file=out,
+    )
+    baseline_all_ranks = (
+        setup.runtime_baseline_pss_bytes_all_ranks
+        or setup.runtime_baseline_rss_bytes_per_rank * setup.mpi_processes
+    )
+    estimated_total = (
+        baseline_all_ranks
+        + (
+            setup.estimated_array_bytes_all_ranks
+            or estimated_array * setup.mpi_processes
+        )
     )
     print(
-        f"\n     Estimated max dynamical RAM per process > "
-        f"{maximum_mb:10.2f} MB",
+        "     Estimated array memory/rank > "
+        f"{format_bytes(estimated_array)}",
         file=out,
     )
-    if setup.mpi_processes > 1:
+    for label, size in setup.estimated_array_components_per_rank:
         print(
-            f"\n     Estimated total dynamical RAM > "
-            f"{maximum_mb * setup.mpi_processes:10.2f} MB",
+            f"       {label:<31} {format_bytes(size):>12}",
             file=out,
         )
+    print(
+        "     Estimated total RAM, all ranks > "
+        f"{format_bytes(estimated_total)}",
+        file=out,
+    )
     print("", file=out)
-    if setup.diagonalization == "dense" and setup.kpoints > 64:
-        print(
-            "     WARNING: the active mesh remains outside the default "
-            "dense-solver k-point limit after symmetry handling.\n",
-            file=out,
-        )
     return out.getvalue()
 
 
@@ -395,52 +430,18 @@ def format_iteration(step: SCFIteration) -> str:
         file=out,
     )
     if step.davidson_threshold_ha > 0.0:
-        print("     Davidson diagonalization with overlap", file=out)
+        solver_lines = {
+            "david": "Davidson diagonalization with overlap",
+            "cg": "CG style diagonalization",
+            "paro": "ParO style diagonalization",
+            "rmm": "RMM-DIIS diagonalization",
+            "rmm-davidson": "RMM-DIIS diagonalization",
+            "rmm-paro": "RMM-DIIS diagonalization",
+            "dense": "Direct diagonalization of the dense Hamiltonian matrix",
+        }
+        print(f"     {solver_lines[step.diagonalization]}", file=out)
         print(
-            "\n---- Real-time Memory Report at c_bands before "
-            "calling an iterative solver",
-            file=out,
-        )
-        print(
-            f"{step.memory_rss_bytes_per_rank / 2**20:14.0f} MiB "
-            "given to the printing process from OS",
-            file=out,
-        )
-        if step.memory_available_bytes:
-            print(
-                f"{step.memory_available_bytes / 2**20:14.0f} MiB "
-                "available memory on the node where the printing "
-                "process lives",
-                file=out,
-            )
-        print(
-            f"{step.memory_density_bytes_per_rank / 1e6:14.2f} MB "
-            "estimated for rho,v,vnew",
-            file=out,
-        )
-        print(
-            f"{step.memory_mixing_bytes_per_rank / 1e6:14.2f} MB "
-            "estimated for rho*nmix",
-            file=out,
-        )
-        print(
-            f"{step.memory_wavefunctions_bytes_per_rank / 1e6:14.2f} MB "
-            "estimated for psi",
-            file=out,
-        )
-        print(
-            f"{step.memory_davidson_bytes_per_rank / 1e6:14.2f} MB "
-            "estimated for Davidson subspace",
-            file=out,
-        )
-        print(
-            f"{step.memory_fft_bytes_per_rank / 1e6:14.2f} MB "
-            "estimated for FFT workspace",
-            file=out,
-        )
-        print("------------------", file=out)
-        print(
-            f"     ethr = {2.0 * step.davidson_threshold_ha:9.2E}, "
+            f"     ethr = {2.0 * step.davidson_threshold_ha:9.2E},  "
             f"avg # of iterations = "
             f"{step.average_diagonalization_iterations:4.1f}",
             file=out,
@@ -458,14 +459,31 @@ def format_iteration(step: SCFIteration) -> str:
         f"{step.cpu_seconds:10.1f} secs",
         file=out,
     )
-    print(f"     total energy              = {step.total_energy_ha * 2:18.10f} Ry", file=out)
+    print(f"     total energy              = {step.total_energy_ha * 2:18.8f} Ry", file=out)
     if np.isfinite(step.estimated_accuracy_ha):
         print(
             f"     estimated scf accuracy    < "
-            f"{step.estimated_accuracy_ha * 2:18.10e} Ry\n",
+            f"{step.estimated_accuracy_ha * 2:18.8f} Ry\n",
             file=out,
         )
     return out.getvalue()
+
+
+def format_progress(kind: ProgressKind, payload: ProgressPayload) -> str:
+    """Format a typed event produced by :func:`qepy_pw.scf.run_scf`.
+
+    The local import preserves the package's lightweight import path while
+    the explicit checks turn a mismatched callback event into a useful error.
+    """
+    from .scf import SCFIteration, SCFSetup
+
+    if kind == "setup" and isinstance(payload, SCFSetup):
+        return format_setup(payload)
+    if kind == "iteration" and isinstance(payload, SCFIteration):
+        return format_iteration(payload)
+    raise TypeError(
+        f"progress event {kind!r} does not match {type(payload).__name__}"
+    )
 
 
 def _format_timing(result: SCFResult, name: str) -> str:
@@ -529,7 +547,7 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
             ),
             file=out,
         )
-    if occupations_mode == "smearing" and result.fermi_energy_ha is not None:
+    if result.fermi_energy_ha is not None:
         print(
             f"\n     the Fermi energy is "
             f"{result.fermi_energy_ha * EV_PER_HARTREE:10.4f} ev",
@@ -660,15 +678,21 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
             f"{len(result.iterations):3d} iterations",
             file=out,
         )
-    print(
-        "\n     peak resident memory/rank = "
-        f"{format_bytes(result.peak_rss_bytes_per_rank)}",
-        file=out,
-    )
-    if result.peak_rss_bytes_all_ranks:
+    if result.peak_sampled_pss_bytes_all_ranks:
         print(
-            "     aggregate rank high-water marks = "
-            f"{format_bytes(result.peak_rss_bytes_all_ranks)}",
+            "\n     Measured peak RAM, all ranks = "
+            f"{format_bytes(result.peak_sampled_pss_bytes_all_ranks)} "
+            "(aggregate PSS, sampled)",
+            file=out,
+        )
+    else:
+        measured_peak = (
+            result.peak_rss_bytes_all_ranks
+            or result.peak_rss_bytes_per_rank
+        )
+        print(
+            "\n     Measured peak RAM, all ranks = "
+            f"{format_bytes(measured_peak)} (RSS upper bound)",
             file=out,
         )
     print("\n     init_run     :"

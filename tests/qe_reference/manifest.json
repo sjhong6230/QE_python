@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "upstream": {
+    "repository": "https://gitlab.com/QEF/q-e.git",
+    "commit": "4a218b993489604a844db92fe85c747bd09b2442"
+  },
+  "reference_tolerances": {
+    "energy_ry": {"absolute": 5e-8},
+    "iterations": {"absolute": 0.0},
+    "total_force_ry_bohr": {"absolute": 1e-4},
+    "pressure_kbar": {"absolute": 0.01},
+    "fermi_ev": {"absolute": 1e-4},
+    "homo_ev": {"absolute": 1e-4},
+    "homo_lumo_ev": {"absolute": 1e-4},
+    "bands_ev": {"absolute": 1e-4},
+    "num_kpoints": {"absolute": 0.0}
+  },
+  "pseudopotentials": {
+    "H.pz-vbc.UPF": {
+      "fixture_md5": "b4742c37e165d3c4b97552e3cd66ffd5",
+      "source": "https://pseudopotentials.quantum-espresso.org/upf_files/H.pz-vbc.UPF"
+    },
+    "Si.pz-vbc.UPF": {
+      "fixture_md5": "9f25e6ff280f3123e9b3a84715b2e9c9",
+      "source": "https://pseudopotentials.quantum-espresso.org/upf_files/Si.pz-vbc.UPF"
+    },
+    "Al.pz-vbc.UPF": {
+      "fixture_md5": "f06ceae8da0fe5c02c98e3688433298c",
+      "source": "https://pseudopotentials.quantum-espresso.org/upf_files/Al.pz-vbc.UPF"
+    }
+  },
+  "cases": [
+    {"id": "lattice_ibrav1", "suite": "pw_lattice-ibrav", "input": "lattice-ibrav1.in", "pseudo": ["H.pz-vbc.UPF"], "features": ["scf", "ibrav=1", "gamma", "ATOMIC_POSITIONS angstrom"]},
+    {"id": "lattice_ibrav2_kauto", "suite": "pw_lattice-ibrav", "input": "lattice-ibrav2-kauto.in", "pseudo": ["H.pz-vbc.UPF"], "features": ["scf", "ibrav=2", "K_POINTS automatic"]},
+    {"id": "lattice_ibrav5", "suite": "pw_lattice-ibrav", "input": "lattice-ibrav5.in", "pseudo": ["H.pz-vbc.UPF"], "features": ["scf", "rhombohedral ibrav=5"]},
+    {"id": "lattice_ibrav_minus5", "suite": "pw_lattice-ibrav", "input": "lattice-ibrav-5.in", "pseudo": ["H.pz-vbc.UPF"], "features": ["scf", "rhombohedral ibrav=-5"]},
+    {"id": "lattice_ibrav14", "suite": "pw_lattice-ibrav", "input": "lattice-ibrav14.in", "pseudo": ["H.pz-vbc.UPF"], "features": ["scf", "triclinic celldm"]},
+    {"id": "lattice_cell_angstrom", "suite": "pw_lattice-ibrav", "input": "lattice-ibrav0-cell_parameters-ang.in", "pseudo": ["H.pz-vbc.UPF"], "features": ["scf", "ibrav=0", "CELL_PARAMETERS angstrom"]},
+    {"id": "scf_baseline", "suite": "pw_scf", "input": "scf.in", "pseudo": ["Si.pz-vbc.UPF"], "features": ["scf", "K_POINTS tpiba", "stress"]},
+    {"id": "scf_gamma", "suite": "pw_scf", "input": "scf-gamma.in", "pseudo": ["Si.pz-vbc.UPF"], "features": ["scf", "gamma", "diago_david_ndim"]},
+    {"id": "scf_kauto", "suite": "pw_scf", "input": "scf-kauto.in", "pseudo": ["Si.pz-vbc.UPF"], "features": ["scf", "K_POINTS automatic"]},
+    {"id": "scf_kcrys", "suite": "pw_scf", "input": "scf-kcrys.in", "pseudo": ["Si.pz-vbc.UPF"], "features": ["scf", "K_POINTS crystal"]},
+    {"id": "scf_mixing_tf", "suite": "pw_scf", "input": "scf-mixing_TF.in", "pseudo": ["Si.pz-vbc.UPF"], "features": ["scf", "mixing_mode TF"]},
+    {"id": "scf_mixing_local_tf", "suite": "pw_scf", "input": "scf-mixing_localTF.in", "pseudo": ["Si.pz-vbc.UPF"], "features": ["scf", "mixing_mode local-TF"]},
+    {"id": "scf_cg", "suite": "pw_scf", "input": "scf-cg.in", "pseudo": ["Si.pz-vbc.UPF"], "features": ["scf", "diagonalization cg", "diago_thr_init"]},
+    {"id": "scf_allfrac", "suite": "pw_scf", "input": "scf-allfrac.in", "pseudo": ["Si.pz-vbc.UPF"], "features": ["scf", "use_all_frac"]},
+    {"id": "scf_force_symmorphic", "suite": "pw_scf", "input": "scf-nofrac.in", "pseudo": ["Si.pz-vbc.UPF"], "features": ["scf", "force_symmorphic"]},
+    {"id": "dft_revpbe", "suite": "pw_dft", "input": "dft2.in", "pseudo": ["Si.pz-vbc.UPF"], "features": ["scf", "input_dft revPBE"]},
+    {"id": "dft_pbesol", "suite": "pw_dft", "input": "dft4.in", "pseudo": ["Si.pz-vbc.UPF"], "features": ["scf", "input_dft PBEsol"]},
+    {"id": "metal_mv", "suite": "pw_metal", "input": "metal.in", "pseudo": ["Al.pz-vbc.UPF"], "features": ["scf", "Marzari-Vanderbilt smearing", "stress"]},
+    {"id": "metal_fermi_dirac", "suite": "pw_metal", "input": "metal-fermi_dirac.in", "pseudo": ["Al.pz-vbc.UPF"], "features": ["scf", "Fermi-Dirac smearing"]},
+    {"id": "metal_methfessel_paxton", "suite": "pw_metal", "input": "metal-gaussian.in", "pseudo": ["Al.pz-vbc.UPF"], "features": ["scf", "Methfessel-Paxton smearing"]},
+    {"id": "metal_tetrahedra_opt", "suite": "pw_metal", "input": "metal-tetrahedra.in", "pseudo": ["Al.pz-vbc.UPF"], "features": ["scf", "optimized tetrahedra", "K_POINTS automatic"]}
+  ]
+}

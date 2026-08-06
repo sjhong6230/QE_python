@@ -1,9 +1,10 @@
-"""Small optional MPI runtime used by the distributed FFT backend."""
+"""MPI runtime used by the mandatory distributed Cython FFT path."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 import os
+import sys
 
 import numpy as np
 
@@ -25,10 +26,25 @@ class MPIContext:
         default_factory=lambda: np.empty(0, dtype=np.complex128),
         repr=False,
     )
+    _shared_comm: object | None = field(default=None, repr=False)
+    _shared_windows: list[object] = field(default_factory=list, repr=False)
 
     @classmethod
     def world(cls) -> "MPIContext":
         try:
+            import mpi4py
+
+            if "mpi4py.MPI" not in sys.modules:
+                # Native OpenMP/FFTW workers never call MPI. FUNNELED is the
+                # strongest level required and avoids THREAD_MULTIPLE state in
+                # every rank on MPI implementations that distinguish them.
+                mpi4py.rc.threads = True
+                mpi4py.rc.thread_level = "funneled"
+                if "OMPI_COMM_WORLD_SIZE" in os.environ:
+                    # Open MPI's UCX OSC probe emits warnings under WSL for a
+                    # node-local shared window; the dedicated sm component is
+                    # the appropriate implementation for COMM_TYPE_SHARED.
+                    os.environ.setdefault("OMPI_MCA_osc", "sm")
             from mpi4py import MPI
         except ImportError:
             launched = any(
@@ -43,11 +59,58 @@ class MPIContext:
             )
             if launched:
                 raise QEInputError(
-                    "MPI execution requires mpi4py; install qepy-pw[mpi]"
+                    "MPI execution requires the mandatory mpi4py dependency; "
+                    "reinstall qepy-pw with pip"
                 )
             return cls()
         comm = MPI.COMM_WORLD
         return cls(comm, int(comm.Get_rank()), int(comm.Get_size()))
+
+    def _node_comm(self):
+        if self.size == 1:
+            return None
+        if self._shared_comm is None:
+            from mpi4py import MPI
+
+            self._shared_comm = self.comm.Split_type(
+                MPI.COMM_TYPE_SHARED, key=self.rank
+            )
+        return self._shared_comm
+
+    @property
+    def shared_size(self) -> int:
+        node_comm = self._node_comm()
+        return 1 if node_comm is None else int(node_comm.Get_size())
+
+    def shared_readonly(self, value: np.ndarray) -> np.ndarray:
+        """Keep one physical copy of an identical read-only array per node."""
+        array = np.ascontiguousarray(value)
+        node_comm = self._node_comm()
+        if node_comm is None:
+            array.flags.writeable = False
+            return array
+        from mpi4py import MPI
+
+        local_rank = int(node_comm.Get_rank())
+        metadata = (
+            (array.shape, array.dtype.str) if local_rank == 0 else None
+        )
+        shape, dtype_string = node_comm.bcast(metadata, root=0)
+        dtype = np.dtype(dtype_string)
+        number_of_bytes = int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
+        window = MPI.Win.Allocate_shared(
+            number_of_bytes if local_rank == 0 else 0,
+            dtype.itemsize,
+            comm=node_comm,
+        )
+        shared_buffer, _disp_unit = window.Shared_query(0)
+        shared = np.ndarray(shape, dtype=dtype, buffer=shared_buffer)
+        if local_rank == 0:
+            shared[...] = array
+        node_comm.Barrier()
+        shared.flags.writeable = False
+        self._shared_windows.append(window)
+        return shared
 
     @property
     def is_root(self) -> bool:
@@ -410,6 +473,14 @@ class MPIContext:
         return (
             self._exchange_send_buffer[:send_size],
             self._exchange_recv_buffer[:recv_size],
+        )
+
+    @property
+    def exchange_buffer_bytes(self) -> int:
+        """Bytes retained by the grow-only complex collective buffers."""
+        return int(
+            self._exchange_send_buffer.nbytes
+            + self._exchange_recv_buffer.nbytes
         )
 
     def exchange_complex_planned(

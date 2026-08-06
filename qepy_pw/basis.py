@@ -4,15 +4,93 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from contextlib import nullcontext
+import ctypes
+import glob
+from importlib.util import find_spec
 from math import prod
+from pathlib import Path
 
 import numpy as np
-from scipy.fft import next_fast_len
-from scipy import fft as scipy_fft
 
 from .errors import QEInputError
 from .mpi import MPIContext
+from .threads import hybrid_thread_count
 from .timing import TimingRegistry
+
+
+_FFTW_ALIGNMENT = 64
+_FFT_THREAD_WORK_THRESHOLD = 1 << 18
+_BATCHED_FFT_THREAD_WORK_THRESHOLD = 1 << 15
+_FFTW_LIBRARY_HANDLE: object | None = None
+_FFTW_OPENMP_LIBRARY_HANDLE: object | None = None
+_OPENMP_LIBRARY_HANDLE: object | None = None
+_NATIVE_FFT_MODULE: object | None = None
+
+
+def _next_fast_len_real(target: int) -> int:
+    """Return SciPy/FFTW's next 2-, 3-, 5-smooth real-FFT length."""
+    candidate = max(1, int(target))
+    while True:
+        remainder = candidate
+        for factor in (2, 3, 5):
+            while remainder % factor == 0:
+                remainder //= factor
+        if remainder == 1:
+            return candidate
+        candidate += 1
+
+
+def _aligned_complex_empty(size: int, alignment: int) -> np.ndarray:
+    """Allocate aligned complex storage without importing pyFFTW at runtime."""
+    itemsize = np.dtype(np.complex128).itemsize
+    raw = np.empty(size * itemsize + alignment - 1, dtype=np.uint8)
+    offset = (-int(raw.ctypes.data)) % alignment
+    return raw[offset : offset + size * itemsize].view(np.complex128)
+
+
+def _load_native_fft() -> object:
+    """Load bundled FFTW globally, then import the mandatory Cython module."""
+    global _FFTW_LIBRARY_HANDLE, _FFTW_OPENMP_LIBRARY_HANDLE
+    global _OPENMP_LIBRARY_HANDLE, _NATIVE_FFT_MODULE
+    if _NATIVE_FFT_MODULE is not None:
+        return _NATIVE_FFT_MODULE
+    if _FFTW_LIBRARY_HANDLE is None:
+        spec = find_spec("pyfftw")
+        if spec is None or spec.origin is None:
+            raise ImportError("the mandatory pyfftw package is not installed")
+        library_dir = Path(spec.origin).resolve().parent.parent / "pyfftw.libs"
+        candidates = sorted(
+            glob.glob(str(library_dir / "libfftw3-*.so*"))
+        )
+        openmp_candidates = sorted(
+            glob.glob(str(library_dir / "libfftw3_omp-*.so*"))
+        )
+        runtime_candidates = sorted(
+            glob.glob(str(library_dir / "libgomp-*.so*"))
+        )
+        if not candidates or not openmp_candidates or not runtime_candidates:
+            raise ImportError(
+                "cannot locate pyfftw's bundled FFTW/OpenMP runtime libraries"
+            )
+        _OPENMP_LIBRARY_HANDLE = ctypes.CDLL(
+            runtime_candidates[-1], mode=ctypes.RTLD_GLOBAL
+        )
+        _FFTW_LIBRARY_HANDLE = ctypes.CDLL(
+            candidates[-1], mode=ctypes.RTLD_GLOBAL
+        )
+        _FFTW_OPENMP_LIBRARY_HANDLE = ctypes.CDLL(
+            openmp_candidates[-1], mode=ctypes.RTLD_GLOBAL
+        )
+    from . import _native_fft
+
+    _NATIVE_FFT_MODULE = _native_fft
+    return _NATIVE_FFT_MODULE
+
+
+def _compact_unsigned(values: np.ndarray, upper_bound: int) -> np.ndarray:
+    """Store nonnegative table indices in the narrowest practical dtype."""
+    dtype = np.uint16 if upper_bound <= np.iinfo(np.uint16).max + 1 else np.uint32
+    return np.asarray(values, dtype=dtype)
 
 
 @dataclass(frozen=True)
@@ -21,17 +99,20 @@ class PlaneWaveCatalog:
 
     indices: np.ndarray
     reciprocal: np.ndarray
-    _vectors: np.ndarray = field(init=False, repr=False)
+    _vectors: np.ndarray | None = field(default=None, repr=False)
+    shared: bool = field(default=False, repr=False)
 
     def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "_vectors",
-            np.asarray(self.indices @ self.reciprocal, dtype=float),
-        )
+        if self._vectors is None:
+            object.__setattr__(
+                self,
+                "_vectors",
+                np.asarray(self.indices @ self.reciprocal, dtype=float),
+            )
 
     @property
     def vectors(self) -> np.ndarray:
+        assert self._vectors is not None
         return self._vectors
 
 
@@ -56,10 +137,13 @@ class PlaneWaveBasis:
         # and downstream callers while make_bases uses the compact catalog.
         if isinstance(catalog_or_indices, PlaneWaveCatalog):
             object.__setattr__(self, "catalog", catalog_or_indices)
+            mapping = np.asarray(mapping_or_vectors)
+            if np.any(mapping < 0) or np.any(mapping >= len(catalog_or_indices.indices)):
+                raise ValueError("global plane-wave mapping is out of range")
             object.__setattr__(
                 self,
                 "global_indices",
-                np.asarray(mapping_or_vectors, dtype=np.int32),
+                _compact_unsigned(mapping, len(catalog_or_indices.indices)),
             )
             object.__setattr__(
                 self, "k_crystal", np.asarray(kpoint_or_kinetic, dtype=float)
@@ -141,7 +225,11 @@ class FFTTransposePlan:
     g2r_send_base: np.ndarray
     g2r_recv_base: np.ndarray
     slab_point_indices: np.ndarray
+    native_slab_point_indices: np.ndarray
     _scaled: dict[
+        tuple[int, bool], tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+    ] = field(default_factory=dict, repr=False)
+    _scaled_native: dict[
         tuple[int, bool], tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
     ] = field(default_factory=dict, repr=False)
 
@@ -162,6 +250,22 @@ class FFTTransposePlan:
         self._scaled[key] = cached
         return cached
 
+    def native_counts(
+        self, number_of_vectors: int, *, reverse: bool = False
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Return C-MPI compatible int count/displacement arrays."""
+        key = (int(number_of_vectors), bool(reverse))
+        cached = self._scaled_native.get(key)
+        if cached is None:
+            cached = tuple(
+                np.asarray(array, dtype=np.int32)
+                for array in self.counts(
+                    number_of_vectors, reverse=reverse
+                )
+            )
+            self._scaled_native[key] = cached
+        return cached
+
 
 @dataclass(frozen=True)
 class FFTGridDescriptor:
@@ -173,7 +277,9 @@ class FFTGridDescriptor:
     stick_owners: np.ndarray
     sticks_by_rank: tuple[np.ndarray, ...]
     stick_lookup: np.ndarray
-    transpose_plans: tuple[FFTTransposePlan, ...]
+    row_stick_indices: np.ndarray
+    row_z_slots: np.ndarray
+    transpose_plans: tuple[FFTTransposePlan | None, ...]
 
     @classmethod
     def build(
@@ -181,6 +287,8 @@ class FFTGridDescriptor:
         indices: np.ndarray,
         shape: tuple[int, int, int],
         processes: int,
+        *,
+        local_rank: int | None = None,
     ) -> "FFTGridDescriptor":
         miller = np.asarray(indices, dtype=np.int32)
         shape = tuple(int(value) for value in shape)
@@ -188,6 +296,8 @@ class FFTGridDescriptor:
             raise ValueError("indices must have shape (nplane, 3)")
         if processes < 1:
             raise ValueError("FFT descriptor needs at least one process")
+        if local_rank is not None and not 0 <= local_rank < processes:
+            raise ValueError("local FFT-descriptor rank is out of range")
         pairs = np.column_stack(
             (miller[:, 0] % shape[0], miller[:, 1] % shape[1])
         )
@@ -226,10 +336,14 @@ class FFTGridDescriptor:
             [len(value) for value in by_rank], dtype=np.int64
         )
         xy = sticks[:, 0].astype(np.int64) * shape[1] + sticks[:, 1]
-        plans: list[FFTTransposePlan] = []
+        plans: list[FFTTransposePlan | None] = []
         for rank in range(processes):
+            if local_rank is not None and rank != local_rank:
+                plans.append(None)
+                continue
             local_z = int(z_counts[rank])
             point_blocks = []
+            native_point_blocks = []
             for peer_sticks in by_rank:
                 peer_xy = xy[peer_sticks]
                 point_blocks.append(
@@ -238,16 +352,37 @@ class FFTGridDescriptor:
                         + np.arange(local_z, dtype=np.int64)[:, None]
                     ).ravel()
                 )
+                # QE's local real-space layout keeps each XY plane
+                # contiguous.  The generic NumPy grid remains (x,y,z), but
+                # the fused native Hpsi/density kernels use (z,x,y) scratch
+                # so FFTW does not traverse XY planes with stride local_z.
+                native_point_blocks.append(
+                    (
+                        np.arange(local_z, dtype=np.int64)[:, None]
+                        * (shape[0] * shape[1])
+                        + peer_xy[None, :]
+                    ).ravel()
+                )
             points = (
                 np.concatenate(point_blocks)
                 if point_blocks
+                else np.empty(0, dtype=np.int64)
+            )
+            native_points = (
+                np.concatenate(native_point_blocks)
+                if native_point_blocks
                 else np.empty(0, dtype=np.int64)
             )
             plans.append(
                 FFTTransposePlan(
                     g2r_send_base=z_counts * stick_counts[rank],
                     g2r_recv_base=local_z * stick_counts,
-                    slab_point_indices=points,
+                    slab_point_indices=_compact_unsigned(
+                        points, shape[0] * shape[1] * local_z
+                    ),
+                    native_slab_point_indices=_compact_unsigned(
+                        native_points, shape[0] * shape[1] * local_z
+                    ),
                 )
             )
         return cls(
@@ -257,6 +392,8 @@ class FFTGridDescriptor:
             owners,
             by_rank,
             lookup,
+            _compact_unsigned(inverse, len(sticks)),
+            _compact_unsigned(miller[:, 2] % shape[2], shape[2]),
             tuple(plans),
         )
 
@@ -266,12 +403,16 @@ class FFTGridDescriptor:
             self.sticks.nbytes
             + self.stick_owners.nbytes
             + self.stick_lookup.nbytes
+            + self.row_stick_indices.nbytes
+            + self.row_z_slots.nbytes
             + sum(array.nbytes for array in self.sticks_by_rank)
             + sum(
                 plan.g2r_send_base.nbytes
                 + plan.g2r_recv_base.nbytes
                 + plan.slab_point_indices.nbytes
+                + plan.native_slab_point_indices.nbytes
                 for plan in self.transpose_plans
+                if plan is not None
             )
         )
 
@@ -310,11 +451,7 @@ class FFTScratchPool:
                     if key and key[-1] == old_pointer:
                         del self._fftw_plans[key]
             if requested_alignment:
-                import pyfftw
-
-                buffer = pyfftw.empty_aligned(
-                    size, dtype="complex128", n=requested_alignment
-                )
+                buffer = _aligned_complex_empty(size, requested_alignment)
             else:
                 buffer = np.empty(size, dtype=np.complex128)
             self._complex[name] = buffer
@@ -338,50 +475,82 @@ class LocalPotentialWorkspace:
         indices: np.ndarray | PlaneWaveBasis,
         shape: tuple[int, int, int],
         *,
-        backend: str = "numpy",
-        threads: int = 1,
-        planner_effort: str = "measure",
-        use_numba: bool = False,
         mpi: MPIContext | None = None,
         timers: TimingRegistry | None = None,
         scratch_pool: FFTScratchPool | None = None,
         descriptor: FFTGridDescriptor | None = None,
+        serial_fft_batch_size: int | None = None,
+        retain_serial_sticks: bool = True,
     ) -> None:
+        compact_basis = (
+            indices
+            if isinstance(indices, PlaneWaveBasis)
+            and indices.catalog is not None
+            else None
+        )
         if isinstance(indices, PlaneWaveBasis):
-            miller = indices.indices
+            miller = (
+                None if compact_basis is not None else indices.indices
+            )
+            self.plane_waves = len(indices)
         else:
             miller = np.asarray(indices, dtype=np.int32)
-        if miller.ndim != 2 or miller.shape[1] != 3:
+            self.plane_waves = len(miller)
+        if miller is not None and (
+            miller.ndim != 2 or miller.shape[1] != 3
+        ):
             raise ValueError("indices must have shape (nplane, 3)")
-        self.plane_waves = len(miller)
         self.shape = tuple(shape)
         self.size = int(np.prod(shape))
-        slots = tuple(
-            np.asarray(
-                miller[:, axis] % shape[axis],
-                dtype=np.int32,
-            )
-            for axis in range(3)
-        )
-        self.linear_slots = np.asarray(
-            np.ravel_multi_index(slots, self.shape),
-            dtype=np.int32,
-        )
-        self.use_numba = bool(use_numba)
+        slots = None
         self.mpi = mpi if mpi is not None else MPIContext()
         self.timers = timers
         self.scratch_pool = (
             scratch_pool if scratch_pool is not None else FFTScratchPool()
         )
+        self.serial_fft_batch_size = (
+            None
+            if serial_fft_batch_size is None
+            else int(serial_fft_batch_size)
+        )
+        if (
+            self.serial_fft_batch_size is not None
+            and self.serial_fft_batch_size < 1
+        ):
+            raise QEInputError("serial_fft_batch_size must be at least 1")
         # QE stores complete Z-sticks indexed by (Gx,Gy), then transposes
         # them into real-space Z-plane slabs for the two-dimensional XY FFT.
         self.local_slab = self.mpi.slab(self.shape[2])
         if self.mpi.size == 1:
+            if miller is None:
+                assert compact_basis is not None
+                miller = compact_basis.indices
+            slots = tuple(
+                np.asarray(
+                    miller[:, axis] % shape[axis], dtype=np.int32
+                )
+                for axis in range(3)
+            )
+            self.linear_slots = np.asarray(
+                np.ravel_multi_index(slots, self.shape), dtype=np.int32
+            )
+            plane_size = self.shape[0] * self.shape[1]
+            xy_slots = slots[0] * self.shape[1] + slots[1]
+            self.z_major_slots = _compact_unsigned(
+                slots[2] * plane_size + xy_slots, self.size
+            )
+            self.serial_stick_positions = _compact_unsigned(
+                np.unique(xy_slots), plane_size
+            )
             self.descriptor = None
             self.transpose_plan = None
-            self.sticks = np.unique(
-                np.column_stack((slots[0], slots[1])), axis=0
-            ).astype(np.int32, copy=False)
+            self.sticks = (
+                np.unique(
+                    np.column_stack((slots[0], slots[1])), axis=0
+                ).astype(np.int32, copy=False)
+                if retain_serial_sticks
+                else np.empty((0, 2), dtype=np.int32)
+            )
             # Serial transforms need only compact linear FFT slots. Avoid
             # retaining the distributed stick ownership/maps for every k.
             self.stick_indices = np.empty(0, dtype=np.int32)
@@ -399,6 +568,9 @@ class LocalPotentialWorkspace:
             self.local_stick_positions = np.empty(0, dtype=np.int32)
         else:
             if descriptor is None:
+                if miller is None:
+                    assert compact_basis is not None
+                    miller = compact_basis.indices
                 descriptor = FFTGridDescriptor.build(
                     miller, self.shape, self.mpi.size
                 )
@@ -411,11 +583,37 @@ class LocalPotentialWorkspace:
                 )
             self.descriptor = descriptor
             self.transpose_plan = descriptor.transpose_plans[self.mpi.rank]
+            if self.transpose_plan is None:
+                raise ValueError(
+                    "FFT descriptor does not contain this rank's transpose plan"
+                )
             self.sticks = descriptor.sticks
             self.stick_owners = descriptor.stick_owners
             self.sticks_by_rank = descriptor.sticks_by_rank
-            pair_slots = slots[0] * self.shape[1] + slots[1]
-            self.stick_indices = descriptor.stick_lookup[pair_slots]
+            if compact_basis is not None:
+                assert compact_basis.global_indices is not None
+                catalog_rows = compact_basis.global_indices
+                self.stick_indices = descriptor.row_stick_indices[
+                    catalog_rows
+                ]
+                z_slots = descriptor.row_z_slots[catalog_rows]
+            else:
+                if miller is None:
+                    raise ValueError("distributed FFT indices are missing")
+                if len(miller) == len(descriptor.row_stick_indices):
+                    self.stick_indices = descriptor.row_stick_indices
+                    z_slots = descriptor.row_z_slots
+                else:
+                    slots = tuple(
+                        np.asarray(
+                            miller[:, axis] % shape[axis],
+                            dtype=np.int32,
+                        )
+                        for axis in range(3)
+                    )
+                    pair_slots = slots[0] * self.shape[1] + slots[1]
+                    self.stick_indices = descriptor.stick_lookup[pair_slots]
+                    z_slots = slots[2]
             if np.any(self.stick_indices < 0):
                 raise ValueError(
                     "FFT descriptor does not cover the plane-wave basis"
@@ -424,56 +622,45 @@ class LocalPotentialWorkspace:
                 self.stick_owners[self.stick_indices] == self.mpi.rank
             )
             self.local_plane_wave_indices = np.asarray(
-                np.flatnonzero(self.owned_plane_waves),
-                dtype=np.int32,
+                _compact_unsigned(
+                    np.flatnonzero(self.owned_plane_waves), self.plane_waves
+                )
             )
-            self.local_slots = tuple(
-                axis[self.owned_plane_waves] for axis in slots
+            empty_slots = np.empty(0, dtype=np.int32)
+            self.local_slots = (
+                empty_slots,
+                empty_slots,
+                _compact_unsigned(
+                    z_slots[self.owned_plane_waves], self.shape[2]
+                ),
             )
+            self.linear_slots = np.empty(0, dtype=np.int32)
+            self.z_major_slots = np.empty(0, dtype=np.int32)
+            self.serial_stick_positions = np.empty(0, dtype=np.int32)
             local_stick_lookup = np.full(
                 len(self.sticks), -1, dtype=np.int32
             )
             local_stick_lookup[
                 self.sticks_by_rank[self.mpi.rank]
             ] = np.arange(len(self.sticks_by_rank[self.mpi.rank]))
-            self.local_stick_positions = local_stick_lookup[
-                self.stick_indices[self.owned_plane_waves]
-            ]
-        if self.use_numba:
-            from .acceleration import numba_kernels
-
-            self._jit = numba_kernels()
-        self.backend = backend.lower()
-        self.threads = int(threads)
-        if self.threads < 1:
-            raise QEInputError("py_fft_threads must be at least 1")
-        effort = planner_effort.lower()
-        efforts = {
-            "estimate": "FFTW_ESTIMATE",
-            "measure": "FFTW_MEASURE",
-            "patient": "FFTW_PATIENT",
-        }
-        if effort not in efforts:
-            raise QEInputError(
-                "py_fft_planner must be 'estimate', 'measure', or 'patient'"
-        )
-        self.planner_flag = efforts[effort]
-        if self.backend == "pyfftw":
-            try:
-                import pyfftw
-            except ImportError as exc:
-                raise QEInputError(
-                    "py_fft_backend='pyfftw' requires the optional pyFFTW "
-                    "package; install qepy-pw[fft]"
-                ) from exc
-            self._pyfftw = pyfftw
-            self._fft_alignment = int(pyfftw.simd_alignment)
-        elif self.backend not in {"numpy", "scipy"}:
-            raise QEInputError(
-                "py_fft_backend must be 'scipy', 'numpy', or 'pyfftw'"
+            self.local_stick_positions = _compact_unsigned(
+                local_stick_lookup[
+                    self.stick_indices[self.owned_plane_waves]
+                ],
+                len(self.sticks_by_rank[self.mpi.rank]),
             )
-        else:
-            self._fft_alignment = 0
+        self._native_fft = _load_native_fft()
+        self._fft_alignment = _FFTW_ALIGNMENT
+        self.thread_count = hybrid_thread_count()
+        self._native_fft.configure_openmp_threads(self.thread_count)
+        # Preserve the validated execution policy: serial plans are reused
+        # enough to amortize MEASURE, while MPI's changing Davidson block
+        # shapes use bounded-cost ESTIMATE plans.  A 200 Ry end-to-end check
+        # found all-ESTIMATE reduced VmHWM by only a few MiB but increased FFT
+        # and total wall time materially.
+        self.planner_flag = (
+            "FFTW_MEASURE" if self.mpi.size == 1 else "FFTW_ESTIMATE"
+        )
 
     def _scratch(
         self,
@@ -489,132 +676,159 @@ class LocalPotentialWorkspace:
             alignment=(self._fft_alignment or None),
         )
 
-    def _planned_local_transform(
+    def _parallel_band_fft(self, number_of_vectors: int) -> bool:
+        """Whether independent band FFTs can occupy the rank-local team."""
+        return (
+            self.thread_count > 1
+            and number_of_vectors > 1
+        )
+
+    def _serial_grid_stride(self, number_of_vectors: int) -> int:
+        """Return a 64-byte-aligned band stride when bands run concurrently."""
+        if not self._parallel_band_fft(number_of_vectors):
+            return self.size
+        complex_per_alignment = (
+            _FFTW_ALIGNMENT // np.dtype(np.complex128).itemsize
+        )
+        return (
+            (self.size + complex_per_alignment - 1)
+            // complex_per_alignment
+            * complex_per_alignment
+        )
+
+    def _native_plan(
         self,
         values: np.ndarray,
-        axes: tuple[int, ...],
-        direction: str,
-    ) -> np.ndarray | None:
-        """Run an in-place pyFFTW plan when the reusable array is aligned."""
+        lengths: tuple[int, ...],
+        howmany: int,
+        stride: int,
+        distance: int,
+        *,
+        parallel_bands: bool = False,
+        planner_flag: str | None = None,
+        preserve_values: bool = True,
+    ) -> object:
+        selected_planner_flag = planner_flag or self.planner_flag
         pointer = int(values.ctypes.data)
-        if (
-            self.backend != "pyfftw"
-            or values.dtype != np.complex128
-            or not values.flags.c_contiguous
-            or pointer not in self.scratch_pool._complex_pointers
-        ):
-            return None
-        plan_values = values
-        if (
-            axes == tuple(range(len(axes)))
-            and values.ndim > len(axes) + 1
-        ):
-            # The remaining dimensions are independent transform batches.
-            # Flatten them into one dimension.  Besides reducing planner
-            # metadata, this avoids a pyFFTW/FFTW limitation seen for
-            # rank-3 one-dimensional and rank-4 two-dimensional in-place
-            # plans when SciPy's native libraries are already loaded.
-            plan_values = values.reshape(
-                values.shape[: len(axes)] + (-1,)
-            )
-        cache_key = (
-            "local",
-            direction,
-            plan_values.shape,
-            plan_values.strides,
-            axes,
-            self.threads,
-            self.planner_flag,
+        thread_threshold = (
+            _BATCHED_FFT_THREAD_WORK_THRESHOLD
+            if int(howmany) > 1
+            else _FFT_THREAD_WORK_THRESHOLD
+        )
+        plan_threads = 1 if parallel_bands else (
+            self.thread_count
+            if prod(lengths) * int(howmany) >= thread_threshold
+            else 1
+        )
+        cache_plan = pointer in self.scratch_pool._complex_pointers
+        key = (
+            "native",
+            values.shape,
+            lengths,
+            int(howmany),
+            int(stride),
+            int(distance),
+            selected_planner_flag,
+            plan_threads,
             pointer,
         )
-        cached = self.scratch_pool._fftw_plans.get(cache_key)
+        cached = (
+            self.scratch_pool._fftw_plans.get(key)
+            if cache_plan
+            else None
+        )
         if cached is None:
-            # FFTW_MEASURE/PATIENT may overwrite the planning array.
-            preserved = values.copy()
-            try:
-                plan = self._pyfftw.FFTW(
-                    plan_values,
-                    plan_values,
-                    axes=axes,
-                    direction=(
-                        "FFTW_FORWARD"
-                        if direction == "forward"
-                        else "FFTW_BACKWARD"
-                    ),
-                    flags=(self.planner_flag,),
-                    threads=self.threads,
-                )
-            except RuntimeError:
-                # Some FFTW builds reject a SIMD plan after native libraries
-                # have changed alignment assumptions (notably under pytest's
-                # MPI runner).  The unaligned plan remains genuinely in-place
-                # and is preferable to silently allocating SciPy temporaries.
-                plan = self._pyfftw.FFTW(
-                    plan_values,
-                    plan_values,
-                    axes=axes,
-                    direction=(
-                        "FFTW_FORWARD"
-                        if direction == "forward"
-                        else "FFTW_BACKWARD"
-                    ),
-                    flags=(self.planner_flag, "FFTW_UNALIGNED"),
-                    threads=self.threads,
-                )
-            values[...] = preserved
+            flag = {
+                "FFTW_ESTIMATE": 64,
+                "FFTW_MEASURE": 0,
+                "FFTW_PATIENT": 32,
+            }[selected_planner_flag]
+            preserved = (
+                values.copy()
+                if flag != 64 and preserve_values
+                else None
+            )
+            plan = self._native_fft.NativeFFTWPlan(
+                values,
+                lengths,
+                howmany,
+                stride,
+                distance,
+                flag,
+                plan_threads,
+            )
+            if preserved is not None:
+                values[...] = preserved
             cached = (plan,)
-            self.scratch_pool._fftw_plans[cache_key] = cached
-        plan = cached[0]
-        # Keep NumPy/FFTW's conventional pair: backward transforms carry the
-        # 1/N normalization and forward transforms are unscaled.  In pyFFTW,
-        # passing ``normalise_idft=False`` instead normalizes the forward
-        # direction, so the option must remain true for both plan directions.
-        plan(normalise_idft=True)
-        return values
+            if cache_plan:
+                self.scratch_pool._fftw_plans[key] = cached
+        return cached[0]
+
+    def _serial_spatial_plans(self, grid: np.ndarray) -> tuple[object, object]:
+        """Single-transform plans used by the shared-memory stick path."""
+        plane_size = self.shape[0] * self.shape[1]
+        z_plan = self._native_plan(
+            grid,
+            (self.shape[2],),
+            1,
+            plane_size,
+            1,
+            parallel_bands=True,
+            preserve_values=False,
+        )
+        xy_plan = self._native_plan(
+            grid,
+            (self.shape[0], self.shape[1]),
+            1,
+            1,
+            plane_size,
+            parallel_bands=True,
+            preserve_values=False,
+        )
+        return z_plan, xy_plan
 
     def prepare_potential(self, potential_g: np.ndarray) -> np.ndarray:
         """Transform a fixed local potential once per Hamiltonian."""
-        values = potential_g * self.size
-        if self.backend in {"scipy", "pyfftw"}:
-            return np.real(
-                scipy_fft.ifftn(
-                    values,
-                    axes=(0, 1, 2),
-                    workers=self.threads,
-                    overwrite_x=True,
-                )
-            )
-        return np.real(np.fft.ifftn(values))
+        # The one-shot FFT is destructive. Always copy even when the caller's
+        # reciprocal array is already contiguous complex128; SCF reuses that
+        # array for energies and subsequent Hamiltonians.
+        values = np.array(
+            potential_g, dtype=np.complex128, order="C", copy=True
+        )
+        plan_threads = (
+            self.thread_count
+            if values.size >= _FFT_THREAD_WORK_THRESHOLD
+            else 1
+        )
+        return self._native_fft.inverse_real(
+            values, self.shape, 64, plan_threads
+        )
 
     def _backward_fft(
         self, values: np.ndarray, axes: tuple[int, ...]
     ) -> np.ndarray:
-        planned = self._planned_local_transform(values, axes, "backward")
-        if planned is not None:
-            return planned
-        if self.backend in {"scipy", "pyfftw"}:
-            return scipy_fft.ifftn(
-                values,
-                axes=axes,
-                workers=self.threads,
-                overwrite_x=True,
-            )
-        return np.fft.ifftn(values, axes=axes)
+        lengths = tuple(values.shape[axis] for axis in axes)
+        trailing = prod(values.shape[len(axes) :])
+        if axes != tuple(range(len(axes))) or not values.flags.c_contiguous:
+            raise ValueError("native local FFT requires leading contiguous axes")
+        plan = self._native_plan(
+            values, lengths, trailing, trailing, 1
+        )
+        plan.execute("backward")
+        return values
 
     def _forward_fft(
         self, values: np.ndarray, axes: tuple[int, ...]
     ) -> np.ndarray:
-        planned = self._planned_local_transform(values, axes, "forward")
-        if planned is not None:
-            return planned
-        if self.backend in {"scipy", "pyfftw"}:
-            return scipy_fft.fftn(
-                values,
-                axes=axes,
-                workers=self.threads,
-                overwrite_x=True,
-            )
-        return np.fft.fftn(values, axes=axes)
+        lengths = tuple(values.shape[axis] for axis in axes)
+        trailing = prod(values.shape[len(axes) :])
+        if axes != tuple(range(len(axes))) or not values.flags.c_contiguous:
+            raise ValueError("native local FFT requires leading contiguous axes")
+        plan = self._native_plan(
+            values, lengths, trailing, trailing, 1
+        )
+        plan.execute("forward")
+        return values
 
     def coefficients_to_grid(
         self,
@@ -638,43 +852,43 @@ class LocalPotentialWorkspace:
             )
         number_of_vectors = vectors.shape[1]
         if self.mpi.size == 1:
-            if self.backend == "pyfftw" and use_scratch:
-                real_grid, backward, _forward = self._planned_buffers(
-                    number_of_vectors
+            grid_stride = self._serial_grid_stride(number_of_vectors)
+            real_grid = self._scratch(
+                "serial_fft_grid",
+                (number_of_vectors, grid_stride),
+            )
+            parallel_bands = self._parallel_band_fft(number_of_vectors)
+            plan = self._native_plan(
+                real_grid,
+                self.shape,
+                1 if parallel_bands else number_of_vectors,
+                1,
+                grid_stride,
+                parallel_bands=parallel_bands,
+            )
+            timer = (
+                self.timers.measure("fftw")
+                if self.timers is not None
+                else nullcontext()
+            )
+            with timer:
+                self._native_fft.inverse_serial(
+                    real_grid,
+                    vectors,
+                    self.linear_slots,
+                    plan,
+                    self.size,
+                    grid_stride,
                 )
-                real_grid.fill(0.0)
-                real_grid.reshape(number_of_vectors, self.size)[
-                    :, self.linear_slots
-                ] = vectors.T * self.size
-                timer = (
-                    self.timers.measure("fftw")
-                    if self.timers is not None
-                    else nullcontext()
-                )
-                with timer:
-                    backward(normalise_idft=True)
-            else:
-                reciprocal_input = (
-                    self._numpy_buffers(number_of_vectors)
-                    if use_scratch
-                    else np.zeros(
-                        (number_of_vectors,) + self.shape,
-                        dtype=complex,
-                    )
-                )
-                reciprocal_input.reshape(number_of_vectors, self.size)[
-                    :, self.linear_slots
-                ] = vectors.T * self.size
-                timer = (
-                    self.timers.measure("fftw")
-                    if self.timers is not None
-                    else nullcontext()
-                )
-                with timer:
-                    real_grid = self._backward_fft(
-                        reciprocal_input, (1, 2, 3)
-                    )
-            result = np.moveaxis(real_grid, 0, -1)
+            result = np.moveaxis(
+                real_grid[:, : self.size].reshape(
+                    (number_of_vectors,) + self.shape
+                ),
+                0,
+                -1,
+            )
+            if not use_scratch:
+                result = result.copy()
             return result[..., 0] if was_vector else result
         local_sticks = self.sticks_by_rank[self.mpi.rank]
         stick_shape = (
@@ -682,17 +896,15 @@ class LocalPotentialWorkspace:
             len(local_sticks),
             number_of_vectors,
         )
-        data = (
-            self._scratch(
-                "inverse_sticks", stick_shape, zero=True
-            )
-            if use_scratch
-            else np.zeros(stick_shape, dtype=complex)
+        data = self._scratch(
+            "wave_sticks",
+            stick_shape,
+            zero=True,
         )
         data[
             self.local_slots[2],
             self.local_stick_positions,
-        ] = vectors * self.size
+        ] = vectors
         timer = (
             self.timers.measure("fftw")
             if self.timers is not None
@@ -702,23 +914,21 @@ class LocalPotentialWorkspace:
             data = self._backward_fft(data, (0,))
             real_slab = self._sticks_to_real_slabs(
                 data,
-                out=(
-                    self._scratch(
-                        "real_slabs",
-                        (
-                            self.shape[0],
-                            self.shape[1],
-                            self.local_slab.stop
-                            - self.local_slab.start,
-                            number_of_vectors,
-                        ),
-                        zero=True,
-                    )
-                    if use_scratch
-                    else None
+                out=self._scratch(
+                    "real_slabs",
+                    (
+                        self.shape[0],
+                        self.shape[1],
+                        self.local_slab.stop
+                        - self.local_slab.start,
+                        number_of_vectors,
+                    ),
+                    zero=True,
                 ),
             )
             real_slab = self._backward_fft(real_slab, (0, 1))
+        if not use_scratch:
+            real_slab = real_slab.copy()
         return real_slab[..., 0] if was_vector else real_slab
 
     def _sticks_to_real_slabs(
@@ -756,16 +966,9 @@ class LocalPotentialWorkspace:
             result.fill(0.0)
         source_rows = received.reshape(-1, number_of_vectors)
         destination_rows = result.reshape(-1, number_of_vectors)
-        if self.use_numba:
-            self._jit.scatter_indexed_rows(
-                source_rows,
-                self.transpose_plan.slab_point_indices,
-                destination_rows,
-            )
-        else:
-            destination_rows[
-                self.transpose_plan.slab_point_indices
-            ] = source_rows
+        destination_rows[
+            self.transpose_plan.slab_point_indices
+        ] = source_rows
         return result
 
     def _real_slabs_to_sticks(
@@ -786,7 +989,7 @@ class LocalPotentialWorkspace:
             number_of_vectors,
         )
         if out is None:
-            result = self._scratch("grid_forward_sticks", expected_shape)
+            result = self._scratch("wave_sticks", expected_shape)
         else:
             if out.shape != expected_shape:
                 raise ValueError("stick scratch buffer has wrong shape")
@@ -801,19 +1004,12 @@ class LocalPotentialWorkspace:
         )
         source_rows = np.asarray(real_data).reshape(-1, number_of_vectors)
         send_rows = send.reshape(-1, number_of_vectors)
-        if self.use_numba:
-            self._jit.gather_indexed_rows(
-                source_rows,
-                self.transpose_plan.slab_point_indices,
-                send_rows,
-            )
-        else:
-            np.take(
-                source_rows,
-                self.transpose_plan.slab_point_indices,
-                axis=0,
-                out=send_rows,
-            )
+        np.take(
+            source_rows,
+            self.transpose_plan.slab_point_indices,
+            axis=0,
+            out=send_rows,
+        )
         self.mpi.exchange_complex_planned(
             send,
             send_counts,
@@ -838,20 +1034,41 @@ class LocalPotentialWorkspace:
         if values.shape[:3] != expected:
             raise ValueError("real data does not match this rank's FFT slab")
         if self.mpi.size == 1:
-            transformed = self._forward_fft(values, (0, 1))
-            transformed = self._forward_fft(transformed, (2,)) / self.size
-            result = transformed.reshape(
-                self.size, transformed.shape[-1]
-            )[self.linear_slots]
+            number_of_vectors = values.shape[-1]
+            grid_stride = self._serial_grid_stride(number_of_vectors)
+            transformed = self._scratch(
+                "serial_fft_grid",
+                (number_of_vectors, grid_stride),
+            )
+            transformed[:, : self.size].reshape(
+                (number_of_vectors,) + self.shape
+            )[...] = np.moveaxis(values, -1, 0)
+            parallel_bands = self._parallel_band_fft(number_of_vectors)
+            plan = self._native_plan(
+                transformed,
+                self.shape,
+                1 if parallel_bands else number_of_vectors,
+                1,
+                grid_stride,
+                parallel_bands=parallel_bands,
+            )
+            result = self._native_fft.forward_serial(
+                transformed,
+                self.linear_slots,
+                plan,
+                self.size,
+                grid_stride,
+            )
             return result[:, 0] if was_scalar else result
-        if self.backend == "pyfftw" and not (
+        if not (
             values.dtype == np.complex128
             and values.flags.c_contiguous
             and int(values.ctypes.data)
             in self.scratch_pool._complex_pointers
         ):
             transformed = self._scratch(
-                "grid_real_slabs", values.shape
+                "real_slabs",
+                values.shape,
             )
             transformed[...] = values
         else:
@@ -865,22 +1082,90 @@ class LocalPotentialWorkspace:
         return result[:, 0] if was_scalar else result
 
     def _distributed_apply(
-        self, real_potential: np.ndarray, vectors: np.ndarray
+        self,
+        real_potential: np.ndarray,
+        vectors: np.ndarray,
+        *,
+        native_potential_layout: bool = False,
     ) -> np.ndarray:
-        real_wavefunctions = self.coefficients_to_grid(
-            vectors, use_scratch=True
+        return self._distributed_apply_native(
+            real_potential,
+            vectors,
+            native_potential_layout=native_potential_layout,
         )
-        if real_wavefunctions.ndim == 3:
-            real_wavefunctions = real_wavefunctions[..., None]
-        potential = (
-            real_potential
-            if real_potential.shape[2] == real_wavefunctions.shape[2]
-            else real_potential[:, :, self.local_slab]
+
+    def _distributed_apply_native(
+        self,
+        real_potential: np.ndarray,
+        vectors: np.ndarray,
+        *,
+        native_potential_layout: bool = False,
+    ) -> np.ndarray:
+        """Run the fused Cython/MPI/FFTW local-potential kernel."""
+        assert self._native_fft is not None
+        assert self.transpose_plan is not None
+        number_of_vectors = vectors.shape[1]
+        local_sticks = self.sticks_by_rank[self.mpi.rank]
+        local_z = self.local_slab.stop - self.local_slab.start
+        sticks = self._scratch(
+            "wave_sticks",
+            (self.shape[2], len(local_sticks), number_of_vectors),
         )
-        np.multiply(
-            potential[..., None],
-            real_wavefunctions,
-            out=real_wavefunctions,
+        slab = self._scratch(
+            "real_slabs", (local_z, self.shape[0], self.shape[1], 1)
+        )
+        native_potential_shape = (
+            local_z,
+            self.shape[0],
+            self.shape[1],
+        )
+        if native_potential_layout:
+            if real_potential.shape != native_potential_shape:
+                raise ValueError("native local potential has the wrong shape")
+            potential = np.ascontiguousarray(
+                real_potential, dtype=np.float64
+            )
+        else:
+            potential_view = (
+                real_potential
+                if real_potential.shape[2] == local_z
+                else real_potential[:, :, self.local_slab]
+            )
+            potential = np.ascontiguousarray(
+                np.moveaxis(potential_view, 2, 0), dtype=np.float64
+            )
+        forward = self.transpose_plan.native_counts(number_of_vectors)
+        reverse = self.transpose_plan.native_counts(
+            number_of_vectors, reverse=True
+        )
+        inverse_receive_size = int(
+            forward[3][-1] + forward[2][-1]
+        )
+        reverse_send_size = int(reverse[1][-1] + reverse[0][-1])
+        reverse_send, inverse_receive = self.mpi.complex_exchange_buffers(
+            reverse_send_size, inverse_receive_size
+        )
+        z_plan = self._native_plan(
+            sticks,
+            (self.shape[2],),
+            len(local_sticks) * number_of_vectors,
+            len(local_sticks) * number_of_vectors,
+            1,
+        )
+        xy_plan = self._native_plan(
+            slab,
+            (self.shape[0], self.shape[1]),
+            local_z,
+            1,
+            self.shape[0] * self.shape[1],
+            planner_flag=(
+                "FFTW_MEASURE"
+                if self.thread_count > 1
+                and self.shape[0] * self.shape[1] * local_z
+                >= _BATCHED_FFT_THREAD_WORK_THRESHOLD
+                else None
+            ),
+            preserve_values=False,
         )
         timer = (
             self.timers.measure("fftw")
@@ -888,75 +1173,171 @@ class LocalPotentialWorkspace:
             else nullcontext()
         )
         with timer:
-            transformed = self._forward_fft(real_wavefunctions, (0, 1))
-            transformed = self._real_slabs_to_sticks(
-                transformed,
-                out=self._scratch(
-                    "forward_sticks",
-                    (
-                        self.shape[2],
-                        len(self.sticks_by_rank[self.mpi.rank]),
-                        vectors.shape[1],
-                    ),
+            return self._native_fft.apply_streamed(
+                sticks,
+                slab,
+                reverse_send,
+                inverse_receive,
+                vectors,
+                potential,
+                self.local_slots[2],
+                self.local_stick_positions,
+                self.transpose_plan.native_slab_point_indices,
+                *forward,
+                *reverse,
+                self.mpi.comm,
+                z_plan,
+                xy_plan,
+                self.size,
+            )
+
+    def accumulate_density(
+        self,
+        density: np.ndarray,
+        coefficients: np.ndarray,
+        band_weights: np.ndarray,
+    ) -> None:
+        """Accumulate occupied-state density in the native FFT kernel."""
+        vectors = np.asarray(coefficients)
+        weights = np.asarray(band_weights, dtype=float)
+        if vectors.ndim != 2 or vectors.shape[1] != len(weights):
+            raise ValueError("density coefficients and band weights disagree")
+        expected_density_shape = (
+            self.shape[0],
+            self.shape[1],
+            self.local_slab.stop - self.local_slab.start,
+        )
+        if density.shape != expected_density_shape:
+            raise ValueError("density accumulator has the wrong local shape")
+        number_of_vectors = vectors.shape[1]
+        timer = (
+            self.timers.measure("fftw")
+            if self.timers is not None
+            else nullcontext()
+        )
+        if self.mpi.size == 1:
+            batch_size = min(
+                number_of_vectors,
+                self.serial_fft_batch_size or number_of_vectors,
+            )
+            for start in range(0, number_of_vectors, batch_size):
+                stop = min(start + batch_size, number_of_vectors)
+                active = stop - start
+                grid_stride = self._serial_grid_stride(active)
+                grid = self._scratch(
+                    "serial_fft_grid", (active, grid_stride)
+                )
+                if self.thread_count > 1 and active < self.thread_count:
+                    z_plan, xy_plan = self._serial_spatial_plans(grid)
+                    with timer:
+                        self._native_fft.accumulate_density_serial_spatial(
+                            density,
+                            grid,
+                            vectors[:, start:stop],
+                            weights[start:stop],
+                            self.z_major_slots,
+                            self.serial_stick_positions,
+                            z_plan,
+                            xy_plan,
+                            self.size,
+                            grid_stride,
+                        )
+                else:
+                    parallel_bands = self._parallel_band_fft(active)
+                    plan = self._native_plan(
+                        grid,
+                        self.shape,
+                        1 if parallel_bands else active,
+                        1,
+                        grid_stride,
+                        parallel_bands=parallel_bands,
+                    )
+                    with timer:
+                        self._native_fft.accumulate_density_serial(
+                            density,
+                            grid,
+                            vectors[:, start:stop],
+                            weights[start:stop],
+                            self.linear_slots,
+                            plan,
+                            self.size,
+                            grid_stride,
+                        )
+            return
+        local_sticks = self.sticks_by_rank[self.mpi.rank]
+        sticks = self._scratch(
+            "wave_sticks",
+            (self.shape[2], len(local_sticks), number_of_vectors),
+            zero=True,
+        )
+        if self.mpi.size > 1:
+            assert self.transpose_plan is not None
+            local_z = self.local_slab.stop - self.local_slab.start
+            slab = self._scratch(
+                "real_slabs",
+                (
+                    local_z,
+                    self.shape[0],
+                    self.shape[1],
+                    1,
                 ),
             )
-            transformed = self._forward_fft(transformed, (0,)) / self.size
-        return transformed[
-            self.local_slots[2],
-            self.local_stick_positions,
-        ]
-
-    def _numpy_buffers(
-        self, number_of_vectors: int
-    ) -> np.ndarray:
-        block_shape = (number_of_vectors,) + self.shape
-        return self._scratch(
-            "serial_fft_input", block_shape, zero=True
-        )
-
-    def _planned_buffers(
-        self, number_of_vectors: int
-    ) -> tuple[object, ...]:
-        block_shape = (number_of_vectors,) + self.shape
-        grid = self._scratch("serial_fft_grid", block_shape)
-        pointer = int(grid.ctypes.data)
-        cache_key = (
-            "serial",
-            self.shape,
-            number_of_vectors,
-            self.threads,
-            self.planner_flag,
-            pointer,
-        )
-        cached = self.scratch_pool._fftw_plans.get(cache_key)
-        if cached is not None:
-            return cached
-        # All block-size plans reference views of one grow-only aligned
-        # allocation.  Davidson revisits only a few sizes, so retaining the
-        # small FFTW plan objects avoids repeated FFTW_MEASURE work without
-        # retaining another full-grid payload for each size.
-        backward = self._pyfftw.FFTW(
-            grid,
-            grid,
-            axes=(1, 2, 3),
-            direction="FFTW_BACKWARD",
-            flags=(self.planner_flag,),
-            threads=self.threads,
-        )
-        forward = self._pyfftw.FFTW(
-            grid,
-            grid,
-            axes=(1, 2, 3),
-            direction="FFTW_FORWARD",
-            flags=(self.planner_flag,),
-            threads=self.threads,
-        )
-        buffers = (grid, backward, forward)
-        self.scratch_pool._fftw_plans[cache_key] = buffers
-        return buffers
+            counts = self.transpose_plan.native_counts(number_of_vectors)
+            receive_size = int(counts[3][-1] + counts[2][-1])
+            _send, receive = self.mpi.complex_exchange_buffers(
+                0, receive_size
+            )
+            z_plan = self._native_plan(
+                sticks,
+                (self.shape[2],),
+                len(local_sticks) * number_of_vectors,
+                len(local_sticks) * number_of_vectors,
+                1,
+            )
+            xy_plan = self._native_plan(
+                slab,
+                (self.shape[0], self.shape[1]),
+                local_z,
+                1,
+                self.shape[0] * self.shape[1],
+                planner_flag=(
+                    "FFTW_MEASURE"
+                    if self.thread_count > 1
+                    and self.shape[0] * self.shape[1] * local_z
+                    >= _BATCHED_FFT_THREAD_WORK_THRESHOLD
+                    else None
+                ),
+                preserve_values=False,
+            )
+            timer = (
+                self.timers.measure("fftw")
+                if self.timers is not None
+                else nullcontext()
+            )
+            with timer:
+                self._native_fft.accumulate_density_distributed(
+                    density,
+                    sticks,
+                    slab,
+                    receive,
+                    vectors,
+                    weights,
+                    self.local_slots[2],
+                    self.local_stick_positions,
+                    self.transpose_plan.native_slab_point_indices,
+                    *counts,
+                    self.mpi.comm,
+                    z_plan,
+                    xy_plan,
+                )
+            return
 
     def apply(
-        self, real_potential: np.ndarray, coefficients: np.ndarray
+        self,
+        real_potential: np.ndarray,
+        coefficients: np.ndarray,
+        *,
+        native_potential_layout: bool = False,
     ) -> np.ndarray:
         """Apply a prepared real-space potential using reusable FFT storage."""
         vectors = np.asarray(coefficients)
@@ -975,124 +1356,74 @@ class LocalPotentialWorkspace:
             )
         number_of_vectors = vectors.shape[1]
         if self.mpi.size > 1:
-            result = self._distributed_apply(real_potential, vectors)
+            result = self._distributed_apply(
+                real_potential,
+                vectors,
+                native_potential_layout=native_potential_layout,
+            )
             return result[:, 0] if was_vector else result
-        if self.backend in {"numpy", "scipy"}:
-            reciprocal_input = self._numpy_buffers(number_of_vectors)
-            if self.use_numba:
-                self._jit.scatter_scaled(
-                    reciprocal_input.reshape(number_of_vectors, self.size).T,
-                    self.linear_slots,
-                    vectors,
-                    float(self.size),
+        # QE's serial vloc_psi transforms a small number of states at a time.
+        # Keep one native result owner and one timing scope around the bounded
+        # batches instead of recursively re-entering this Python method for
+        # every batch. The grow-only full-grid scratch remains O(batch size).
+        batch_size = min(
+            number_of_vectors,
+            self.serial_fft_batch_size or number_of_vectors,
+        )
+        potential = np.ascontiguousarray(real_potential, dtype=np.float64)
+        result = np.empty(
+            vectors.shape,
+            dtype=np.result_type(vectors.dtype, np.complex128),
+        )
+        timer = (
+            self.timers.measure("fftw")
+            if self.timers is not None
+            else nullcontext()
+        )
+        with timer:
+            for start in range(0, number_of_vectors, batch_size):
+                stop = min(start + batch_size, number_of_vectors)
+                active = stop - start
+                grid_stride = self._serial_grid_stride(active)
+                grid = self._scratch(
+                    "serial_fft_grid", (active, grid_stride)
                 )
-            else:
-                reciprocal_input.fill(0.0)
-                reciprocal_input.reshape(number_of_vectors, self.size)[
-                    :, self.linear_slots
-                ] = vectors.T * self.size
-            timer = (
-                self.timers.measure("fftw")
-                if self.timers is not None
-                else nullcontext()
-            )
-            with timer:
-                real_wavefunctions = self._backward_fft(
-                    reciprocal_input, (1, 2, 3)
-                )
-            if self.use_numba:
-                self._jit.multiply_real_complex(
-                    real_potential.reshape(self.size),
-                    real_wavefunctions.reshape(
-                        number_of_vectors, self.size
-                    ).T,
-                    real_wavefunctions.reshape(
-                        number_of_vectors, self.size
-                    ).T,
-                )
-            else:
-                np.multiply(
-                    real_potential[None, ...],
-                    real_wavefunctions,
-                    out=real_wavefunctions,
-                )
-            timer = (
-                self.timers.measure("fftw")
-                if self.timers is not None
-                else nullcontext()
-            )
-            with timer:
-                transformed = self._forward_fft(
-                    real_wavefunctions, (1, 2, 3)
-                )
-                transformed /= self.size
-            if self.use_numba:
-                result = np.empty_like(vectors)
-                self._jit.gather_scaled(
-                    transformed.reshape(number_of_vectors, self.size).T,
-                    self.linear_slots,
-                    result,
-                    1.0,
-                )
-            else:
-                result = transformed.reshape(
-                    number_of_vectors, self.size
-                )[:, self.linear_slots].T
-        else:
-            grid, backward, forward = self._planned_buffers(
-                number_of_vectors
-            )
-            if self.use_numba:
-                self._jit.scatter_scaled(
-                    grid.reshape(number_of_vectors, self.size).T,
-                    self.linear_slots,
-                    vectors,
-                    float(self.size),
-                )
-            else:
-                grid.fill(0.0)
-                grid.reshape(number_of_vectors, self.size)[
-                    :, self.linear_slots
-                ] = vectors.T * self.size
-            timer = (
-                self.timers.measure("fftw")
-                if self.timers is not None
-                else nullcontext()
-            )
-            with timer:
-                backward(normalise_idft=True)
-            if self.use_numba:
-                self._jit.multiply_real_complex(
-                    real_potential.reshape(self.size),
-                    grid.reshape(number_of_vectors, self.size).T,
-                    grid.reshape(number_of_vectors, self.size).T,
-                )
-            else:
-                np.multiply(
-                    real_potential[None, ...],
+                if self.thread_count > 1 and native_potential_layout:
+                    z_plan, xy_plan = self._serial_spatial_plans(grid)
+                    self._native_fft.apply_serial_spatial(
+                        grid,
+                        vectors[:, start:stop],
+                        potential,
+                        self.z_major_slots,
+                        self.serial_stick_positions,
+                        z_plan,
+                        xy_plan,
+                        self.size,
+                        grid_stride,
+                        result,
+                        start,
+                    )
+                    continue
+                parallel_bands = self._parallel_band_fft(active)
+                plan = self._native_plan(
                     grid,
-                    out=grid,
+                    self.shape,
+                    1 if parallel_bands else active,
+                    1,
+                    grid_stride,
+                    parallel_bands=parallel_bands,
                 )
-            timer = (
-                self.timers.measure("fftw")
-                if self.timers is not None
-                else nullcontext()
-            )
-            with timer:
-                forward()
-            if self.use_numba:
-                result = np.empty_like(vectors)
-                self._jit.gather_scaled(
-                    grid.reshape(number_of_vectors, self.size).T,
+                self._native_fft.apply_serial(
+                    grid,
+                    vectors[:, start:stop],
+                    potential,
                     self.linear_slots,
+                    plan,
+                    self.size,
+                    grid_stride,
                     result,
-                    1.0 / self.size,
+                    start,
                 )
-            else:
-                result = grid.reshape(number_of_vectors, self.size)[
-                    :, self.linear_slots
-                ].T
-                result /= self.size
         return result[:, 0] if was_vector else result
 
 
@@ -1125,6 +1456,8 @@ def make_bases(
     reciprocal: np.ndarray,
     k_crystal: np.ndarray,
     ecut_ry: float,
+    *,
+    mpi: MPIContext | None = None,
 ) -> list[PlaneWaveBasis]:
     """Build multiple k-point bases from one globally ordered G catalog."""
     reciprocal = np.asarray(reciprocal, dtype=float)
@@ -1190,9 +1523,21 @@ def make_bases(
     compact_global = np.flatnonzero(used).astype(np.int32)
     remap = np.full(len(integer), -1, dtype=np.int32)
     remap[compact_global] = np.arange(len(compact_global), dtype=np.int32)
+    catalog_indices = np.asarray(integer[compact_global], dtype=np.int32)
+    catalog_vectors = np.asarray(catalog_indices @ reciprocal, dtype=float)
+    share_catalog = (
+        mpi is not None
+        and mpi.size > 1
+        and catalog_indices.nbytes + catalog_vectors.nbytes >= (1 << 20)
+    )
+    if share_catalog:
+        catalog_indices = mpi.shared_readonly(catalog_indices)
+        catalog_vectors = mpi.shared_readonly(catalog_vectors)
     catalog = PlaneWaveCatalog(
-        np.asarray(integer[compact_global], dtype=np.int32),
+        catalog_indices,
         reciprocal.copy(),
+        catalog_vectors,
+        share_catalog,
     )
     return [
         PlaneWaveBasis(
@@ -1269,7 +1614,7 @@ def fft_shape(
         for value, factor in zip(maximum_indices, fft_factors):
             order = int(2 * value + 1)
             while True:
-                candidate = next_fast_len(order, real=True)
+                candidate = _next_fast_len_real(order)
                 if candidate % factor == 0:
                     shape.append(candidate)
                     break
@@ -1299,21 +1644,14 @@ def fft_shape(
     # of QE's 16).  Include the unoccupied cutoff boundary point.
     shape = []
     for value in span:
-        order = next_fast_len(int(2 * value + 2), real=True)
+        order = _next_fast_len_real(int(2 * value + 2))
         # QE's cutoff-based estimate gives an even dense-grid order for the
         # ordinary PW grids supported here.  Do not accept an intervening odd
         # fast length (e.g. scipy chooses 15 where QE chooses 16).
         if order % 2:
-            order = next_fast_len(order + 1, real=True)
+            order = _next_fast_len_real(order + 1)
         shape.append(order)
     return tuple(shape)
-
-
-def coefficients_to_grid(coefficients: np.ndarray, indices: np.ndarray, shape: tuple[int, ...], volume: float) -> np.ndarray:
-    data = np.zeros(shape, dtype=complex)
-    slots = tuple((indices[:, axis] % shape[axis]) for axis in range(3))
-    data[slots] = coefficients * np.prod(shape) / np.sqrt(volume)
-    return np.fft.ifftn(data)
 
 
 def potential_matrix(vg: np.ndarray, indices: np.ndarray) -> np.ndarray:

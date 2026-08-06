@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import itertools
+
 import numpy as np
-from scipy.optimize import brentq
-from scipy.special import erf, erfc
 
 from .errors import QEInputError, UnsupportedFeatureError
+from .special import erf, erfc
 
 
 _SMEARING_ORDERS = {
@@ -27,6 +28,13 @@ _SMEARING_ORDERS = {
     "fermidirac": -99,
 }
 
+_SMEARING_HELP = (
+    "'gaussian'/'gauss', "
+    "'methfessel-paxton'/'m-p'/'mp', "
+    "'marzari-vanderbilt'/'cold'/'m-v'/'mv', or "
+    "'fermi-dirac'/'f-d'/'fd'"
+)
+
 
 def smearing_order(name: object) -> int:
     """Translate QE's ``smearing`` names to its ``ngauss`` value."""
@@ -35,18 +43,269 @@ def smearing_order(name: object) -> int:
         return _SMEARING_ORDERS[normalized]
     except KeyError as exc:
         raise UnsupportedFeatureError(
-            f"smearing={name!r} is not ported; use 'gaussian', "
-            "'methfessel-paxton', 'marzari-vanderbilt'/'cold', or "
-            "'fermi-dirac'"
+            f"unknown smearing={name!r}; QE accepts {_SMEARING_HELP}"
         ) from exc
 
 
 def default_number_of_bands(nelec: float, occupations: object) -> int:
-    """Return QE's insulating or metallic default number of bands."""
-    filled = int(np.ceil(0.5 * nelec - 1.0e-12))
-    if str(occupations).strip().lower() != "smearing":
+    """Return QE's scalar ``setup.f90`` default number of bands.
+
+    QE uses Fortran ``NINT`` rather than a ceiling operation.  Electron
+    counts are nonnegative here, so ``floor(x + 1/2)`` reproduces its
+    round-to-nearest behavior, including half-integer ties away from zero.
+    """
+    filled = int(np.floor(0.5 * nelec + 0.5))
+    metallic_modes = {
+        "smearing", "tetrahedra", "tetrahedra_lin", "tetrahedra-lin",
+        "tetrahedra_opt", "tetrahedra-opt",
+    }
+    if str(occupations).strip().lower() not in metallic_modes:
         return filled
-    return max(filled + 4, int(np.ceil(1.2 * 0.5 * nelec)))
+    metallic = int(np.floor(1.2 * 0.5 * nelec + 0.5))
+    return max(filled + 4, metallic)
+
+
+_OPTIMIZED_TETRA_WEIGHTS = np.asarray(
+    [
+        [1440, 0, 30, 0, -38, 7, 17, -28, -56, 9, -46, 9, -38, -28, 17, 7, -18, -18, 12, -18],
+        [0, 1440, 0, 30, -28, -38, 7, 17, 9, -56, 9, -46, 7, -38, -28, 17, -18, -18, -18, 12],
+        [30, 0, 1440, 0, 17, -28, -38, 7, -46, 9, -56, 9, 17, 7, -38, -28, 12, -18, -18, -18],
+        [0, 30, 0, 1440, 7, 17, -28, -38, 9, -46, 9, -56, -28, 17, 7, -38, -18, 12, -18, -18],
+    ],
+    dtype=float,
+) / 1260.0
+
+
+def _tetrahedra(
+    grid: tuple[int, int, int],
+    full_to_irreducible: np.ndarray,
+    reciprocal: np.ndarray,
+    shortest_diagonal: bool,
+    optimized_weights: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build QE's periodic six-tetrahedra-per-grid-cell connectivity."""
+    nx, ny, nz = (int(value) for value in grid)
+    mapping = np.asarray(full_to_irreducible, dtype=np.int32)
+    if mapping.shape != (nx * ny * nz,):
+        raise QEInputError("tetrahedra require a complete automatic k-point grid")
+    if shortest_diagonal:
+        steps = np.asarray(reciprocal, dtype=float) / np.asarray(grid)[:, None]
+        diagonals = np.asarray(
+            [
+                -steps[0] + steps[1] + steps[2],
+                steps[0] - steps[1] + steps[2],
+                steps[0] + steps[1] - steps[2],
+                steps[0] + steps[1] + steps[2],
+            ]
+        )
+        shaft = int(np.argmin(np.einsum("ij,ij->i", diagonals, diagonals)))
+        origin = np.zeros(4, dtype=int)
+        directions = np.eye(4, dtype=int)
+        origin[shaft] = 1
+        directions[shaft, shaft] = -1
+        corner_sets = []
+        for permutation in itertools.permutations(range(3)):
+            corners = [origin[:3].copy()]
+            for axis in permutation:
+                corners.append(corners[-1] + directions[:3, axis])
+            corner_sets.append(np.asarray(corners))
+        stencils = []
+        for corners in corner_sets:
+            v1, v2, v3, v4 = corners
+            stencils.append(
+                np.asarray(
+                    [
+                        v1, v2, v3, v4,
+                        2*v1-v2, 2*v2-v3, 2*v3-v4, 2*v4-v1,
+                        2*v1-v3, 2*v2-v4, 2*v3-v1, 2*v4-v2,
+                        2*v1-v4, 2*v2-v1, 2*v3-v2, 2*v4-v3,
+                        v4-v1+v2, v1-v2+v3, v2-v3+v4, v3-v4+v1,
+                    ]
+                )
+            )
+        if optimized_weights:
+            stencil_weights = _OPTIMIZED_TETRA_WEIGHTS
+        else:
+            stencils = [stencil[:4] for stencil in stencils]
+            stencil_weights = np.eye(4)
+    else:
+        stencils = [
+            np.asarray(values, dtype=int)
+            for values in (
+                ((0,0,0),(1,0,0),(0,1,0),(1,0,1)),
+                ((1,0,0),(0,1,0),(1,1,0),(1,0,1)),
+                ((0,0,0),(0,1,0),(0,0,1),(1,0,1)),
+                ((0,1,0),(1,1,0),(1,0,1),(1,1,1)),
+                ((0,1,0),(1,0,1),(0,1,1),(1,1,1)),
+                ((0,1,0),(0,0,1),(1,0,1),(0,1,1)),
+            )
+        ]
+        stencil_weights = np.eye(4)
+    tetrahedra: list[np.ndarray] = []
+    modulo = np.asarray(grid, dtype=int)
+    for i in range(nx):
+        for j in range(ny):
+            for k in range(nz):
+                cell = np.asarray((i, j, k))
+                for stencil in stencils:
+                    points = (cell + stencil) % modulo
+                    flat = points[:, 2] + nz * (points[:, 1] + ny * points[:, 0])
+                    tetrahedra.append(mapping[flat])
+    return np.asarray(tetrahedra, dtype=np.int32), stencil_weights
+
+
+def _integrated_tetra_fraction(sorted_energies: np.ndarray, energy: float) -> np.ndarray:
+    e1, e2, e3, e4 = np.moveaxis(sorted_energies, -1, 0)
+    result = np.zeros_like(e1)
+    full = energy >= e4
+    result[full] = 1.0
+    low = (energy > e1) & (energy < e2)
+    result[low] = (energy - e1[low]) ** 3 / (
+        (e2[low] - e1[low]) * (e3[low] - e1[low]) * (e4[low] - e1[low])
+    )
+    high = (energy >= e3) & (energy < e4)
+    result[high] = 1.0 - (e4[high] - energy) ** 3 / (
+        (e4[high] - e1[high]) * (e4[high] - e2[high]) * (e4[high] - e3[high])
+    )
+    middle = (energy >= e2) & (energy < e3)
+    x = energy - e2[middle]
+    result[middle] = (
+        (e2[middle] - e1[middle]) ** 2
+        + 3.0 * (e2[middle] - e1[middle]) * x
+        + 3.0 * x**2
+        - (e3[middle] - e1[middle] + e4[middle] - e2[middle])
+        / ((e3[middle] - e2[middle]) * (e4[middle] - e2[middle])) * x**3
+    ) / ((e3[middle] - e1[middle]) * (e4[middle] - e1[middle]))
+    # Completely degenerate tetrahedra are step functions.
+    degenerate = np.ptp(sorted_energies, axis=-1) < 1.0e-14
+    result[degenerate] = energy >= e1[degenerate]
+    return result
+
+
+def _linear_tetra_moments(energies: np.ndarray, energy: float) -> tuple[np.ndarray, float]:
+    """Return normalized vertex moments and DOS for one sorted tetrahedron."""
+    e = np.asarray(energies, dtype=float)
+    if energy < e[0]:
+        return np.zeros(4), 0.0
+    if energy >= e[3]:
+        return np.full(4, 0.25), 0.0
+    if np.ptp(e) < 1.0e-14:
+        return (np.full(4, 0.25) if energy >= e[0] else np.zeros(4)), 0.0
+    a = np.zeros((4, 4))
+    for i in range(4):
+        for j in range(4):
+            if abs(e[i] - e[j]) > 1.0e-14:
+                a[i, j] = (energy - e[j]) / (e[i] - e[j])
+    if energy < e[1]:
+        c = 0.25 * a[1,0] * a[2,0] * a[3,0]
+        moments = c * np.asarray((1+a[0,1]+a[0,2]+a[0,3], a[1,0], a[2,0], a[3,0]))
+        dos = 3.0 * (energy-e[0])**2 / ((e[1]-e[0])*(e[2]-e[0])*(e[3]-e[0]))
+        return moments, dos
+    if energy < e[2]:
+        c1 = 0.25 * a[3,0] * a[2,0]
+        c2 = 0.25 * a[3,0] * a[2,1] * a[0,2]
+        c3 = 0.25 * a[3,1] * a[2,1] * a[0,3]
+        moments = np.asarray((
+            c1 + (c1+c2)*a[0,2] + (c1+c2+c3)*a[0,3],
+            c1+c2+c3 + (c2+c3)*a[1,2] + c3*a[1,3],
+            (c1+c2)*a[2,0] + (c2+c3)*a[2,1],
+            (c1+c2+c3)*a[3,0] + c3*a[3,1],
+        ))
+        x = energy-e[1]
+        dos = (3*(e[1]-e[0]) + 6*x - 3*(e[2]-e[0]+e[3]-e[1])*x*x/((e[2]-e[1])*(e[3]-e[1]))) / ((e[2]-e[0])*(e[3]-e[0]))
+        return moments, dos
+    c = a[0,3] * a[1,3] * a[2,3]
+    moments = 0.25 * np.asarray((
+        1-c*a[0,3], 1-c*a[1,3], 1-c*a[2,3],
+        1-c*(1+a[3,0]+a[3,1]+a[3,2]),
+    ))
+    dos = 3.0 * (e[3]-energy)**2 / ((e[3]-e[0])*(e[3]-e[1])*(e[3]-e[2]))
+    return moments, dos
+
+
+def tetrahedron_occupations(
+    eigenvalues: list[np.ndarray],
+    irreducible_weights: np.ndarray,
+    nelec: float,
+    grid: tuple[int, int, int],
+    full_to_irreducible: np.ndarray,
+    reciprocal: np.ndarray,
+    method: str,
+) -> tuple[float, list[np.ndarray]]:
+    """QE linear, Blöchl-corrected, or optimized tetrahedron occupations."""
+    normalized = str(method).strip().lower().replace("-", "_")
+    if normalized not in {"tetrahedra", "tetrahedra_lin", "tetrahedra_opt"}:
+        raise QEInputError(f"unknown tetrahedron occupation method {method!r}")
+    optimized_connectivity = normalized in {"tetrahedra_lin", "tetrahedra_opt"}
+    optimized = normalized == "tetrahedra_opt"
+    tetra, interpolation = _tetrahedra(
+        grid,
+        full_to_irreducible,
+        reciprocal,
+        optimized_connectivity,
+        optimized,
+    )
+    matrix = np.stack([np.asarray(values, dtype=float) for values in eigenvalues])
+    point_energies = matrix[tetra]
+    effective = np.einsum("cp,tpb->tbc", interpolation, point_energies)
+    sorted_effective = np.sort(effective, axis=-1)
+    capacity = 2.0 * matrix.shape[1]
+    if nelec <= 0.0 or nelec >= capacity - 1.0e-12:
+        raise QEInputError(
+            f"nbnd provides {capacity:.6g} tetrahedron states for {nelec:.6g} electrons; add unoccupied bands"
+        )
+    lower = float(np.min(effective))
+    upper = float(np.max(effective))
+    ntetra = len(tetra)
+    for _ in range(300):
+        fermi = 0.5 * (lower + upper)
+        count = 2.0 * float(np.sum(_integrated_tetra_fraction(sorted_effective, fermi))) / ntetra
+        if abs(count - nelec) < 1.0e-10:
+            break
+        if count < nelec:
+            lower = fermi
+        else:
+            upper = fermi
+    else:
+        raise QEInputError("tetrahedron Fermi-energy search did not converge")
+    integrated = np.zeros_like(matrix)
+    blochl = normalized == "tetrahedra"
+    for itetra in range(ntetra):
+        for band in range(matrix.shape[1]):
+            order = np.argsort(effective[itetra, band], kind="stable")
+            sorted_e = effective[itetra, band, order]
+            moments, dos = _linear_tetra_moments(sorted_e, fermi)
+            if blochl and dos:
+                original_e = effective[itetra, band]
+                correction = dos * (np.sum(sorted_e) - 4.0 * original_e) / 40.0
+                unsorted = np.empty(4)
+                unsorted[order] = moments
+                moments = unsorted + correction
+                for corner, point in enumerate(tetra[itetra, :4]):
+                    integrated[point, band] += moments[corner]
+                continue
+            unsorted = np.empty(4)
+            unsorted[order] = moments
+            weights_at_points = interpolation.T @ unsorted
+            if not optimized and interpolation.shape[1] == 4:
+                weights_at_points = unsorted
+            for point, value in zip(tetra[itetra], weights_at_points):
+                integrated[point, band] += value
+    integrated *= 2.0 / ntetra
+    point_weights = np.asarray(irreducible_weights, dtype=float)
+    if np.any(point_weights <= 0.0):
+        raise QEInputError("tetrahedron irreducible k-point weights must be positive")
+    occupations = integrated / point_weights[:, None]
+    # QE averages weights over exactly degenerate bands at each k point.
+    for ik, values in enumerate(matrix):
+        begin = 0
+        while begin < len(values):
+            end = begin + 1
+            while end < len(values) and abs(values[end] - values[begin]) < 1.0e-6:
+                end += 1
+            occupations[ik, begin:end] = np.mean(occupations[ik, begin:end])
+            begin = end
+    return float(fermi), [row.copy() for row in occupations]
 
 
 def wgauss(x: np.ndarray | float, order: int) -> np.ndarray:
@@ -145,6 +404,10 @@ def smeared_occupations(
         raise QEInputError("degauss must be positive for smeared occupations")
     if not eigenvalues or any(len(values) == 0 for values in eigenvalues):
         raise QEInputError("cannot determine occupations without bands")
+    # Importing scipy.optimize initializes a sizeable collection of extension
+    # modules and private runtime state. Fixed-occupation calculations never
+    # need it, so keep that per-MPI-rank baseline out of their working set.
+    from scipy.optimize import brentq
     normalized_weights = np.asarray(weights, dtype=float)
     if normalized_weights.shape != (len(eigenvalues),):
         raise QEInputError("k-point weights do not match eigenvalue arrays")

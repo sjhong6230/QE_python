@@ -1,24 +1,27 @@
-"""Serial scalar Kohn-Sham SCF driver corresponding to pw.x/electrons."""
+"""Spinless Kohn--Sham SCF orchestration corresponding to ``pw.x``.
+
+Numerical kernels remain in the focused ``basis``, ``diagonalization``,
+``ewald``, ``mixing``, ``occupations``, and ``xc`` modules.  This module owns
+the calculation phases, rank-local object lifetimes, and the small immutable
+records passed to the reporting layer.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from collections.abc import Sequence
-from importlib.util import find_spec
 import time
-from typing import Callable
+from typing import Callable, Literal
 
 import numpy as np
-from scipy.linalg import eigh
 from threadpoolctl import threadpool_limits
 
-from .acceleration import numba_kernels, resolve_numba
 from .basis import (
     FFTGridDescriptor,
     FFTScratchPool,
     LocalPotentialWorkspace,
     PlaneWaveBasis,
-    coefficients_to_grid,
+    _load_native_fft,
     fft_shape,
     make_bases,
     potential_matrix,
@@ -29,7 +32,10 @@ from .diagonalization import (
     PlaneWaveHamiltonian,
     ProjectorTerm,
     _lowest_generalized_eigh,
+    conjugate_gradient,
     davidson,
+    parallel_orbital,
+    rmm_diis,
 )
 from .errors import QEInputError, UnsupportedFeatureError
 from .ewald import ewald_energy, ewald_forces, ewald_stress
@@ -39,47 +45,98 @@ from .mixing import (
     LinearMixer,
     PlainBroydenMixer,
 )
-from .memory import available_memory_bytes, current_rss_bytes, peak_rss_bytes
+from .memory import (
+    available_memory_bytes,
+    current_pss_bytes,
+    current_rss_bytes,
+    current_uss_bytes,
+    peak_rss_bytes,
+    trim_allocator,
+)
 from .occupations import (
     default_number_of_bands,
     smeared_occupations,
     smearing_order,
+    tetrahedron_occupations,
 )
 from .timing import TimingEntry, TimingRegistry
 from .mpi import MPIContext
 from .upf import LocalPotential, read_upf
-from .xc import pbe_unpolarized_components, pz81_unpolarized
+from .xc import (
+    GGA_FUNCTIONALS,
+    canonical_xc_name,
+    pbe_unpolarized_components,
+    pw92_lda_unpolarized,
+    pz81_unpolarized,
+)
 from .symmetry import (
-    DensitySymmetrizer,
+    ReciprocalDensitySymmetrizer,
     fft_factors,
     symmetrize_forces,
     symmetrize_stress,
 )
+from .threads import hybrid_thread_count
+
+
+def _canonical_diagonalization(value: object) -> str:
+    requested = str(value).strip()
+    aliases = {
+        "david": "david",
+        "davidson": "david",
+        "cg": "cg",
+        "paro": "paro",
+        "rmm": "rmm-davidson",
+        "rmm-diis": "rmm-davidson",
+        "rmm-davidson": "rmm-davidson",
+        "rmm-paro": "rmm-paro",
+        "direct": "dense",
+        "dense": "dense",
+    }
+    canonical = aliases.get(requested.lower())
+    if canonical is not None:
+        return canonical
+    if requested.lower() == "ppcg":
+        raise UnsupportedFeatureError(
+            "PPCG diagonalization is no longer supported by QE"
+        )
+    raise QEInputError(
+        f"invalid diagonalization={requested!r}; use 'david', 'cg', "
+        "'paro', 'rmm-davidson', or 'rmm-paro'"
+    )
 
 
 @dataclass
 class SCFIteration:
+    """Stable reporting data captured after one electronic iteration."""
+
     number: int
     total_energy_ha: float
     estimated_accuracy_ha: float
     cutoff_ry: float = 0.0
     mixing_beta: float = 0.0
+    diagonalization: str = "david"
     davidson_threshold_ha: float = 0.0
     average_diagonalization_iterations: float = 0.0
     average_hamiltonian_applications: float = 0.0
     maximum_eigen_residual_ha: float = 0.0
     cpu_seconds: float = 0.0
     memory_rss_bytes_per_rank: int = 0
+    memory_pss_bytes_all_ranks: int = 0
     memory_available_bytes: int = 0
     memory_density_bytes_per_rank: int = 0
     memory_mixing_bytes_per_rank: int = 0
     memory_wavefunctions_bytes_per_rank: int = 0
     memory_davidson_bytes_per_rank: int = 0
     memory_fft_bytes_per_rank: int = 0
+    memory_fft_scratch_bytes_per_rank: int = 0
+    memory_fft_exchange_bytes_per_rank: int = 0
+    memory_fft_plan_count_per_rank: int = 0
 
 
 @dataclass(frozen=True)
 class SCFEnergyTerms:
+    """Converged total-energy decomposition in Hartree."""
+
     one_electron_ha: float
     hartree_ha: float
     xc_ha: float
@@ -90,6 +147,8 @@ class SCFEnergyTerms:
 
 @dataclass(frozen=True)
 class SCFSetup:
+    """Read-only setup summary emitted once before the SCF loop."""
+
     kpoints: int
     min_plane_waves: int
     max_plane_waves: int
@@ -107,17 +166,23 @@ class SCFSetup:
     target_charge: float = 0.0
     starting_potential: str = "atomic"
     starting_wavefunctions: str = "atomic+random"
-    fft_backend: str = "numpy"
-    fft_threads: int = 1
-    fft_planner: str = "measure"
-    numba_enabled: bool = False
+    starting_messages: tuple[str, ...] = ()
     mpi_processes: int = 1
+    threads_per_process: int = 1
     estimated_persistent_bytes_per_rank: int = 0
     estimated_peak_workspace_bytes_per_rank: int = 0
+    estimated_array_components_per_rank: tuple[tuple[str, int], ...] = ()
+    estimated_array_bytes_all_ranks: int = 0
+    estimated_peak_rss_bytes_per_rank: int = 0
+    runtime_baseline_rss_bytes_per_rank: int = 0
+    runtime_baseline_pss_bytes_all_ranks: int = 0
+    runtime_baseline_uss_bytes_all_ranks: int = 0
 
 
 @dataclass
 class SCFResult:
+    """Physical result and restart/reporting data returned by :func:`run_scf`."""
+
     converged: bool
     total_energy_ha: float
     eigenvalues_ha: list[np.ndarray]
@@ -128,6 +193,7 @@ class SCFResult:
     plane_waves_per_k: list[int] = field(default_factory=list)
     peak_rss_bytes_per_rank: int = 0
     peak_rss_bytes_all_ranks: int = 0
+    peak_sampled_pss_bytes_all_ranks: int = 0
     timings: dict[str, TimingEntry] = field(default_factory=dict)
     forces_ha_per_bohr: np.ndarray | None = None
     stress_ha_per_bohr3: np.ndarray | None = None
@@ -140,7 +206,9 @@ class SCFResult:
     wavefunctions_distributed: bool = False
 
 
-ProgressCallback = Callable[[str, SCFSetup | SCFIteration], None]
+ProgressKind = Literal["setup", "iteration"]
+ProgressPayload = SCFSetup | SCFIteration
+ProgressCallback = Callable[[ProgressKind, ProgressPayload], None]
 _PACKED_PROJECTOR_CHANNEL_LIMIT = 64
 
 
@@ -209,33 +277,35 @@ def _peak_memory_across_ranks(mpi: MPIContext) -> tuple[int, int]:
 
 
 class _LazyWorkspaceSequence(Sequence[LocalPotentialWorkspace]):
-    """Rebuild compact current-k maps around one shared FFT descriptor."""
+    """Provide compact current-k maps around one shared FFT descriptor."""
 
     def __init__(
         self,
         bases: Sequence[PlaneWaveBasis],
         shape: tuple[int, int, int],
         *,
-        backend: str,
-        threads: int,
-        planner_effort: str,
-        use_numba: bool,
         mpi: MPIContext,
         timers: TimingRegistry,
         scratch_pool: FFTScratchPool,
         descriptor: FFTGridDescriptor | None,
+        serial_fft_batch_size: int | None = None,
+        cache_workspaces: bool = False,
+        retain_serial_sticks: bool = True,
     ) -> None:
         self.bases = bases
         self.shape = shape
+        self._cache: list[LocalPotentialWorkspace | None] | None = (
+            [None] * len(bases)
+            if cache_workspaces
+            else None
+        )
         self.options = dict(
-            backend=backend,
-            threads=threads,
-            planner_effort=planner_effort,
-            use_numba=use_numba,
             mpi=mpi,
             timers=timers,
             scratch_pool=scratch_pool,
             descriptor=descriptor,
+            serial_fft_batch_size=serial_fft_batch_size,
+            retain_serial_sticks=retain_serial_sticks,
         )
 
     def __len__(self) -> int:
@@ -250,9 +320,22 @@ class _LazyWorkspaceSequence(Sequence[LocalPotentialWorkspace]):
             index += len(self)
         if not 0 <= index < len(self):
             raise IndexError(index)
-        return LocalPotentialWorkspace(
+        if self._cache is not None:
+            cached = self._cache[index]
+            if cached is not None:
+                return cached
+        workspace = LocalPotentialWorkspace(
             self.bases[index], self.shape, **self.options
         )
+        if self._cache is not None:
+            # Ownership was already distilled into the compact arrays used
+            # by the hot FFT path. The full per-G stick and boolean owner maps
+            # are setup intermediates; dropping them keeps the all-k cache
+            # compact without rebuilding any operational metadata.
+            workspace.stick_indices = np.empty(0, dtype=np.int32)
+            workspace.owned_plane_waves = np.empty(0, dtype=bool)
+            self._cache[index] = workspace
+        return workspace
 
 
 def _collect_wavefunctions_root(
@@ -376,17 +459,74 @@ class _QERandom:
         second = values[1::2].reshape(bands, plane_waves).T
         return first, second
 
+    def pairs_by_band_rows(
+        self,
+        plane_waves: int,
+        bands: int,
+        rows: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Draw the global QE stream while retaining selected PW rows only."""
+        selected = np.asarray(rows, dtype=np.int64).reshape(-1)
+        if (
+            np.any(selected < 0)
+            or np.any(selected >= plane_waves)
+            or len(np.unique(selected)) != len(selected)
+        ):
+            raise ValueError("selected random plane-wave rows are invalid")
+        positions = np.full(plane_waves, -1, dtype=np.int32)
+        positions[selected] = np.arange(len(selected), dtype=np.int32)
+        first = np.empty((len(selected), bands), dtype=float)
+        second = np.empty_like(first)
+        table = self._table
+        table_size = self._table_size
+        modulus = self._modulus
+        multiplier = self._multiplier
+        increment = self._increment
+        current = self._current
+        seed = self._seed
+        for band in range(bands):
+            for row in range(plane_waves):
+                table_index = (table_size * current) // modulus
+                current = int(table[table_index])
+                amplitude = current / modulus
+                seed = (multiplier * seed + increment) % modulus
+                table[table_index] = seed
+                table_index = (table_size * current) // modulus
+                current = int(table[table_index])
+                phase = current / modulus
+                seed = (multiplier * seed + increment) % modulus
+                table[table_index] = seed
+                destination = int(positions[row])
+                if destination >= 0:
+                    first[destination, band] = amplitude
+                    second[destination, band] = phase
+        self._current = current
+        self._seed = seed
+        return first, second
+
 
 def _randomize_atomic_trials(
     trials: np.ndarray,
     kinetic: np.ndarray,
     random_stream: _QERandom,
     strength: float = 0.05,
+    global_plane_waves: int | None = None,
+    rows: np.ndarray | None = None,
 ) -> np.ndarray:
     """Apply QE's coefficient-wise 5% perturbation to atomic trials."""
     del kinetic  # Retained in the private signature for compatibility.
-    amplitude, phase = random_stream.pairs_by_band(
-        trials.shape[0], trials.shape[1]
+    if rows is not None and global_plane_waves is None:
+        raise ValueError(
+            "global plane-wave count is required with local rows"
+        )
+    amplitude, phase = (
+        random_stream.pairs_by_band(trials.shape[0], trials.shape[1])
+        if rows is None
+        else random_stream.pairs_by_band_rows(
+            int(global_plane_waves),
+            trials.shape[1],
+            rows,
+        )
     )
     noise = amplitude * np.exp(2j * np.pi * phase)
     return trials * (1.0 + strength * noise)
@@ -450,12 +590,9 @@ def _nonlocal_projector_terms(
             beta, coupling = pseudo.projector_basis(
                 vectors, pw.volume
             )
-            phases = np.exp(
-                -1j
-                * (
-                    vectors
-                    @ np.asarray(positions, dtype=float).T
-                )
+            phases = _load_native_fft().phase_matrix(
+                np.asarray(vectors, dtype=np.float64),
+                np.ascontiguousarray(positions, dtype=np.float64),
             )
             terms.append(
                 FactorizedProjectorTerm(
@@ -583,16 +720,25 @@ def _atomic_starting_orbitals(
     basis: PlaneWaveBasis,
     number_of_bands: int,
     random_stream: _QERandom,
+    local_rows: np.ndarray | None = None,
+    mpi: MPIContext | None = None,
+    starting_wfc: str | None = None,
 ) -> np.ndarray:
     """Build QE ``atomic+random`` trial vectors for the first diagonalization."""
     starting_wfc = str(
-        pw.electrons.get("startingwfc", "atomic+random")
+        starting_wfc
+        if starting_wfc is not None
+        else pw.electrons.get("startingwfc", "atomic+random")
     ).lower()
     if starting_wfc not in {"atomic", "atomic+random", "random"}:
         raise UnsupportedFeatureError(
             f"startingwfc={starting_wfc!r} is not ported"
         )
-    basis_vectors = basis.vectors
+    basis_vectors = (
+        basis.vectors
+        if local_rows is None
+        else basis.vectors[np.asarray(local_rows, dtype=np.int32)]
+    )
     kinetic = 0.5 * np.einsum(
         "ij,ij->i", basis_vectors, basis_vectors
     )
@@ -616,10 +762,19 @@ def _atomic_starting_orbitals(
     trials = (
         np.column_stack(atomic)
         if atomic
-        else np.empty((len(basis), 0), dtype=complex)
+        else np.empty((len(basis_vectors), 0), dtype=complex)
     )
     if trials.shape[1]:
-        norms = np.linalg.norm(trials, axis=0)
+        if local_rows is None:
+            norms = np.linalg.norm(trials, axis=0)
+        else:
+            if mpi is None:
+                raise ValueError("MPI context is required for local trial rows")
+            norms = np.sqrt(
+                mpi.sum_array(
+                    np.sum(np.abs(trials) ** 2, axis=0)
+                )
+            )
         usable = norms > max(1.0e-14, 1.0e-12 * float(np.max(norms)))
         trials = trials[:, usable]
     if (
@@ -629,12 +784,22 @@ def _atomic_starting_orbitals(
         # QE's default ``atomic+random`` perturbs a complete atomic trial
         # space by five percent to avoid loss of symmetry-related states.
         trials = _randomize_atomic_trials(
-            trials, kinetic, random_stream
+            trials,
+            kinetic,
+            random_stream,
+            global_plane_waves=(
+                len(basis.vectors) if local_rows is not None else None
+            ),
+            rows=local_rows,
         )
-    else:
+    elif trials.shape[1] < number_of_bands:
         missing = number_of_bands - trials.shape[1]
-        amplitude, phase_fraction = random_stream.pairs_by_band(
-            len(basis), missing
+        amplitude, phase_fraction = (
+            random_stream.pairs_by_band(len(basis.vectors), missing)
+            if local_rows is None
+            else random_stream.pairs_by_band_rows(
+                len(basis.vectors), missing, local_rows
+            )
         )
         phase = np.exp(
             2j
@@ -646,6 +811,27 @@ def _atomic_starting_orbitals(
         )
         trials = np.column_stack((trials, random_trials))
     return trials
+
+
+def _starting_charge_scales(
+    pw: PWInput, pseudos: dict[str, LocalPotential]
+) -> dict[str, float]:
+    """Return QE atomic-rho scale factors from ``starting_charge(i)``."""
+    scales: dict[str, float] = {}
+    for index, species in enumerate(pw.species, start=1):
+        raw = pw.system.get(f"starting_charge({index})", 0.0)
+        charge = float(raw)
+        if not np.isfinite(charge):
+            raise QEInputError(
+                f"starting_charge({index}) must be finite"
+            )
+        valence = float(pseudos[species.label].z_valence)
+        scales[species.label] = (
+            max(0.0, valence - charge) / valence
+            if valence > 1.0e-8
+            else 1.0
+        )
+    return scales
 
 
 def _rotate_starting_subspace(
@@ -717,6 +903,7 @@ def _atomic_starting_density(
     nelec: float,
     g2_cutoff: float,
     geometry: ReciprocalGrid | None = None,
+    workspace: LocalPotentialWorkspace | None = None,
 ) -> tuple[np.ndarray, float]:
     """Return QE's superposition of UPF atomic valence charge densities."""
     geometry = (
@@ -727,8 +914,10 @@ def _atomic_starting_density(
     gvec = geometry.charge_vectors
     q = np.sqrt(geometry.charge_g2)
     coefficients = np.zeros(len(gvec), dtype=complex)
+    charge_scales = _starting_charge_scales(pw, pseudos)
     for species in pw.species:
         pseudo = pseudos[species.label]
+        scale = charge_scales[species.label]
         positions = [
             atom.position
             for atom in pw.atoms
@@ -743,22 +932,35 @@ def _atomic_starting_density(
                 )
                 for position in positions
             )
-            coefficients += radial * structure
+            coefficients += scale * radial * structure
         else:
             # A UPF without PP_RHOATOM contributes the correct average
             # charge but no invented atom-centered Fourier components.
             coefficients[geometry.charge_g2 < 1.0e-14] += (
-                len(positions) * pseudo.z_valence / pw.volume
+                len(positions)
+                * scale
+                * pseudo.z_valence
+                / pw.volume
             )
     starting_charge = float(
         np.real(np.sum(coefficients[geometry.charge_g2 < 1.0e-14]))
     ) * pw.volume
     if abs(starting_charge) < 1.0e-14:
-        raise QEInputError("atomic starting density has zero total charge")
-    coefficients *= nelec / starting_charge
-    density_g = np.zeros(shape, dtype=complex)
-    density_g[tuple(geometry.charge_slots.T)] = coefficients
-    density = np.real(np.fft.ifftn(density_g * np.prod(shape)))
+        coefficients.fill(0.0)
+        coefficients[geometry.charge_g2 < 1.0e-14] = nelec / pw.volume
+    else:
+        coefficients *= nelec / starting_charge
+    if workspace is not None:
+        transformed = workspace.coefficients_to_grid(
+            coefficients, use_scratch=True
+        )
+        density = np.ascontiguousarray(np.real(transformed))
+    else:
+        density_g = np.zeros(shape, dtype=complex)
+        density_g[tuple(geometry.charge_slots.T)] = coefficients
+        density = np.ascontiguousarray(
+            np.real(np.fft.ifftn(density_g * np.prod(shape)))
+        )
     return density, starting_charge
 
 
@@ -766,7 +968,6 @@ def _xc_terms(
     valence_density: np.ndarray,
     core_density: np.ndarray,
     volume: float,
-    use_numba: bool = False,
     mpi: MPIContext | None = None,
     functional: str = "pz",
     workspace: LocalPotentialWorkspace | None = None,
@@ -780,7 +981,6 @@ def _xc_terms(
         epsilon_xc, potential_xc = _xc_energy_potential(
             total_density,
             functional,
-            use_numba=use_numba,
             workspace=workspace,
             g_vectors=g_vectors,
         )
@@ -797,7 +997,6 @@ def _xc_terms(
     epsilon_xc, potential_local = _xc_energy_potential(
         total_local,
         functional,
-        use_numba=use_numba,
         workspace=workspace,
         g_vectors=g_vectors,
     )
@@ -816,30 +1015,32 @@ def _xc_energy_potential(
     density: np.ndarray,
     functional: str,
     *,
-    use_numba: bool = False,
     workspace: LocalPotentialWorkspace | None = None,
     g_vectors: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Evaluate the selected XC functional on a rank-local FFT slab."""
     if functional == "pz":
-        return pz81_unpolarized(density, use_numba=use_numba)
-    if functional != "pbe":
+        return pz81_unpolarized(density)
+    if functional == "pw":
+        return pw92_lda_unpolarized(density)
+    if functional not in GGA_FUNCTIONALS:
         raise ValueError(f"unknown XC functional {functional!r}")
     if workspace is None or g_vectors is None:
-        raise ValueError("PBE requires an FFT workspace and reciprocal vectors")
+        raise ValueError("GGA requires an FFT workspace and reciprocal vectors")
 
-    epsilon, potential, _gradient, _coefficient = _pbe_energy_potential_data(
-        density, workspace, g_vectors
+    epsilon, potential, _gradient, _coefficient = _gga_energy_potential_data(
+        density, workspace, g_vectors, functional
     )
     return epsilon, potential
 
 
-def _pbe_energy_potential_data(
+def _gga_energy_potential_data(
     density: np.ndarray,
     workspace: LocalPotentialWorkspace,
     g_vectors: np.ndarray,
+    functional: str,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Return PBE energy/potential plus fields needed by GGA stress."""
+    """Return GGA energy/potential plus fields needed by analytic stress."""
     coefficients = workspace.grid_to_coefficients(density)
     gradient = np.moveaxis(
         workspace.coefficients_to_grid(
@@ -861,7 +1062,9 @@ def _pbe_energy_potential_data(
         return np.sum(derivatives.real, axis=-1)
 
     epsilon, local_potential, gradient_coefficient = (
-        pbe_unpolarized_components(density, gradient)
+        pbe_unpolarized_components(
+            density, gradient, functional=functional
+        )
     )
     potential = local_potential - divergence(
         gradient_coefficient[None, ...] * gradient
@@ -928,13 +1131,13 @@ def _iteration_energy(
     core_density: np.ndarray,
     reciprocal: np.ndarray,
     volume: float,
-    use_numba: bool = False,
     mpi: MPIContext | None = None,
     functional: str = "pz",
     workspace: LocalPotentialWorkspace | None = None,
     g_vectors: np.ndarray | None = None,
     smearing_energy: float = 0.0,
     geometry: ReciprocalGrid | None = None,
+    real_workspace: np.ndarray | None = None,
 ) -> tuple[float, SCFEnergyTerms]:
     """QE ``delta_e`` plus ``delta_escf`` energy for one SCF iteration."""
     rho_energy_g = np.fft.fftn(rho_energy) / np.prod(rho_energy.shape)
@@ -952,27 +1155,51 @@ def _iteration_energy(
         rho_energy_g, reciprocal, mpi, geometry
     )
     eh = volume * eh_density
-    vxc_energy, exc, _ = _xc_terms(
-        rho_energy,
-        core_density,
-        volume,
-        use_numba,
-        mpi,
+    if real_workspace is None:
+        total_density = rho_energy + core_density
+    else:
+        if real_workspace.shape != rho_energy.shape:
+            raise ValueError("real-space energy workspace has the wrong shape")
+        np.add(rho_energy, core_density, out=real_workspace)
+        total_density = real_workspace
+    epsilon_energy, vxc_energy = _xc_energy_potential(
+        total_density,
         functional,
-        workspace,
-        g_vectors,
+        workspace=workspace,
+        g_vectors=g_vectors,
     )
+    if real_workspace is None:
+        xc_integral = float(np.sum(total_density * epsilon_energy))
+    else:
+        np.multiply(total_density, epsilon_energy, out=real_workspace)
+        xc_integral = float(np.sum(real_workspace))
+    exc = volume / grid_points * xc_integral
     vh_energy = np.real(
         np.fft.ifftn(vh_energy_g * np.prod(rho_energy.shape))
     )
-    descf = -volume / grid_points * mpi.sum_scalar(
-        float(
+    if real_workspace is None:
+        density_difference = rho_energy - rho_out
+        energy_potential = vh_energy + vxc_energy
+    else:
+        np.subtract(rho_energy, rho_out, out=input_hxc)
+        density_difference = input_hxc
+        np.add(vh_energy, vxc_energy, out=real_workspace)
+        energy_potential = real_workspace
+    if real_workspace is None:
+        descf_integral = float(
             np.sum(
-                (rho_energy[:, :, z_slab] - rho_out[:, :, z_slab])
-                * (vh_energy[:, :, z_slab] + vxc_energy[:, :, z_slab])
+                density_difference[:, :, z_slab]
+                * energy_potential[:, :, z_slab]
             )
         )
-    )
+    else:
+        np.multiply(
+            density_difference,
+            energy_potential,
+            out=input_hxc,
+        )
+        descf_integral = float(np.sum(input_hxc[:, :, z_slab]))
+    descf = -volume / grid_points * mpi.sum_scalar(descf_integral)
     terms = SCFEnergyTerms(
         one_electron_ha=band_energy + deband,
         hartree_ha=eh,
@@ -1000,11 +1227,17 @@ def _density_error_ry(
     g2_cutoff: float | None = None,
     mpi: MPIContext | None = None,
     geometry: ReciprocalGrid | None = None,
+    residual_workspace: np.ndarray | None = None,
 ) -> float:
     """QE ``rho_ddot`` norm of the scalar density residual, in Ry."""
-    residual_g = np.fft.fftn(density_out - density_in) / np.prod(
-        density_in.shape
-    )
+    if residual_workspace is None:
+        residual = density_out - density_in
+    else:
+        if residual_workspace.shape != density_in.shape:
+            raise ValueError("density-residual workspace has the wrong shape")
+        np.subtract(density_out, density_in, out=residual_workspace)
+        residual = residual_workspace
+    residual_g = np.fft.fftn(residual) / np.prod(density_in.shape)
     mpi = mpi if mpi is not None else MPIContext()
     shape = density_in.shape
     if mpi.size == 1:
@@ -1056,28 +1289,18 @@ def _density_error_ry(
 
 
 def _functional_family(name: str) -> str | None:
-    normalized = (
-        str(name)
-        .lower()
-        .replace("-", "")
-        .replace("_", "")
-        .replace(" ", "")
+    canonical = canonical_xc_name(name)
+    if canonical is not None:
+        return canonical
+    normalized = "".join(
+        character for character in str(name).lower() if character.isalnum()
     )
-    if any(
-        variant in normalized
-        for variant in ("pbesol", "revpbe", "rpbe")
-    ):
+    known_unsupported = (
+        "blyp", "pw91", "olyp", "wc", "sogga", "tpss", "scan",
+        "pbe0", "hse", "b3lyp", "vdw", "rvv10",
+    )
+    if any(value in normalized for value in known_unsupported):
         return "unsupported"
-    if (
-        normalized == "pbe"
-        or "perdewburkeernzerhof" in normalized
-        or ("pbx" in normalized and "pbc" in normalized)
-    ):
-        return "pbe"
-    if normalized in {"pz", "pz81", "lda"}:
-        return "pz"
-    if "pz" in normalized and "pbe" not in normalized:
-        return "pz"
     return None
 
 
@@ -1093,11 +1316,20 @@ def _resolve_xc_functional(
             )
         return selected
 
-    families = {
-        family
+    resolved_metadata = [
+        (pseudo.functional, _functional_family(pseudo.functional))
         for pseudo in pseudos.values()
-        if (family := _functional_family(pseudo.functional)) is not None
-    }
+    ]
+    unknown_metadata = sorted(
+        {name for name, family in resolved_metadata if family is None}
+    )
+    if unknown_metadata:
+        raise UnsupportedFeatureError(
+            "cannot determine a supported XC functional from "
+            f"pseudopotential metadata: {', '.join(unknown_metadata)}; "
+            "set input_dft explicitly"
+        )
+    families = {family for _name, family in resolved_metadata}
     if "unsupported" in families:
         names = ", ".join(
             sorted({pseudo.functional for pseudo in pseudos.values()})
@@ -1111,7 +1343,9 @@ def _resolve_xc_functional(
         )
     if families:
         return families.pop()
-    return "pz"
+    raise UnsupportedFeatureError(
+        "cannot determine XC functional without input_dft or pseudopotentials"
+    )
 
 
 def _density_from_states(
@@ -1122,7 +1356,6 @@ def _density_from_states(
     shape: tuple[int, int, int],
     volume: float,
     nelec: float,
-    use_numba: bool = False,
     mpi: MPIContext | None = None,
     workspaces: Sequence[LocalPotentialWorkspace] | None = None,
     timers: TimingRegistry | None = None,
@@ -1135,7 +1368,6 @@ def _density_from_states(
         z_slab.stop - z_slab.start,
     )
     rho_local = np.zeros(local_shape, dtype=float)
-    jit = numba_kernels() if use_numba else None
     for index, (coeff, basis, weight, band_occupations) in enumerate(
         zip(vectors, bases, weights, occupations)
     ):
@@ -1151,43 +1383,15 @@ def _density_from_states(
                 basis.indices, shape, mpi=mpi
             )
         transform_started = timers.start() if timers is not None else None
-        psi = workspace.coefficients_to_grid(
+        workspace.accumulate_density(
+            rho_local,
             coeff[:, :band_count],
-            use_scratch=True,
+            weight
+            * np.asarray(band_occupations[:band_count], dtype=float)
+            / volume,
         )
-        psi /= np.sqrt(volume)
         if timers is not None and transform_started is not None:
             timers.stop("sum_band:wfc", transform_started)
-        accumulate_started = timers.start() if timers is not None else None
-        if jit is None:
-            active_occupations = band_occupations[:band_count]
-            # ``psi`` is FFT scratch and is dead after this accumulation.
-            # Form |psi|^2 in place, avoiding a full-size complex conjugate
-            # temporary at every k point.
-            np.square(psi.real, out=psi.real)
-            np.square(psi.imag, out=psi.imag)
-            np.add(psi.real, psi.imag, out=psi.real)
-            if np.all(active_occupations == active_occupations[0]):
-                density_contribution = active_occupations[0] * np.sum(
-                    psi.real, axis=-1
-                )
-            else:
-                density_contribution = np.einsum(
-                    "...b,b->...",
-                    psi.real,
-                    active_occupations,
-                    optimize=False,
-                )
-            rho_local += weight * density_contribution
-        else:
-            jit.accumulate_density_weighted_bands(
-                rho_local.ravel(),
-                psi.reshape(-1, band_count),
-                np.asarray(band_occupations[:band_count]),
-                float(weight),
-            )
-        if timers is not None and accumulate_started is not None:
-            timers.stop("sum_band:rho", accumulate_started)
     local_sum = float(np.sum(rho_local))
     total_sum = mpi.sum_scalar(local_sum)
     rho_local *= nelec * np.prod(shape) / (total_sum * volume)
@@ -1270,10 +1474,16 @@ def _nonlocal_derivatives(
                 beta_gradient = None
             if beta.shape[1] == 0:
                 continue
+            # These arrays are local derivative workspaces.  Store their
+            # conjugated form in place once, instead of materializing a full
+            # beta/beta-gradient conjugate for every atom and contraction.
+            np.conjugate(beta, out=beta)
+            if beta_gradient is not None:
+                np.conjugate(beta_gradient, out=beta_gradient)
             for atom_index, atom in indexed_atoms:
                 phase = np.exp(-1j * (gk @ atom.position))
                 modulated = np.conjugate(phase)[:, None] * occupied_vectors
-                overlap = mpi.sum_array(beta.conj().T @ modulated)
+                overlap = mpi.sum_array(beta.T @ modulated)
                 coupled = coupling @ overlap
                 energy += float(weight) * float(
                     np.real(
@@ -1288,7 +1498,7 @@ def _nonlocal_derivatives(
                     derivative_overlap = mpi.sum_array(
                         np.einsum(
                             "gp,gab->pab",
-                            beta.conj(),
+                            beta,
                             1j * gk[:, :, None] * modulated[:, None, :],
                             optimize=True,
                         )
@@ -1307,7 +1517,7 @@ def _nonlocal_derivatives(
                     derivative_overlap = mpi.sum_array(
                         np.einsum(
                             "gpl,grb->plrb",
-                            beta_gradient.conj(),
+                            beta_gradient,
                             gk[:, :, None] * modulated[:, None, :],
                             optimize=True,
                         )
@@ -1386,11 +1596,11 @@ def _hellmann_feynman_stress(
     local_workspaces: Sequence[LocalPotentialWorkspace],
     ecutrho: float,
     xc_functional: str,
-    use_numba: bool,
     mpi: MPIContext,
     charges: np.ndarray,
     nonlocal_energy: float,
     nonlocal_tensor: np.ndarray,
+    real_workspace: np.ndarray | None = None,
 ) -> np.ndarray:
     """Return analytic compressive-positive HF stress in Ha/bohr^3."""
     volume = pw.volume
@@ -1452,43 +1662,53 @@ def _hellmann_feynman_stress(
             np.einsum("g,gi,gj->ij", radial_weight, g_vectors, g_vectors)
         )
     stress += local_tensor + local_energy / volume * np.eye(3)
+    del local_radial, potential, radial_derivative, phase, coefficient
 
     # Hartree term, obtained by differentiating 4*pi/G^2 and the two
     # Omega^-1 density coefficients.
     nonzero = g2 > 1.0e-14
+    np.abs(density_g, out=radial_weight)
+    np.square(radial_weight, out=radial_weight)
+    np.divide(radial_weight, g2, out=radial_weight, where=nonzero)
+    radial_weight[~nonzero] = 0.0
     hartree_energy = 2.0 * np.pi * volume * mpi.sum_scalar(
-        float(np.sum(np.abs(density_g[nonzero]) ** 2 / g2[nonzero]))
+        float(np.sum(radial_weight))
     )
-    hartree_tensor = np.zeros((3, 3))
-    if np.any(nonzero):
-        hartree_tensor = -4.0 * np.pi * mpi.sum_array(
-            np.einsum(
-                "g,gi,gj->ij",
-                np.abs(density_g[nonzero]) ** 2 / g2[nonzero] ** 2,
-                g_vectors[nonzero],
-                g_vectors[nonzero],
-            )
+    np.divide(radial_weight, g2, out=radial_weight, where=nonzero)
+    hartree_tensor = -4.0 * np.pi * mpi.sum_array(
+        np.einsum(
+            "g,gi,gj->ij",
+            radial_weight,
+            g_vectors,
+            g_vectors,
         )
+    )
     stress += hartree_tensor + hartree_energy / volume * np.eye(3)
+    del density_g, radial_weight
 
     # Exchange-correlation contribution. QE's diagonal term contains the
     # valence-density potential integral, while Exc and every GGA gradient
     # are evaluated at rho_valence + rho_core.
-    total_density = density + core_density
-    if xc_functional == "pbe":
+    if real_workspace is None:
+        total_density = density + core_density
+    else:
+        if real_workspace.shape != density.shape:
+            raise ValueError("stress real workspace has the wrong shape")
+        np.add(density, core_density, out=real_workspace)
+        total_density = real_workspace
+    if xc_functional in GGA_FUNCTIONALS:
         (
             epsilon_xc,
             potential_xc,
             density_gradient,
             gradient_coefficient,
-        ) = _pbe_energy_potential_data(
-            total_density, charge_workspace, g_vectors
+        ) = _gga_energy_potential_data(
+            total_density, charge_workspace, g_vectors, xc_functional
         )
     else:
         epsilon_xc, potential_xc = _xc_energy_potential(
             total_density,
             xc_functional,
-            use_numba=use_numba,
             workspace=charge_workspace,
             g_vectors=g_vectors,
         )
@@ -1511,6 +1731,7 @@ def _hellmann_feynman_stress(
                 optimize=True,
             )
         ) / np.prod(shape)
+    del epsilon_xc, total_density, density_gradient, gradient_coefficient
 
     # Nonlinear core correction. This is QE's stres_cc: the diagonal term
     # restores the frozen-core part omitted from vtxc, and the radial tensor
@@ -1554,6 +1775,9 @@ def _hellmann_feynman_stress(
                 )
             )
         stress += core_tensor + core_diagonal * np.eye(3)
+        del potential_xc_g, radial_weight
+
+    del potential_xc
 
     # Norm-conserving projector derivatives are evaluated jointly with
     # forces before entering this routine, once per species and k point.
@@ -1567,9 +1791,35 @@ def _hellmann_feynman_stress(
         np.array([atom.position for atom in pw.atoms]),
         charges,
         ecutrho,
+        reciprocal_vectors=charge_vectors,
+        mpi=mpi,
     )
     return symmetrize_stress(
         0.5 * (stress + stress.T), pw.lattice, pw.symmetry_operations
+    )
+
+
+def _serial_blas_thread_count(
+    pw: PWInput,
+    mpi: MPIContext,
+    requested_threads: int,
+) -> int:
+    """Use BLAS teams only when the short matrix dimension is substantial."""
+    if mpi.size > 1:
+        return 1
+    explicit_bands = int(pw.system.get("nbnd", 0))
+    # npwx and the number of irreducible k points are not BLAS work measures.
+    # The dominant products have nbnd/Davidson block width as their short
+    # dimension.  With four Si bands, symmetry reduction made the old policy
+    # enable BLAS workers and paid a team launch in tens of thousands of
+    # narrow GEMMs. QE's OpenMP CPU build likewise keeps its ordinary BLAS
+    # independent of the FFT/OpenMP team. The native FFT, projector, and PW-
+    # row kernels still use every requested rank-local thread.
+    minimum_threaded_bands = max(32, 8 * requested_threads)
+    return (
+        requested_threads
+        if explicit_bands >= minimum_threaded_bands
+        else 1
     )
 
 
@@ -1578,17 +1828,16 @@ def run_scf(
     progress: ProgressCallback | None = None,
     mpi: MPIContext | None = None,
 ) -> SCFResult:
-    """Run SCF with one numerical-library thread per rank by default."""
+    """Run SCF with environment-selected threads per MPI rank."""
     mpi = mpi if mpi is not None else MPIContext.world()
-    numerical_threads = int(
-        pw.electrons.get("py_blas_threads", 1)
-    )
-    if numerical_threads < 1:
-        raise QEInputError("py_blas_threads must be at least 1")
-    # With no user_api filter threadpoolctl also constrains OpenMP runtimes
-    # loaded by SciPy/Numba, preventing MPI ranks from silently inheriting
-    # the machine-wide OpenBLAS, MKL, or OpenMP thread count.
-    with threadpool_limits(limits=numerical_threads):
+    threads = hybrid_thread_count()
+    # MPI already distributes the plane-wave rows, so keep BLAS single
+    # threaded per rank and avoid nested teams. A single MPI rank has no such
+    # spatial decomposition. A single rank enables BLAS workers only for an
+    # explicitly large band dimension; symmetry and npwx do not make a narrow
+    # GEMM wide. Native FFT/projector/PW kernels retain requested threads.
+    blas_threads = _serial_blas_thread_count(pw, mpi, threads)
+    with threadpool_limits(limits=blas_threads):
         return _run_scf(pw, progress, mpi)
 
 
@@ -1598,6 +1847,11 @@ def _run_scf(
     mpi: MPIContext | None = None,
 ) -> SCFResult:
     mpi = mpi if mpi is not None else MPIContext()
+    threads_per_process = hybrid_thread_count()
+    baseline_rss_per_rank = int(mpi.max_scalar(current_rss_bytes()))
+    baseline_pss_all_ranks = int(mpi.sum_scalar(current_pss_bytes()))
+    baseline_uss_all_ranks = int(mpi.sum_scalar(current_uss_bytes()))
+    peak_sampled_pss_all_ranks = baseline_pss_all_ranks
     start = time.perf_counter()
     cpu_start = time.process_time()
     timers = TimingRegistry()
@@ -1624,18 +1878,21 @@ def _run_scf(
         pw.electrons.get("startingwfc", "atomic+random")
     ).strip().lower()
     if starting_potential not in {"atomic", "file"}:
-        raise UnsupportedFeatureError(
-            f"startingpot={starting_potential!r} is not ported; use 'atomic' or 'file'"
+        raise QEInputError(
+            f"invalid startingpot={starting_potential!r}; "
+            "use 'atomic' or 'file'"
         )
     if starting_wavefunctions not in {
         "atomic", "atomic+random", "random", "file"
     }:
-        raise UnsupportedFeatureError(
-            f"startingwfc={starting_wavefunctions!r} is not ported"
+        raise QEInputError(
+            f"invalid startingwfc={starting_wavefunctions!r}; use "
+            "'atomic', 'atomic+random', 'random', or 'file'"
         )
     if restart_mode == "restart":
         starting_potential = "file"
         starting_wavefunctions = "file"
+    starting_messages: list[str] = []
     save_wavefunctions = (
         str(pw.control.get("disk_io", "low")).strip().lower() != "none"
     )
@@ -1644,11 +1901,15 @@ def _run_scf(
     )
     occupations_mode = str(
         pw.system.get("occupations", "fixed")
-    ).strip().lower()
-    if occupations_mode not in {"fixed", "smearing"}:
+    ).strip().lower().replace("-", "_")
+    tetrahedron_modes = {
+        "tetrahedra", "tetrahedra_lin", "tetrahedra_opt"
+    }
+    if occupations_mode not in {"fixed", "smearing", *tetrahedron_modes}:
         raise UnsupportedFeatureError(
             f"occupations={occupations_mode!r} is not ported; use "
-            "'fixed' or 'smearing'"
+            "'fixed', 'smearing', 'tetrahedra', 'tetrahedra_lin', "
+            "or 'tetrahedra_opt'"
         )
     pseudo_by_label = {}
     for species in pw.species:
@@ -1685,11 +1946,21 @@ def _run_scf(
     else:
         degauss_ry = 0.0
         gaussian_order = 0
+    if occupations_mode in tetrahedron_modes:
+        if pw.kpoint_mode != "automatic" or pw.kpoint_grid is None:
+            raise QEInputError(
+                "tetrahedron occupations require K_POINTS automatic"
+            )
+        if len(pw.full_to_irreducible) != int(np.prod(pw.kpoint_grid)):
+            raise QEInputError(
+                "tetrahedron occupations require a complete automatic k-point grid"
+            )
     pw.system["_number_of_bands"] = nbnd
     bases = make_bases(
         pw.reciprocal,
         np.array([point.crystal for point in pw.kpoints]),
         ecut,
+        mpi=mpi,
     )
     sizes = [len(basis) for basis in bases]
     if min(sizes) < nbnd:
@@ -1697,58 +1968,73 @@ def _run_scf(
             f"nbnd={nbnd} exceeds the smallest plane-wave basis "
             f"dimension ({min(sizes)})"
         )
-    diagonalization = str(
+    diagonalization = _canonical_diagonalization(
         pw.electrons.get("diagonalization", "david")
-    ).lower()
-    if diagonalization == "davidson":
-        diagonalization = "david"
-    if diagonalization not in {"david", "dense"}:
-        raise UnsupportedFeatureError(
-            f"diagonalization={diagonalization!r} is not ported; use "
-            "'david' or the Python-only diagnostic mode 'dense'"
+    )
+    if "diago_david_ndiim" in pw.electrons:
+        raise QEInputError(
+            "unknown ELECTRONS variable diago_david_ndiim; "
+            "use QE's diago_david_ndim spelling"
         )
     davidson_ndim = int(pw.electrons.get("diago_david_ndim", 2))
-    if diagonalization == "david" and davidson_ndim < 2:
+    if davidson_ndim < 2:
         raise QEInputError("diago_david_ndim must be at least 2")
-    if "py_cache_projectors" in pw.electrons:
-        raise QEInputError(
-            "py_cache_projectors has been removed; nonlocal projectors "
-            "are now built for the current k point like QE"
-        )
+    cg_maxiter = int(pw.electrons.get("diago_cg_maxiter", 20))
+    if cg_maxiter < 1:
+        raise QEInputError("diago_cg_maxiter must be at least 1")
+    rmm_ndim = int(pw.electrons.get("diago_rmm_ndim", 4))
+    if rmm_ndim < 2:
+        raise QEInputError("diago_rmm_ndim must be at least 2")
+    rmm_converge = bool(pw.electrons.get("diago_rmm_conv", False))
+    gs_nblock = int(pw.electrons.get("diago_gs_nblock", 16))
+    if gs_nblock < 1:
+        raise QEInputError("diago_gs_nblock must be at least 1")
+    full_accuracy = bool(pw.electrons.get("diago_full_acc", False))
     shape = fft_shape(
         bases,
         pw.reciprocal,
         ecutrho,
-        fft_factors(pw.symmetry_operations),
+        fft_factors(
+            pw.symmetry_operations,
+            use_all_frac=bool(pw.system.get("use_all_frac", False)),
+        ),
     )
     if mpi.size > shape[2]:
         raise QEInputError(
             f"{mpi.size} MPI ranks exceed the third FFT dimension "
             f"({shape[2]}); use at most {shape[2]} ranks"
         )
-    if starting_wavefunctions == "file" and diagonalization == "dense":
-        raise UnsupportedFeatureError(
-            "startingwfc='file' requires the Davidson diagonalization path"
-        )
+    if restart_mode != "restart" and (
+        starting_potential == "file" or starting_wavefunctions == "file"
+    ):
+        from .save import resolve_save_directory
+
+        save_directory = resolve_save_directory(pw)
+        density_path = save_directory / "charge-density.hdf5"
+        if starting_potential == "file" and not density_path.is_file():
+            starting_messages.append(
+                f"Cannot read rho: {density_path} not found; "
+                "using atomic starting potential"
+            )
+            starting_potential = "atomic"
+        if starting_wavefunctions == "file":
+            missing_wavefunctions = [
+                save_directory / f"wfc{index}.hdf5"
+                for index in range(1, len(pw.kpoints) + 1)
+                if not (save_directory / f"wfc{index}.hdf5").is_file()
+            ]
+            if missing_wavefunctions:
+                starting_messages.append(
+                    "Cannot read wfcs: file not found; recomputing them "
+                    "from atomic+random wavefunctions"
+                )
+                starting_wavefunctions = "atomic+random"
     if starting_potential == "file" or starting_wavefunctions == "file":
         # Local import avoids coupling the persistence writer to SCF module
         # initialization while still sharing the exact QE save schema.
         from .save import validate_restart_metadata
 
         validate_restart_metadata(pw, shape, nbnd)
-    requested_fft_backend = pw.electrons.get("py_fft_backend")
-    fft_backend = str(
-        requested_fft_backend
-        if requested_fft_backend is not None
-        else ("pyfftw" if find_spec("pyfftw") is not None else "scipy")
-    ).lower()
-    fft_threads = int(pw.electrons.get("py_fft_threads", 1))
-    fft_planner = str(
-        pw.electrons.get("py_fft_planner", "measure")
-    ).lower()
-    numba_enabled = resolve_numba(
-        pw.electrons.get("py_numba", False)
-    )
     fft_scratch_pool = FFTScratchPool()
     if mpi.size > 1:
         catalog = bases[0].catalog
@@ -1760,49 +2046,69 @@ def _run_scf(
             )
         )
         wave_fft_descriptor = FFTGridDescriptor.build(
-            wave_indices, shape, mpi.size
+            wave_indices, shape, mpi.size, local_rank=mpi.rank
         )
     else:
         wave_fft_descriptor = None
     local_workspaces = _LazyWorkspaceSequence(
         bases,
         shape,
-        backend=fft_backend,
-        threads=fft_threads,
-        planner_effort=fft_planner,
-        use_numba=numba_enabled,
         mpi=mpi,
         timers=timers,
         scratch_pool=fft_scratch_pool,
         descriptor=wave_fft_descriptor,
+        # Bound serial FFT storage by the rank-local thread team. This keeps
+        # memory O(threads), not O(bands), while independent band transforms
+        # occupy the cores. MPI retains its block transform.
+        serial_fft_batch_size=(
+            threads_per_process if mpi.size == 1 else None
+        ),
+        # Every k point is revisited by c_bands and sum_band throughout SCF.
+        # Cache only compact slot/owner maps; FFT payloads and plans remain in
+        # the one shared scratch pool, so this does not create per-k grids.
+        cache_workspaces=True,
+        # Serial kernels address one flat FFT grid directly. QE-style stick
+        # lists are distributed-FFT metadata and are never read in this path.
+        retain_serial_sticks=mpi.size > 1,
     )
-    symmetry_plan_started = timers.start()
-    density_symmetrizer = DensitySymmetrizer(
-        shape, pw.symmetry_operations, mpi
-    )
-    timers.stop("sym_rho:init", symmetry_plan_started)
     reciprocal_grid = ReciprocalGrid.build(
         shape, pw.reciprocal, ecutrho
     )
     charge_slots = reciprocal_grid.charge_slots
     charge_indices = reciprocal_grid.charge_indices
     charge_fft_descriptor = (
-        FFTGridDescriptor.build(charge_indices, shape, mpi.size)
+        FFTGridDescriptor.build(
+            charge_indices, shape, mpi.size, local_rank=mpi.rank
+        )
         if mpi.size > 1
         else None
     )
     charge_workspace = LocalPotentialWorkspace(
         charge_indices,
         shape,
-        backend=fft_backend,
-        threads=fft_threads,
-        planner_effort=fft_planner,
-        use_numba=numba_enabled,
         mpi=mpi,
         timers=timers,
         scratch_pool=fft_scratch_pool,
         descriptor=charge_fft_descriptor,
+        # Serial charge transforms use compact flat FFT slots.  The retained
+        # QE stick catalog is needed only by the distributed transpose.
+        retain_serial_sticks=mpi.size > 1,
     )
+    symmetry_plan_started = timers.start()
+    density_symmetrizer = ReciprocalDensitySymmetrizer(
+        shape,
+        pw.symmetry_operations,
+        charge_indices,
+        reciprocal_grid.charge_g2,
+        charge_workspace,
+        mpi,
+    )
+    timers.stop("sym_rho:init", symmetry_plan_started)
+    # Star construction needs a dense lookup table and other one-shot index
+    # vectors.  Return those freed pages before the first sampled PSS value;
+    # otherwise glibc retention makes setup memory look proportional to the
+    # persistent SCF arrays even though these buffers are no longer live.
+    trim_allocator()
     local_charge_rows = charge_workspace.local_plane_wave_indices
     local_charge_vectors = reciprocal_grid.charge_vectors[local_charge_rows]
     local_charge_g2 = reciprocal_grid.charge_g2[local_charge_rows]
@@ -1813,24 +2119,32 @@ def _run_scf(
     wavefunction_sticks = (
         len(wave_fft_descriptor.sticks)
         if wave_fft_descriptor is not None
-        else max(len(workspace.sticks) for workspace in local_workspaces)
+        else max(
+            len(np.unique(basis.indices[:, :2], axis=0))
+            for basis in bases
+        )
     )
     atomic_orbitals = sum(
         pseudo_by_label[atom.label].number_of_atomic_orbitals
         for atom in pw.atoms
     )
+    starting_charge_scales = _starting_charge_scales(
+        pw, pseudo_by_label
+    )
     starting_charge = 0.0
     for atom in pw.atoms:
         pseudo = pseudo_by_label[atom.label]
+        scale = starting_charge_scales[atom.label]
         if pseudo.has_atomic_density:
             starting_charge += float(
-                pseudo.atomic_density_fourier(
+                scale
+                * pseudo.atomic_density_fourier(
                     np.array([0.0]), pw.volume
                 )[0]
                 * pw.volume
             )
         else:
-            starting_charge += pseudo.z_valence
+            starting_charge += scale * pseudo.z_valence
     grid_points = int(np.prod(shape))
     mixing_ndim_estimate = int(
         pw.electrons.get("mixing_ndim", 8)
@@ -1843,29 +2157,64 @@ def _run_scf(
     local_plane_waves = max(local_plane_wave_counts)
     # This is an array working-set estimate, not an RSS prediction. It covers
     # persistent SCF grids/history, basis metadata, wavefunctions, and the
-    # largest Davidson/FFT block. Python, BLAS, FFT, MPI, and JIT runtimes are
+    # largest Davidson/FFT block. Python, BLAS, FFT, and MPI runtimes are
     # measured separately by the peak-RSS report.
     mixing_bytes = (
         2
         * (mixing_ndim_estimate + 1)
-        * int(np.ceil(charge_gvectors / mpi.size))
+        * len(local_charge_rows)
         * 16
-        if str(pw.electrons.get("mixing_mode", "plain")).lower()
-        in {"plain", "default"}
+        if str(pw.electrons.get("mixing_mode", "plain"))
+        .strip()
+        .lower()
+        .replace("_", "-")
+        in {"plain", "default", "tf", "local-tf"}
         else 0
     )
-    replicated_grid_bytes = (
-        10 * grid_points * 16
-        if mpi.size == 1
-        else 10 * int(np.ceil(grid_points / mpi.size)) * 16
+    local_z_slab = mpi.slab(shape[2])
+    local_real_points = (
+        shape[0]
+        * shape[1]
+        * (local_z_slab.stop - local_z_slab.start)
+    )
+    # Count the actual grid representations rather than treating ten grids
+    # as complex128.  At the SCF high-water point there are at most nine
+    # rank-local float64 density/potential grids (rho, core, ionic, Hartree,
+    # XC, input-HXC, effective, output, and mixed/energy density).  The
+    # ReciprocalGrid geometry initially contains one float64 g2 grid, two
+    # int32 triplet tables, one float64 G-vector triplet table, and one
+    # float64 |G|^2 vector. The targeted MPI symmetry path releases those
+    # replicated setup tables below; all other paths retain them. The final
+    # term counts rank-local charge-vector and |G|^2 caches.
+    density_potential_grid_bytes = 9 * local_real_points * 8
+    release_replicated_reciprocal_grid = (
+        mpi.size > 1
+        and pw.full_kpoint_count > len(pw.kpoints)
+    )
+    reciprocal_grid_bytes = (
+        len(local_charge_rows) * (3 * 8 + 8)
+        + (
+            0
+            if release_replicated_reciprocal_grid
+            else grid_points * 8
+            + charge_gvectors * (3 * 4 + 3 * 4 + 3 * 8 + 8)
+        )
     )
     # Per-k bases retain only int32 mappings into one shared global G catalog.
     # MPI FFT stick ownership/transposes live in one grid descriptor; compact
     # current-k maps are rebuilt lazily instead of being retained for all k.
     catalog_size = len(bases[0].catalog.indices) if bases[0].catalog else 0
     basis_metadata_bytes = (
-        4 * sum(sizes)
-        + 36 * catalog_size
+        sum(
+            basis.global_indices.nbytes
+            for basis in bases
+            if basis.global_indices is not None
+        )
+        + (
+            (36 * catalog_size + mpi.shared_size - 1) // mpi.shared_size
+            if bases[0].catalog is not None and bases[0].catalog.shared
+            else 36 * catalog_size
+        )
         + (wave_fft_descriptor.nbytes if wave_fft_descriptor is not None else 0)
         + (
             charge_fft_descriptor.nbytes
@@ -1873,13 +2222,33 @@ def _run_scf(
             else 0
         )
     )
+    if local_workspaces._cache is not None:
+        # Every serial k point, and every distributed irreducible k point, is
+        # revisited in each SCF iteration. Retain only compact operational
+        # maps; grids and FFT plans still live in the shared scratch pool.
+        if mpi.size == 1:
+            basis_metadata_bytes += sum(
+                workspace.linear_slots.nbytes
+                + workspace.sticks.nbytes
+                + sum(values.nbytes for values in workspace.sticks_by_rank)
+                + workspace.local_plane_wave_indices.nbytes
+                for workspace in local_workspaces
+            )
+        else:
+            basis_metadata_bytes += sum(
+                workspace.stick_indices.nbytes
+                + workspace.owned_plane_waves.nbytes
+                + workspace.local_plane_wave_indices.nbytes
+                + workspace.local_slots[2].nbytes
+                + workspace.local_stick_positions.nbytes
+                for workspace in local_workspaces
+            )
     starting_and_saved_wfc_bytes = (
         (
-            sum(sizes) * nbnd
-            + max(sizes) * maximum_block
+            sum(local_plane_wave_counts) * nbnd
+            + local_plane_waves * maximum_block
         )
         * 16
-        // mpi.size
     )
     projector_species_layout = [
         (
@@ -1911,13 +2280,27 @@ def _run_scf(
     )
     estimated_persistent = (
         mixing_bytes
-        + replicated_grid_bytes
+        + density_potential_grid_bytes
+        + reciprocal_grid_bytes
         + basis_metadata_bytes
         + starting_and_saved_wfc_bytes
         + density_symmetrizer.mapping_bytes
     )
+    persistent_components = [
+        ("density/potential grids", density_potential_grid_bytes),
+        ("mixing history", mixing_bytes),
+        ("wavefunctions", starting_and_saved_wfc_bytes),
+        (
+            "basis/reciprocal metadata",
+            reciprocal_grid_bytes + basis_metadata_bytes,
+        ),
+        ("symmetry metadata", density_symmetrizer.mapping_bytes),
+    ]
     if diagonalization == "dense":
         estimated_workspace = 2 * max(sizes) ** 2 * 16
+        workspace_components = [
+            ("dense eigensolver workspace", estimated_workspace)
+        ]
     else:
         davidson_rows = (
             max(sizes) if mpi.size == 1 else local_plane_waves
@@ -1928,35 +2311,93 @@ def _run_scf(
             * min(max(sizes), davidson_ndim * nbnd)
             * 16
         )
-        local_real_points = int(np.ceil(grid_points / mpi.size))
         local_stick_points = shape[2] * (
             len(wave_fft_descriptor.sticks_by_rank[mpi.rank])
             if wave_fft_descriptor is not None
             else wavefunction_sticks
         )
-        if mpi.size == 1 and fft_backend == "pyfftw":
-            # QE-style in-place G->R->G transform: one full FFT grid plus
-            # the compact reciprocal-space result block.
+        if mpi.size == 1:
+            # One full grid per concurrently transformed band, bounded by the
+            # rank-local thread count, plus compact reciprocal results.
+            serial_fft_batch = min(threads_per_process, maximum_block)
+            serial_grid_stride = local_real_points
+            if threads_per_process > 1 and serial_fft_batch > 1:
+                # Native band-parallel FFTs pad only the distance between
+                # grids, by at most three complex values, so every FFTW
+                # new-array pointer preserves 64-byte SIMD alignment.
+                serial_grid_stride = (local_real_points + 3) // 4 * 4
             fft_bytes = (
-                (local_real_points + local_plane_waves)
-                * maximum_block
+                (serial_grid_stride + local_plane_waves)
+                * serial_fft_batch
                 * 16
             )
-        else:
+        elif mpi.size > 1:
+            assert wave_fft_descriptor is not None
+            assert charge_fft_descriptor is not None
+            charge_local_stick_points = shape[2] * len(
+                charge_fft_descriptor.sticks_by_rank[mpi.rank]
+            )
+            wave_slab_points = local_real_points // shape[0] // shape[1]
+            wave_slab_points *= wavefunction_sticks
+            charge_slab_points = (
+                local_real_points // shape[0] // shape[1]
+            ) * charge_sticks
+            # One scratch allocation is shared by wave and charge Z sticks.
+            # MPI owns grow-only send/receive buffers sized by the largest of
+            # either transpose direction.  Count these actual maxima instead
+            # of assuming perfectly balanced wave sticks, which understated
+            # the runtime pool for the denser charge descriptor.
+            stick_scratch = max(
+                charge_local_stick_points,
+                local_stick_points * maximum_block,
+            )
+            transpose_buffer = max(
+                charge_local_stick_points,
+                charge_slab_points,
+                local_stick_points * maximum_block,
+                wave_slab_points * maximum_block,
+            )
+            real_batch = 1
             fft_bytes = (
-                2
-                * (local_real_points + local_stick_points)
-                * maximum_block
+                stick_scratch
+                + local_real_points * real_batch
+                + 2 * transpose_buffer
+            ) * 16
+        else:
+            fft_batch_size = 1
+            # The inverse and forward Z-stick phases are sequential and use
+            # one shared grow-only buffer.  The two MPI transpose buffers
+            # add two more stick payloads; only one real-slab batch exists.
+            fft_bytes = (
+                (local_real_points + 3 * local_stick_points)
+                * fft_batch_size
                 * 16
             )
         estimated_workspace = (
             davidson_bytes + fft_bytes + projector_workspace_bytes
         )
+        workspace_components = [
+            ("Davidson workspace", davidson_bytes),
+            ("FFT/MPI workspace", fft_bytes),
+            ("nonlocal-projector workspace", projector_workspace_bytes),
+        ]
     if save_wavefunctions and mpi.size > 1:
-        estimated_workspace = max(
-            estimated_workspace,
-            max(sizes) * nbnd * np.dtype(np.complex128).itemsize,
+        save_workspace = (
+            max(sizes) * nbnd * np.dtype(np.complex128).itemsize
         )
+        if save_workspace > estimated_workspace:
+            estimated_workspace = save_workspace
+            workspace_components = [
+                ("wavefunction-save workspace", save_workspace)
+            ]
+    array_components = tuple(
+        (label, int(size))
+        for label, size in persistent_components + workspace_components
+        if size
+    )
+    estimated_array_all_ranks = int(
+        mpi.sum_scalar(estimated_persistent + estimated_workspace)
+    )
     setup = SCFSetup(
         kpoints=len(bases),
         min_plane_waves=min(sizes),
@@ -1981,33 +2422,31 @@ def _run_scf(
         target_charge=nelec,
         starting_potential=starting_potential,
         starting_wavefunctions=starting_wavefunctions,
-        fft_backend=fft_backend,
-        fft_threads=fft_threads,
-        fft_planner=fft_planner,
-        numba_enabled=numba_enabled,
+        starting_messages=tuple(starting_messages),
         mpi_processes=mpi.size,
+        threads_per_process=threads_per_process,
         estimated_persistent_bytes_per_rank=estimated_persistent,
         estimated_peak_workspace_bytes_per_rank=estimated_workspace,
+        estimated_array_components_per_rank=array_components,
+        estimated_array_bytes_all_ranks=estimated_array_all_ranks,
+        runtime_baseline_rss_bytes_per_rank=baseline_rss_per_rank,
+        runtime_baseline_pss_bytes_all_ranks=baseline_pss_all_ranks,
+        runtime_baseline_uss_bytes_all_ranks=baseline_uss_all_ranks,
     )
-    if progress is not None:
-        progress("setup", setup)
+    if release_replicated_reciprocal_grid:
+        # From here onward MPI branches use only local_charge_vectors/g2 and
+        # charge_workspace's compact descriptor.  The complete geometry is
+        # referenced exclusively by serial branches, so release its replicated
+        # grids after the QE-style symmetry plan has distilled its stars.
+        del reciprocal_grid, charge_slots, charge_indices
+        trim_allocator()
     if diagonalization == "dense":
-        max_dense_pw = int(pw.system.get("py_max_dense_pw", 2500))
+        max_dense_pw = 2500
         if setup.max_plane_waves > max_dense_pw:
             raise UnsupportedFeatureError(
                 f"dense reference diagonalization needs up to "
                 f"{setup.max_plane_waves} plane waves, exceeding "
-                f"py_max_dense_pw={max_dense_pw}"
-            )
-        max_dense_kpoints = int(
-            pw.system.get("py_max_dense_kpoints", 64)
-        )
-        if setup.kpoints > max_dense_kpoints:
-            raise UnsupportedFeatureError(
-                f"dense reference solver received {setup.kpoints} active k "
-                f"points, exceeding py_max_dense_kpoints="
-                f"{max_dense_kpoints}; use Davidson or set the limit "
-                f"explicitly to acknowledge the computational cost"
+                f"the built-in limit of {max_dense_pw}"
             )
     hinit_started = timers.start()
     local_q = np.sqrt(local_charge_g2)
@@ -2027,8 +2466,12 @@ def _run_scf(
             for position in positions_species
         )
         v_ion_coefficients += radial * structure
-    v_ion_local = np.real(
-        charge_workspace.coefficients_to_grid(v_ion_coefficients)
+    v_ion_local = np.ascontiguousarray(
+        np.real(
+            charge_workspace.coefficients_to_grid(
+                v_ion_coefficients, use_scratch=True
+            )
+        )
     )
     v_ion_average = mpi.sum_scalar(
         float(np.real(np.sum(v_ion_coefficients[local_charge_g2 < 1e-14])))
@@ -2052,8 +2495,12 @@ def _run_scf(
             for position in positions_species
         )
         core_coefficients += radial * structure
-    rho_core = np.real(
-        charge_workspace.coefficients_to_grid(core_coefficients)
+    rho_core = np.ascontiguousarray(
+        np.real(
+            charge_workspace.coefficients_to_grid(
+                core_coefficients, use_scratch=True
+            )
+        )
     )
     if diagonalization == "dense":
         init_us_started = timers.start()
@@ -2071,6 +2518,7 @@ def _run_scf(
         nonlocal_matrices = []
     timers.stop("hinit0", hinit_started)
     potinit_started = timers.start()
+    starting_coefficients: np.ndarray | None = None
     if starting_potential == "file":
         from .save import read_saved_density
 
@@ -2095,6 +2543,7 @@ def _run_scf(
             nelec,
             ecutrho,
             reciprocal_grid,
+            charge_workspace,
         )
     else:
         starting_coefficients = np.zeros(
@@ -2102,6 +2551,7 @@ def _run_scf(
         )
         for species in pw.species:
             pseudo = pseudo_by_label[species.label]
+            scale = starting_charge_scales[species.label]
             positions_species = [
                 atom.position
                 for atom in pw.atoms
@@ -2117,11 +2567,12 @@ def _run_scf(
                     )
                     for position in positions_species
                 )
-                starting_coefficients += radial * structure
+                starting_coefficients += scale * radial * structure
             else:
                 zero = local_charge_g2 < 1.0e-14
                 starting_coefficients[zero] += (
                     len(positions_species)
+                    * scale
                     * pseudo.z_valence
                     / pw.volume
                 )
@@ -2136,13 +2587,23 @@ def _run_scf(
                 )
             )
         )
-        starting_coefficients *= nelec / _starting_charge
-        rho = np.real(
-            charge_workspace.coefficients_to_grid(
-                starting_coefficients
+        if abs(_starting_charge) < 1.0e-14:
+            starting_coefficients.fill(0.0)
+            starting_coefficients[local_charge_g2 < 1.0e-14] = (
+                nelec / pw.volume
+            )
+        else:
+            starting_coefficients *= nelec / _starting_charge
+        rho = np.ascontiguousarray(
+            np.real(
+                charge_workspace.coefficients_to_grid(
+                    starting_coefficients, use_scratch=True
+                )
             )
         )
     timers.stop("potinit", potinit_started)
+    del local_q, v_ion_coefficients, core_coefficients, starting_coefficients
+    trim_allocator()
     weights = np.array([point.weight for point in pw.kpoints])
     charges = np.array([z_by_label[atom.label] for atom in pw.atoms])
     positions = np.array([atom.position for atom in pw.atoms])
@@ -2150,34 +2611,39 @@ def _run_scf(
     conv_thr_ry = float(pw.electrons.get("conv_thr", 1.0e-6))
     maxiter = int(pw.electrons.get("electron_maxstep", 100))
     mixing = float(pw.electrons.get("mixing_beta", 0.7))
-    mixing_mode = str(pw.electrons.get("mixing_mode", "plain")).lower()
+    mixing_mode = (
+        str(pw.electrons.get("mixing_mode", "plain"))
+        .strip()
+        .lower()
+        .replace("_", "-")
+    )
     mixing_ndim = int(pw.electrons.get("mixing_ndim", 8))
-    if mixing_mode in {"plain", "default"}:
-        density_mixer = (
-            DistributedBroydenMixer(
-                charge_workspace,
-                local_charge_g2,
-                beta=mixing,
-                ndim=mixing_ndim,
-                g2_cutoff=ecutrho,
-            )
-            if mpi.size > 1
-            else PlainBroydenMixer(
-                shape,
-                pw.reciprocal,
-                beta=mixing,
-                ndim=mixing_ndim,
-                g2_cutoff=ecutrho,
-                use_numba=numba_enabled,
-                mpi=mpi,
-            )
+    if not np.isfinite(mixing) or not 0.0 < mixing <= 1.0:
+        raise QEInputError(
+            "mixing_beta must satisfy 0 < mixing_beta <= 1"
+        )
+    if not 1 <= mixing_ndim <= 25:
+        raise QEInputError("mixing_ndim must be between 1 and 25")
+    if mixing_mode in {"plain", "default", "tf", "local-tf"}:
+        # The compact rho(G) implementation is valid for one rank as well as
+        # MPI.  Using it in serial removes PlainBroydenMixer's second full FFT
+        # geometry and its NumPy/pocketfft full-grid temporaries.
+        density_mixer = DistributedBroydenMixer(
+            charge_workspace,
+            local_charge_g2,
+            beta=mixing,
+            ndim=mixing_ndim,
+            g2_cutoff=ecutrho,
+            mode=mixing_mode,
+            nelec=nelec,
+            volume=pw.volume,
         )
     elif mixing_mode == "linear":
         density_mixer = LinearMixer(beta=mixing)
     else:
         raise UnsupportedFeatureError(
-            f"mixing_mode={mixing_mode!r} is not ported; use 'plain' "
-            "(Broyden) or the Python-only diagnostic mode 'linear'"
+            f"mixing_mode={mixing_mode!r} is not supported; use 'plain', "
+            "'TF', 'local-TF', or the Python-only diagnostic mode 'linear'"
         )
     iterations: list[SCFIteration] = []
     old_energy = None
@@ -2203,41 +2669,59 @@ def _run_scf(
                     if mpi.size > 1 else None
                 ),
             )
+    starting_fft_scratch_pool: FFTScratchPool | None = None
+    starting_local_workspaces: _LazyWorkspaceSequence | None = None
+    if (
+        mpi.size == 1
+        and diagonalization != "dense"
+        and not loaded_wavefunctions
+    ):
+        # Atomic-orbital initialization is a one-shot phase.  Keep its FFTW
+        # plan and full-grid buffer out of the long-lived SCF pool, then drop
+        # both after all starting subspaces have been rotated.
+        starting_fft_scratch_pool = FFTScratchPool()
+        starting_local_workspaces = _LazyWorkspaceSequence(
+            bases,
+            shape,
+            mpi=mpi,
+            timers=timers,
+            scratch_pool=starting_fft_scratch_pool,
+            descriptor=None,
+            serial_fft_batch_size=threads_per_process,
+            retain_serial_sticks=False,
+        )
     qe_random = _QERandom()
     requested_diago_thr = pw.electrons.get("diago_thr_init")
     diago_thr_ry = (
         float(requested_diago_thr)
         if requested_diago_thr is not None
-        else 1.0e-2
+        else (1.0e-5 if starting_potential == "file" else 1.0e-2)
     )
-    if diago_thr_ry < 0.0:
+    if not np.isfinite(diago_thr_ry) or diago_thr_ry < 0.0:
         raise QEInputError("diago_thr_init must be nonnegative")
     davidson_tolerance = (
         0.5 * diago_thr_ry if diago_thr_ry > 0.0 else 5.0e-3
     )
     previous_accuracy = np.inf
-    davidson_maxiter = int(
-        pw.electrons.get("py_davidson_maxiter", 20)
-    )
-    residual_factor_value = pw.electrons.get(
-        "py_davidson_residual_factor"
-    )
-    davidson_residual_factor = (
-        None
-        if residual_factor_value is None
-        else float(residual_factor_value)
-    )
-    residual_energy_scale_value = pw.electrons.get(
-        "py_davidson_residual_energy_scale"
-    )
-    if residual_energy_scale_value is None:
-        davidson_residual_energy_scale = None
-    else:
-        residual_energy_scale = float(residual_energy_scale_value)
-        davidson_residual_energy_scale = (
-            None if residual_energy_scale == 0.0 else residual_energy_scale
-        )
     energy_terms: SCFEnergyTerms | None = None
+    estimated_peak_rss = int(
+        mpi.max_scalar(
+            max(
+                peak_rss_bytes(),
+                current_rss_bytes() + estimated_workspace,
+            )
+        )
+    )
+    setup_pss_all_ranks = int(mpi.sum_scalar(current_pss_bytes()))
+    peak_sampled_pss_all_ranks = max(
+        peak_sampled_pss_all_ranks, setup_pss_all_ranks
+    )
+    setup = replace(
+        setup,
+        estimated_peak_rss_bytes_per_rank=estimated_peak_rss,
+    )
+    if progress is not None:
+        progress("setup", setup)
     timers.stop("init_run", init_started)
     electrons_started = timers.start()
     iteration = 1
@@ -2245,40 +2729,54 @@ def _run_scf(
     while iteration <= maxiter:
         potential_started = timers.start()
         hartree_started = timers.start()
-        if mpi.size == 1:
-            rho_g = np.fft.fftn(rho) / np.prod(shape)
-            vh_g, _ = _hartree(
-                rho_g, pw.reciprocal, mpi, reciprocal_grid
+        rho_g_local = charge_workspace.grid_to_coefficients(rho)
+        vh_g_local = np.zeros_like(rho_g_local)
+        hartree_mask = local_charge_g2 > 1.0e-14
+        vh_g_local[hartree_mask] = (
+            4.0
+            * np.pi
+            * rho_g_local[hartree_mask]
+            / local_charge_g2[hartree_mask]
+        )
+        vh = np.ascontiguousarray(
+            np.real(
+                charge_workspace.coefficients_to_grid(
+                    vh_g_local, use_scratch=True
+                )
             )
-            vh = np.real(np.fft.ifftn(vh_g * np.prod(shape)))
-        else:
-            rho_g_local = charge_workspace.grid_to_coefficients(rho)
-            vh_g_local = np.zeros_like(rho_g_local)
-            hartree_mask = local_charge_g2 > 1.0e-14
-            vh_g_local[hartree_mask] = (
-                4.0
-                * np.pi
-                * rho_g_local[hartree_mask]
-                / local_charge_g2[hartree_mask]
-            )
-            vh = np.real(
-                charge_workspace.coefficients_to_grid(vh_g_local)
-            )
+        )
+        del rho_g_local, vh_g_local, hartree_mask
         timers.stop("v_h", hartree_started)
+        # Allocate the effective-potential owner before XC and use it first as
+        # the total-density workspace. This removes ``rho + rho_core`` as a
+        # separate full-grid temporary on every SCF iteration.
+        if (
+            (mpi.size > 1 or threads_per_process > 1)
+            and diagonalization != "dense"
+        ):
+            local_z_count = rho.shape[2]
+            v_eff_local = np.empty(
+                (local_z_count, shape[0], shape[1]), dtype=np.float64
+            )
+            v_eff_grid = np.moveaxis(v_eff_local, 0, 2)
+        else:
+            v_eff_local = np.empty_like(v_ion_local)
+            v_eff_grid = v_eff_local
+        np.add(rho, rho_core, out=v_eff_grid)
         xc_started = timers.start()
-        _, vxc = _xc_energy_potential(
-            rho + rho_core,
+        epsilon_input, vxc = _xc_energy_potential(
+            v_eff_grid,
             xc_functional,
-            use_numba=numba_enabled,
             workspace=charge_workspace,
             g_vectors=local_charge_vectors,
         )
         timers.stop("v_xc", xc_started)
         input_hxc = vh + vxc
+        del vh, vxc, epsilon_input
         # QE constructs vrs once per SCF iteration and shares it across the
         # entire k loop.  Keep the same real-space array in serial as well as
         # MPI instead of inverse-transforming identical v_eff(G) for every k.
-        v_eff_local = v_ion_local + input_hxc
+        np.add(v_ion_local, input_hxc, out=v_eff_grid)
         potential_average = mpi.sum_scalar(
             float(np.sum(v_eff_local))
         ) / np.prod(shape)
@@ -2291,6 +2789,7 @@ def _run_scf(
         diagonalization_iterations: list[int] = []
         hamiltonian_applications: list[int] = []
         eigen_residuals: list[float] = []
+        active_diagonalization = diagonalization
         if iteration > 1 and np.isfinite(previous_accuracy):
             # QE resets ethr to 1e-2 Ry at the second SCF iteration before
             # applying the dr2/nelec tightening rule. This matters when the
@@ -2308,6 +2807,10 @@ def _run_scf(
             )
         memory_rss_report = int(
             mpi.max_scalar(current_rss_bytes())
+        )
+        memory_pss_all_ranks = int(mpi.sum_scalar(current_pss_bytes()))
+        peak_sampled_pss_all_ranks = max(
+            peak_sampled_pss_all_ranks, memory_pss_all_ranks
         )
         memory_available_report = available_memory_bytes()
         history_count_report = (
@@ -2333,6 +2836,11 @@ def _run_scf(
                     basis.kinetic
                 )
                 hamiltonian += nonlocal_matrices[kpoint_index]
+                # Dense diagonalization is a diagnostic/reference path.  Keep
+                # SciPy's sizeable extension baseline out of the default
+                # Davidson process until this path is explicitly requested.
+                from scipy.linalg import eigh
+
                 values, vectors = eigh(
                     hamiltonian,
                     subset_by_index=(0, nbnd - 1),
@@ -2363,6 +2871,10 @@ def _run_scf(
                     local_workspace=local_workspace,
                     timers=timers,
                     real_potential=v_eff_local,
+                    native_potential_layout=(
+                        (mpi.size > 1 or threads_per_process > 1)
+                        and diagonalization != "dense"
+                    ),
                     # QE's usnldiag uses v_of_0: the G=0 component of the
                     # ionic local potential, not the average total effective
                     # potential used by H|psi>.
@@ -2378,55 +2890,139 @@ def _run_scf(
                         basis,
                         nbnd,
                         random_stream=qe_random,
+                        # Retain only rank-local coefficients, but advance the
+                        # same global QE randy() stream on every rank.  Thus the
+                        # distributed starting subspace is the exact row slice
+                        # of the serial one, without allocating its global
+                        # wavefunction matrix on every rank.
+                        local_rows=(
+                            operator.local_rows
+                            if mpi.size > 1
+                            and pw.full_kpoint_count > len(pw.kpoints)
+                            else None
+                        ),
+                        mpi=(
+                            mpi
+                            if mpi.size > 1
+                            and pw.full_kpoint_count > len(pw.kpoints)
+                            else None
+                        ),
+                        starting_wfc=starting_wavefunctions,
                     )
-                    if mpi.size > 1:
+                    if mpi.size > 1 and starting.shape[0] == len(basis):
                         starting = starting[
                             operator.local_rows
                         ]
+                    rotation_operator = operator
+                    if starting_local_workspaces is not None:
+                        rotation_operator = PlaneWaveHamiltonian(
+                            basis,
+                            v_eff_g,
+                            projector_terms,
+                            local_workspace=(
+                                starting_local_workspaces[kpoint_index]
+                            ),
+                            timers=timers,
+                            real_potential=v_eff_local,
+                            native_potential_layout=True,
+                            potential_average=v_ion_average,
+                        )
                     (
                         trial_vectors,
                         trial_eigenvalues,
                     ) = _rotate_starting_subspace(
-                        operator, starting, nbnd, mpi
+                        rotation_operator, starting, nbnd, mpi
                     )
                     timers.stop("wfcinit", wfcinit_started)
-                    del starting
-                davidson_started = timers.start()
-                solution = davidson(
-                    operator.apply,
-                    operator.diagonal,
-                    nbnd,
-                    initial_vectors=trial_vectors,
-                    tolerance=davidson_tolerance,
-                    max_iterations=davidson_maxiter,
-                    subspace_multiplier=davidson_ndim,
-                    residual_factor=davidson_residual_factor,
-                    residual_energy_scale=davidson_residual_energy_scale,
-                    # QE initializes every btype as occupied. Empty-band
-                    # tolerances apply only after occupations are known from
-                    # the first diagonalization.
-                    occupied_roots=(
-                        occupied
-                        if occupations_mode == "fixed" and iteration > 1
-                        else nbnd
-                    ),
-                    # Atomic trials have just been Rayleigh-Ritz rotated.
-                    # File orbitals may accompany a different starting
-                    # potential and must therefore be projected again.
-                    initial_is_ritz=(
-                        iteration == 1 and not loaded_wavefunctions
-                    ),
-                    # rotate_wfc, restart data, and the preceding SCF solve
-                    # all supply orthonormal vectors even when a fresh
-                    # reduced diagonalization is required.
-                    initial_is_orthonormal=True,
-                    initial_eigenvalues=trial_eigenvalues,
-                    mpi=mpi,
-                    global_dimension=len(basis),
-                    global_row_indices=operator.local_rows,
-                    timers=timers,
+                    del starting, rotation_operator
+                active_diagonalization = diagonalization
+                if diagonalization == "rmm-davidson":
+                    active_diagonalization = (
+                        "david"
+                        if iteration < 3 or iteration % 5 == 0
+                        else "rmm"
+                    )
+                elif diagonalization == "rmm-paro":
+                    active_diagonalization = (
+                        "paro" if iteration % 5 == 1 else "rmm"
+                    )
+                diagonalization_started = timers.start()
+                occupied_roots = (
+                    occupied
+                    if occupations_mode == "fixed" and iteration > 1
+                    else nbnd
                 )
-                timers.stop("cegterg", davidson_started)
+                if active_diagonalization == "david":
+                    solution = davidson(
+                        operator.apply,
+                        operator.diagonal,
+                        nbnd,
+                        initial_vectors=trial_vectors,
+                        tolerance=davidson_tolerance,
+                        max_iterations=20,
+                        subspace_multiplier=davidson_ndim,
+                        residual_factor=None,
+                        residual_energy_scale=None,
+                        occupied_roots=(
+                            nbnd if full_accuracy else occupied_roots
+                        ),
+                        initial_is_ritz=(
+                            iteration == 1 and not loaded_wavefunctions
+                        ),
+                        initial_is_orthonormal=True,
+                        initial_eigenvalues=trial_eigenvalues,
+                        mpi=mpi,
+                        global_dimension=len(basis),
+                        global_row_indices=operator.local_rows,
+                        timers=timers,
+                    )
+                    timer_name = "cegterg"
+                elif active_diagonalization == "cg":
+                    solution = conjugate_gradient(
+                        operator.apply,
+                        operator.diagonal,
+                        nbnd,
+                        initial_vectors=trial_vectors,
+                        tolerance=davidson_tolerance,
+                        max_iterations=cg_maxiter,
+                        occupied_roots=occupied_roots,
+                        full_accuracy=full_accuracy,
+                        initial_is_orthonormal=True,
+                        mpi=mpi,
+                    )
+                    timer_name = "ccgdiagg"
+                elif active_diagonalization == "paro":
+                    solution = parallel_orbital(
+                        operator.apply,
+                        operator.diagonal,
+                        nbnd,
+                        initial_vectors=trial_vectors,
+                        tolerance=davidson_tolerance,
+                        max_iterations=20,
+                        occupied_roots=occupied_roots,
+                        full_accuracy=full_accuracy,
+                        initial_is_orthonormal=True,
+                        mpi=mpi,
+                    )
+                    timer_name = "paro"
+                else:
+                    solution = rmm_diis(
+                        operator.apply,
+                        operator.diagonal,
+                        nbnd,
+                        initial_vectors=trial_vectors,
+                        tolerance=davidson_tolerance,
+                        max_iterations=20,
+                        history_dimension=rmm_ndim,
+                        converge=rmm_converge,
+                        gram_schmidt_block=gs_nblock,
+                        occupied_roots=occupied_roots,
+                        full_accuracy=full_accuracy,
+                        initial_is_orthonormal=True,
+                        mpi=mpi,
+                    )
+                    timer_name = "rmm-diis"
+                timers.stop(timer_name, diagonalization_started)
                 davidson_iterations = solution.iterations
                 # cegterg returns its best Ritz vectors after 20 iterations.
                 # c_bands accepts that result unless more than five bands are
@@ -2437,7 +3033,8 @@ def _run_scf(
                     and solution.number_unconverged > 5
                 ):
                     raise QEInputError(
-                        f"Davidson diagonalization did not converge at k point "
+                        f"{active_diagonalization} diagonalization did not "
+                        f"converge at k point "
                         f"{kpoint_index + 1} after {davidson_iterations} "
                         f"iterations (largest residual "
                         f"{np.max(solution.residual_norms):.3e} Ha)"
@@ -2464,7 +3061,19 @@ def _run_scf(
                     trial_vectors,
                     trial_eigenvalues,
                 )
+        if starting_local_workspaces is not None:
+            # The last temporary Hamiltonian/workspace was deleted above;
+            # releasing these owners now also releases the atomic FFT plan
+            # and its aligned full-grid allocation before density mixing.
+            starting_local_workspaces = None
+            starting_fft_scratch_pool = None
+            trim_allocator()
         timers.stop("c_bands", bands_started)
+        # All current-k Davidson bases, Hpsi images, and projector operands
+        # have gone out of scope. Trim once per complete k loop—not per k
+        # point—so freed solver heaps do not inflate the next iteration's PSS
+        # sample while avoiding thousands of allocator calls.
+        trim_allocator()
         if occupations_mode == "smearing":
             fermi_energy, band_occupations, smearing_energy = (
                 smeared_occupations(
@@ -2475,6 +3084,17 @@ def _run_scf(
                     gaussian_order,
                 )
             )
+        elif occupations_mode in tetrahedron_modes:
+            fermi_energy, band_occupations = tetrahedron_occupations(
+                eigenvalues,
+                weights,
+                nelec,
+                pw.kpoint_grid,
+                pw.full_to_irreducible,
+                pw.reciprocal,
+                occupations_mode,
+            )
+            smearing_energy = 0.0
         else:
             band_occupations = []
             for values in eigenvalues:
@@ -2492,7 +3112,6 @@ def _run_scf(
             shape,
             pw.volume,
             nelec,
-            numba_enabled,
             mpi,
             local_workspaces,
             timers,
@@ -2514,6 +3133,7 @@ def _run_scf(
                 weights, eigenvalues, band_occupations
             )
         )
+        real_grid_workspace = v_eff_grid
         if mpi.size == 1:
             accuracy = 0.5 * _density_error_ry(
                 rho,
@@ -2523,10 +3143,12 @@ def _run_scf(
                 ecutrho,
                 mpi,
                 reciprocal_grid,
+                residual_workspace=real_grid_workspace,
             )
         else:
+            np.subtract(rho_out, rho, out=real_grid_workspace)
             residual_g_local = charge_workspace.grid_to_coefficients(
-                rho_out - rho
+                real_grid_workspace
             )
             error_mask = local_charge_g2 > 1.0e-14
             accuracy = 0.5 * pw.volume * mpi.sum_scalar(
@@ -2555,6 +3177,10 @@ def _run_scf(
                 0.1 * accuracy / max(1.0, nelec),
             )
             first_scf_diagonalization = False
+            del rho_out, real_grid_workspace, v_eff_grid, v_eff_local
+            if mpi.size > 1:
+                del residual_g_local, error_mask
+            trim_allocator()
             continue
         first_scf_diagonalization = False
         # QE mix_rho decides convergence directly from dr2, including on the
@@ -2584,13 +3210,13 @@ def _run_scf(
                 rho_core,
                 pw.reciprocal,
                 pw.volume,
-                numba_enabled,
                 mpi,
                 xc_functional,
                 charge_workspace,
                 local_charge_vectors,
                 smearing_energy,
                 reciprocal_grid,
+                real_workspace=real_grid_workspace,
             )
         else:
             grid_scale = pw.volume / np.prod(shape)
@@ -2619,32 +3245,33 @@ def _run_scf(
                     )
                 )
             )
+            np.add(rho_energy, rho_core, out=real_grid_workspace)
             epsilon_energy, vxc_energy = _xc_energy_potential(
-                rho_energy + rho_core,
+                real_grid_workspace,
                 xc_functional,
-                use_numba=numba_enabled,
                 workspace=charge_workspace,
                 g_vectors=local_charge_vectors,
             )
+            np.multiply(
+                real_grid_workspace,
+                epsilon_energy,
+                out=real_grid_workspace,
+            )
             exc = grid_scale * mpi.sum_scalar(
-                float(
-                    np.sum(
-                        (rho_energy + rho_core) * epsilon_energy
+                float(np.sum(real_grid_workspace))
+            )
+            vh_energy = np.ascontiguousarray(
+                np.real(
+                    charge_workspace.coefficients_to_grid(
+                        vh_energy_g_local, use_scratch=True
                     )
                 )
             )
-            vh_energy = np.real(
-                charge_workspace.coefficients_to_grid(
-                    vh_energy_g_local
-                )
-            )
+            np.subtract(rho_energy, rho_out, out=input_hxc)
+            np.add(vh_energy, vxc_energy, out=real_grid_workspace)
+            np.multiply(input_hxc, real_grid_workspace, out=input_hxc)
             descf = -grid_scale * mpi.sum_scalar(
-                float(
-                    np.sum(
-                        (rho_energy - rho_out)
-                        * (vh_energy + vxc_energy)
-                    )
-                )
+                float(np.sum(input_hxc))
             )
             energy_terms = SCFEnergyTerms(
                 one_electron_ha=band_energy + deband,
@@ -2672,7 +3299,7 @@ def _run_scf(
         iteration_mixing_bytes = (
             2
             * (history_count_report + 1)
-            * int(np.ceil(charge_gvectors / mpi.size))
+            * len(local_charge_rows)
             * 16
             if isinstance(
                 density_mixer,
@@ -2690,33 +3317,18 @@ def _run_scf(
             * min(max(sizes), davidson_ndim * nbnd)
             * 16
         )
-        if mpi.size == 1 and fft_backend == "pyfftw":
-            iteration_fft_bytes = (
-                (grid_points + max(sizes))
-                * maximum_block
-                * 16
-            )
-        else:
-            iteration_fft_bytes = (
-                2
-                * (
-                    int(np.ceil(grid_points / mpi.size))
-                    + shape[2]
-                    * (
-                        len(wave_fft_descriptor.sticks_by_rank[mpi.rank])
-                        if wave_fft_descriptor is not None
-                        else wavefunction_sticks
-                    )
-                )
-                * maximum_block
-                * 16
-            )
+        iteration_fft_scratch_bytes = fft_scratch_pool.nbytes
+        iteration_fft_exchange_bytes = mpi.exchange_buffer_bytes
+        iteration_fft_bytes = (
+            iteration_fft_scratch_bytes + iteration_fft_exchange_bytes
+        )
         step = SCFIteration(
             iteration,
             energy,
             accuracy,
             cutoff_ry=ecut,
             mixing_beta=mixing,
+            diagonalization=active_diagonalization,
             davidson_threshold_ha=davidson_tolerance,
             average_diagonalization_iterations=float(
                 np.mean(diagonalization_iterations)
@@ -2729,12 +3341,18 @@ def _run_scf(
             ),
             cpu_seconds=time.process_time() - cpu_start,
             memory_rss_bytes_per_rank=memory_rss_report,
+            memory_pss_bytes_all_ranks=memory_pss_all_ranks,
             memory_available_bytes=memory_available_report,
             memory_density_bytes_per_rank=iteration_density_bytes,
             memory_mixing_bytes_per_rank=iteration_mixing_bytes,
             memory_wavefunctions_bytes_per_rank=wavefunction_memory_report,
             memory_davidson_bytes_per_rank=iteration_davidson_bytes,
             memory_fft_bytes_per_rank=iteration_fft_bytes,
+            memory_fft_scratch_bytes_per_rank=iteration_fft_scratch_bytes,
+            memory_fft_exchange_bytes_per_rank=iteration_fft_exchange_bytes,
+            memory_fft_plan_count_per_rank=int(
+                mpi.max_scalar(len(fft_scratch_pool._fftw_plans))
+            ),
         )
         iterations.append(step)
         if progress is not None:
@@ -2743,6 +3361,38 @@ def _run_scf(
         if converged:
             timers.stop("electrons", electrons_started)
             result_density = mpi.gather_z_slabs_root(rho, shape)
+            derivative_real_workspace = (
+                real_grid_workspace
+                if calculate_forces or calculate_stress
+                else None
+            )
+            # mix_rho and sym_rho are finished permanently at convergence.
+            # Releasing their O(N_G) histories/maps before forces and stress
+            # prevents the SCF and derivative high-water sets from stacking.
+            del density_mixer, density_symmetrizer, previous_eigenvectors
+            del v_ion_local
+            del (
+                rho_out,
+                rho_energy,
+                real_grid_workspace,
+                v_eff_grid,
+                v_eff_local,
+                input_hxc,
+            )
+            if mpi.size > 1:
+                del (
+                    residual_g_local,
+                    error_mask,
+                    rho_energy_g_local,
+                    vh_energy_g_local,
+                    energy_mask,
+                    epsilon_energy,
+                    vxc_energy,
+                    vh_energy,
+                )
+            else:
+                del reciprocal_grid, charge_slots, charge_indices
+            trim_allocator()
             forces_ha_per_bohr = None
             stress_ha_per_bohr3 = None
             nonlocal_energy = 0.0
@@ -2769,13 +3419,19 @@ def _run_scf(
                 timers.stop("nonlocal_derivatives", derivative_started)
             if calculate_forces:
                 force_started = timers.start()
-                _, final_vxc = _xc_energy_potential(
-                    rho + rho_core,
+                assert derivative_real_workspace is not None
+                np.add(
+                    rho,
+                    rho_core,
+                    out=derivative_real_workspace,
+                )
+                final_epsilon, final_vxc = _xc_energy_potential(
+                    derivative_real_workspace,
                     xc_functional,
-                    use_numba=numba_enabled,
                     workspace=charge_workspace,
                     g_vectors=local_charge_vectors,
                 )
+                del final_epsilon
                 local_force, core_force = _local_and_core_forces(
                     pw,
                     pseudo_by_label,
@@ -2787,7 +3443,12 @@ def _run_scf(
                 )
                 assert nonlocal_force is not None
                 ionic_force = ewald_forces(
-                    pw.lattice, positions, charges, ecutrho
+                    pw.lattice,
+                    positions,
+                    charges,
+                    ecutrho,
+                    reciprocal_vectors=local_charge_vectors,
+                    mpi=mpi,
                 )
                 forces_ha_per_bohr = (
                     local_force
@@ -2808,6 +3469,8 @@ def _run_scf(
                 forces_ha_per_bohr -= np.mean(
                     forces_ha_per_bohr, axis=0, keepdims=True
                 )
+                del final_vxc
+                trim_allocator()
                 timers.stop("forces", force_started)
             if calculate_stress:
                 stress_started = timers.start()
@@ -2827,12 +3490,13 @@ def _run_scf(
                     local_workspaces,
                     ecutrho,
                     xc_functional,
-                    numba_enabled,
                     mpi,
                     charges,
                     nonlocal_energy,
                     nonlocal_tensor,
+                    real_workspace=derivative_real_workspace,
                 )
+                trim_allocator()
                 timers.stop("stress", stress_started)
             if save_wavefunctions:
                 (
@@ -2851,7 +3515,20 @@ def _run_scf(
                 final_miller_indices = []
                 final_wavefunction_rows = []
                 wavefunctions_distributed = False
+            # The returned SCFResult owns only final observables (and optional
+            # saved wavefunctions), not the FFT plans, k-point maps, projector
+            # state, or occupied states used to form derivatives.
+            if retain_occupied_states:
+                del eigenvectors
+            del derivative_real_workspace
+            del basis, compact_basis, local_workspace, vectors
+            del local_workspaces, charge_workspace, fft_scratch_pool, bases
+            trim_allocator()
             peak_per_rank, peak_all_ranks = _peak_memory_across_ranks(mpi)
+            final_pss = int(mpi.sum_scalar(current_pss_bytes()))
+            peak_sampled_pss_all_ranks = max(
+                peak_sampled_pss_all_ranks, final_pss
+            )
             return SCFResult(
                 converged=True,
                 total_energy_ha=energy,
@@ -2863,6 +3540,9 @@ def _run_scf(
                 plane_waves_per_k=sizes,
                 peak_rss_bytes_per_rank=peak_per_rank,
                 peak_rss_bytes_all_ranks=peak_all_ranks,
+                peak_sampled_pss_bytes_all_ranks=(
+                    peak_sampled_pss_all_ranks
+                ),
                 timings=timers.snapshot(),
                 forces_ha_per_bohr=forces_ha_per_bohr,
                 stress_ha_per_bohr3=stress_ha_per_bohr3,
@@ -2876,6 +3556,32 @@ def _run_scf(
             )
         old_energy = energy
         iteration += 1
+        # None of these current-output/energy workspaces is an input to the
+        # next diagonalization.  Leaving their Python names alive retained two
+        # real grids (and, in MPI, compact energy vectors) until after the next
+        # iteration's memory sample.  QE reuses this storage at the iteration
+        # boundary; release it here and let the shared FFT pool remain the one
+        # intentional grow-only owner.
+        del (
+            rho_out,
+            rho_energy,
+            real_grid_workspace,
+            v_eff_grid,
+            v_eff_local,
+            input_hxc,
+        )
+        if mpi.size > 1:
+            del (
+                residual_g_local,
+                error_mask,
+                rho_energy_g_local,
+                vh_energy_g_local,
+                energy_mask,
+                epsilon_energy,
+                vxc_energy,
+                vh_energy,
+            )
+        trim_allocator()
     timers.stop("electrons", electrons_started)
     result_density = mpi.gather_z_slabs_root(rho, shape)
     if save_wavefunctions:
@@ -2896,6 +3602,10 @@ def _run_scf(
         final_wavefunction_rows = []
         wavefunctions_distributed = False
     peak_per_rank, peak_all_ranks = _peak_memory_across_ranks(mpi)
+    final_pss = int(mpi.sum_scalar(current_pss_bytes()))
+    peak_sampled_pss_all_ranks = max(
+        peak_sampled_pss_all_ranks, final_pss
+    )
     return SCFResult(
         converged=False,
         total_energy_ha=float(old_energy),
@@ -2907,6 +3617,7 @@ def _run_scf(
         plane_waves_per_k=sizes,
         peak_rss_bytes_per_rank=peak_per_rank,
         peak_rss_bytes_all_ranks=peak_all_ranks,
+        peak_sampled_pss_bytes_all_ranks=peak_sampled_pss_all_ranks,
         timings=timers.snapshot(),
         occupations=[values.copy() for values in band_occupations],
         fermi_energy_ha=fermi_energy,

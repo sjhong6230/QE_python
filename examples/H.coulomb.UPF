@@ -1,8 +1,0 @@
-<UPF version="2.0.1">
-  <PP_INFO>Pure Coulomb hydrogen test potential for the Python reference solver.</PP_INFO>
-  <PP_HEADER generated="qepy-pw" author="qepy-pw" date="20260730"
-    element="H" pseudo_type="NC" relativistic="scalar"
-    is_ultrasoft="F" is_paw="F" is_coulomb="T" has_so="F"
-    functional="PZ" z_valence="1.0" number_of_proj="0"/>
-</UPF>
-

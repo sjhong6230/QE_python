@@ -7,16 +7,20 @@ delimiters. It does not attempt to reinterpret unsupported physics.
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 import re
 import shlex
 from typing import Any, TextIO
+import warnings
 
 import numpy as np
 
 from .constants import BOHR_PER_ANGSTROM, TWO_PI
 from .errors import QEInputError, UnsupportedFeatureError
+from .xc import canonical_xc_name
 from .symmetry import (
     SymmetryOperation,
     find_space_group,
@@ -39,12 +43,14 @@ class Species:
 class Atom:
     label: str
     position: np.ndarray  # Cartesian, bohr
+    if_pos: tuple[int, int, int] = (1, 1, 1)
 
 
 @dataclass(frozen=True)
 class KPoint:
     crystal: np.ndarray
     weight: float
+    label: str | None = None
 
 
 @dataclass
@@ -58,6 +64,12 @@ class PWInput:
     kpoints: list[KPoint]
     kpoint_mode: str = "gamma"
     full_kpoint_count: int = 1
+    full_kpoints: tuple[KPoint, ...] = ()
+    full_to_irreducible: np.ndarray = field(
+        default_factory=lambda: np.zeros(1, dtype=np.int32)
+    )
+    kpoint_grid: tuple[int, int, int] | None = None
+    kpoint_shift: tuple[int, int, int] | None = None
     symmetry_operations: tuple[SymmetryOperation, ...] = field(
         default_factory=lambda: (
             SymmetryOperation(np.eye(3, dtype=int), np.zeros(3)),
@@ -137,7 +149,10 @@ def _value(text: str) -> Any:
         value.startswith('"') and value.endswith('"')
     ):
         return value[1:-1]
-    numeric = re.sub(r"(?<=\d)[dD](?=[+-]?\d)", "e", value)
+    # Fortran accepts both ``1d-8`` and ``1.d-8``.  The latter occurs
+    # throughout QE's own test-suite, so do not require the character
+    # immediately before the exponent marker to be a digit.
+    numeric = re.sub(r"([0-9.])[dD]([+-]?\d)", r"\1e\2", value)
     try:
         return int(numeric)
     except ValueError:
@@ -187,7 +202,317 @@ def _header(line: str) -> tuple[str, str]:
     return name, option
 
 
+def _hexagonal_to_rhombohedral(coordinates: np.ndarray) -> np.ndarray:
+    """Convert ITA obverse hexagonal coordinates to QE ``ibrav=5`` axes.
+
+    This is the trigonal ``ccord`` transformation used after QE expands
+    ``crystal_sg`` positions for ``rhombohedral=.false.``.
+    """
+    x, y, z = np.asarray(coordinates, dtype=float)
+    converted = np.asarray((x - y - z, y - z, -z - x))
+    return converted - np.floor(converted)
+
+
+def _coordinate_expression(token: str) -> float:
+    """Evaluate the deliberately small expression language accepted by QE.
+
+    QE permits only arithmetic operators in atomic coordinates.  Parsing an
+    AST instead of calling ``eval`` keeps names, calls, attributes, and every
+    other Python construct out of input files.
+    """
+    if token.startswith("+"):
+        raise QEInputError(
+            f"atomic coordinate expression {token!r} must not start with '+'"
+        )
+    normalized = re.sub(
+        r"(?<=[0-9.])[dD](?=[+-]?\d)", "e", token
+    ).replace("^", "**")
+    try:
+        tree = ast.parse(normalized, mode="eval")
+    except SyntaxError as exc:
+        raise QEInputError(f"invalid atomic coordinate expression {token!r}") from exc
+
+    binary = {
+        ast.Add: lambda left, right: left + right,
+        ast.Sub: lambda left, right: left - right,
+        ast.Mult: lambda left, right: left * right,
+        ast.Div: lambda left, right: left / right,
+        ast.Pow: lambda left, right: left**right,
+    }
+
+    def evaluate(node: ast.AST) -> float:
+        if isinstance(node, ast.Expression):
+            return evaluate(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return float(node.value)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            return -evaluate(node.operand)
+        if isinstance(node, ast.BinOp) and type(node.op) in binary:
+            return float(binary[type(node.op)](evaluate(node.left), evaluate(node.right)))
+        raise QEInputError(f"invalid atomic coordinate expression {token!r}")
+
+    try:
+        value = evaluate(tree)
+    except (ArithmeticError, OverflowError, ValueError) as exc:
+        raise QEInputError(f"invalid atomic coordinate expression {token!r}") from exc
+    if not np.isfinite(value):
+        raise QEInputError(f"atomic coordinate expression {token!r} is not finite")
+    return value
+
+
+def _position_constraints(tokens: list[str]) -> tuple[int, int, int]:
+    if not tokens:
+        return (1, 1, 1)
+    if len(tokens) != 3:
+        raise QEInputError("ATOMIC_POSITIONS constraints require exactly three if_pos values")
+    try:
+        values = tuple(int(token) for token in tokens)
+    except ValueError as exc:
+        raise QEInputError("ATOMIC_POSITIONS if_pos values must be 0 or 1") from exc
+    if any(str(value) != token.strip() or value not in {0, 1} for token, value in zip(tokens, values)):
+        raise QEInputError("ATOMIC_POSITIONS if_pos values must be 0 or 1")
+    x, y, z = values
+    return x, y, z
+
+
+@lru_cache(maxsize=230 * 4)
+def _space_group_hall_number(
+    number: int,
+    uniqueb: bool,
+    origin_choice: int,
+    rhombohedral: bool,
+) -> int:
+    """Choose the spglib Hall setting corresponding to QE input switches."""
+    if not 1 <= number <= 230:
+        raise QEInputError("space_group must be between 1 and 230")
+    if origin_choice not in {1, 2}:
+        raise QEInputError("origin_choice must be 1 or 2")
+    try:
+        import spglib
+    except ImportError as exc:  # pragma: no cover - dependency installation failure
+        raise UnsupportedFeatureError(
+            "ATOMIC_POSITIONS crystal_sg requires the 'spglib' package"
+        ) from exc
+
+    candidates = []
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        for hall_number in range(1, 531):
+            kind = spglib.get_spacegroup_type(hall_number)
+            if kind is not None and int(kind.number) == number:
+                candidates.append((hall_number, str(kind.choice)))
+
+    if 143 <= number <= 167 and any(choice in {"H", "R"} for _, choice in candidates):
+        wanted = "R" if rhombohedral else "H"
+        return next(hall for hall, choice in candidates if choice == wanted)
+
+    if 3 <= number <= 15:
+        axis = "b" if uniqueb else "c"
+        primary = [
+            hall for hall, choice in candidates
+            if choice.startswith(axis) and choice.endswith("1")
+        ]
+        if primary:
+            return primary[0]
+
+    wanted_origin = str(origin_choice)
+    exact = [hall for hall, choice in candidates if choice == wanted_origin]
+    if exact:
+        return exact[0]
+    if origin_choice == 2:
+        raise QEInputError(
+            f"space_group={number} does not provide a second origin choice"
+        )
+    default = [hall for hall, choice in candidates if choice == ""]
+    if default:
+        return default[0]
+    if candidates:
+        return candidates[0][0]
+    raise QEInputError(f"spglib has no Hall setting for space_group={number}")
+
+
+def _space_group_ibrav(number: int, hall_number: int, uniqueb: bool) -> int:
+    """Return QE's primitive Bravais convention used by ``wyckoff.ccord``."""
+    try:
+        import spglib
+    except ImportError as exc:  # pragma: no cover - dependency installation failure
+        raise UnsupportedFeatureError(
+            "ATOMIC_POSITIONS crystal_sg requires the 'spglib' package"
+        ) from exc
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        group_type = spglib.get_spacegroup_type(hall_number)
+    symbol = str(group_type.international_short)
+    centering = symbol[0].upper()
+    if number <= 2:
+        return 14
+    if number <= 15:
+        base = 12 if centering == "P" else 13
+        return -base if uniqueb else base
+    if number <= 74:
+        return {"P": 8, "C": 9, "A": 91, "B": 91, "F": 10, "I": 11}[centering]
+    if number <= 142:
+        return 7 if centering == "I" else 6
+    if number <= 194:
+        return 5 if centering == "R" else 4
+    return {"P": 1, "F": 2, "I": 3}[centering]
+
+
+def _qe_primitive_coordinates(coordinates: np.ndarray, ibrav: int) -> np.ndarray:
+    """Apply QE ``Modules/wyckoff.f90:ccord`` to conventional coordinates."""
+    values = np.asarray(coordinates, dtype=float)
+    x, y, z = values.T
+    if ibrav == 2:
+        converted = np.column_stack((-x - y + z, x + y + z, -x - z + y))
+    elif ibrav in {3, 11}:
+        converted = np.column_stack((x + z, y - x, z - y))
+    elif ibrav == 7:
+        converted = np.column_stack((x - y, y + z, z - x))
+    elif ibrav == 9:
+        converted = np.column_stack((x + y, y - x, z))
+    elif ibrav == 91:
+        converted = np.column_stack((x, y + z, y - z))
+    elif ibrav == 10:
+        converted = np.column_stack((x - y + z, x + y - z, -x + y + z))
+    elif ibrav == 13:
+        converted = np.column_stack((x - z, y, z + x))
+    elif ibrav == -13:
+        converted = np.column_stack((x + y, y - x, z))
+    else:
+        converted = values.copy()
+    return converted - np.floor(converted)
+
+
+def _unique_fractional(coordinates: np.ndarray, tolerance: float = 1.0e-7) -> np.ndarray:
+    unique: list[np.ndarray] = []
+    for coordinate in np.asarray(coordinates, dtype=float):
+        wrapped = coordinate - np.floor(coordinate)
+        if not any(
+            np.all(np.abs((wrapped - prior) - np.rint(wrapped - prior)) < tolerance)
+            for prior in unique
+        ):
+            unique.append(wrapped)
+    return np.asarray(unique)
+
+
+def _wyckoff_coordinates(
+    hall_number: int, label: str, free_coordinates: list[float]
+) -> np.ndarray:
+    try:
+        from pyxtal.symmetry import Group
+    except ImportError as exc:  # pragma: no cover - dependency installation failure
+        raise UnsupportedFeatureError(
+            "Wyckoff labels in ATOMIC_POSITIONS crystal_sg require the 'pyxtal' package"
+        ) from exc
+    group = Group(hall_number, use_hall=True)
+    wyckoff = group.get_wyckoff_position(label.lower())
+    if wyckoff is None:
+        raise QEInputError(
+            f"Wyckoff position {label!r} is not valid for space_group={group.number}"
+        )
+    required = int(wyckoff.get_dof())
+    if len(free_coordinates) != required:
+        raise QEInputError(
+            f"Wyckoff position {label!r} requires {required} free coordinate(s), "
+            f"not {len(free_coordinates)}"
+        )
+    seed = wyckoff.get_position_from_free_xyzs(free_coordinates)
+    return np.asarray(wyckoff.get_all_positions(seed), dtype=float)
+
+
+def _expand_crystal_sg(
+    rows: list[str], system: dict[str, Any], lattice: np.ndarray
+) -> list[Atom]:
+    if "space_group" not in system or int(system["space_group"]) == 0:
+        raise QEInputError("ATOMIC_POSITIONS crystal_sg requires space_group")
+    number = int(system["space_group"])
+    uniqueb = bool(system.get("uniqueb", False))
+    origin_choice = int(system.get("origin_choice", 1))
+    rhombohedral = bool(system.get("rhombohedral", True))
+    hall_number = _space_group_hall_number(
+        number, uniqueb, origin_choice, rhombohedral
+    )
+    qe_ibrav = _space_group_ibrav(number, hall_number, uniqueb)
+    requested_ibrav = int(system.get("ibrav", 0))
+    if requested_ibrav != 0 and requested_ibrav != qe_ibrav:
+        raise QEInputError(
+            f"space_group={number} requires QE ibrav={qe_ibrav}, "
+            f"not ibrav={requested_ibrav}"
+        )
+    try:
+        import spglib
+    except ImportError as exc:  # pragma: no cover - dependency installation failure
+        raise UnsupportedFeatureError(
+            "ATOMIC_POSITIONS crystal_sg requires the 'spglib' package"
+        ) from exc
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        symmetry = spglib.get_symmetry_from_database(hall_number)
+    rotations = np.asarray(symmetry["rotations"], dtype=float)
+    translations = np.asarray(symmetry["translations"], dtype=float)
+
+    atoms: list[Atom] = []
+    for row in rows:
+        bits = row.split()
+        if len(bits) < 2:
+            raise QEInputError(f"invalid ATOMIC_POSITIONS crystal_sg row: {row!r}")
+        label = bits[0]
+        wyckoff_match = re.fullmatch(r"(\d+)([A-Za-z])", bits[1])
+        if wyckoff_match:
+            try:
+                from pyxtal.symmetry import Group
+            except ImportError as exc:  # pragma: no cover
+                raise UnsupportedFeatureError(
+                    "Wyckoff labels in ATOMIC_POSITIONS crystal_sg require pyxtal"
+                ) from exc
+            wyckoff = Group(hall_number, use_hall=True).get_wyckoff_position(bits[1].lower())
+            if wyckoff is None:
+                raise QEInputError(
+                    f"Wyckoff position {bits[1]!r} is invalid for space_group={number}"
+                )
+            required = int(wyckoff.get_dof())
+            payload = bits[2:]
+            if len(payload) not in {required, required + 3}:
+                raise QEInputError(
+                    f"Wyckoff position {bits[1]!r} requires {required} free coordinate(s) "
+                    "followed optionally by three if_pos values"
+                )
+            free = [_coordinate_expression(token) for token in payload[:required]]
+            if_pos = _position_constraints(payload[required:])
+            conventional = _wyckoff_coordinates(hall_number, bits[1], free)
+        else:
+            if len(bits) not in {4, 7}:
+                raise QEInputError(
+                    "ATOMIC_POSITIONS crystal_sg coordinates require x y z "
+                    "followed optionally by three if_pos values"
+                )
+            seed = np.asarray([_coordinate_expression(token) for token in bits[1:4]])
+            if_pos = _position_constraints(bits[4:])
+            conventional = (
+                rotations @ seed[:, np.newaxis]
+            ).squeeze(axis=2) + translations
+
+        if qe_ibrav == 5 and not rhombohedral:
+            primitive = np.asarray(
+                [_hexagonal_to_rhombohedral(value) for value in conventional]
+            )
+        else:
+            primitive = _qe_primitive_coordinates(conventional, qe_ibrav)
+        for coordinate in _unique_fractional(primitive):
+            atoms.append(Atom(label, coordinate @ lattice, if_pos))
+    return atoms
+
+
 def _lattice(system: dict[str, Any], cards: dict[str, tuple[str, list[str]]]) -> tuple[np.ndarray, float]:
+    legacy_parameters = sorted(
+        key for key in system if re.fullmatch(r"celldm\([1-6]\)", key)
+    )
+    modern_parameter_names = {"a", "b", "c", "cosab", "cosac", "cosbc"}
+    modern_parameters = sorted(modern_parameter_names.intersection(system))
+    if legacy_parameters and modern_parameters:
+        raise QEInputError(
+            "celldm(i) and A/B/C/cosAB/cosAC/cosBC cannot be used together"
+        )
     ibrav = int(system.get("ibrav", 0))
     celldm_1 = float(system.get("celldm(1)", 0.0))
     if celldm_1 <= 0.0 and "a" in system:
@@ -312,6 +637,16 @@ def _collect_cards(lines: list[str], system: dict[str, Any]) -> dict[str, tuple[
         if name not in _CARDS:
             i += 1
             continue
+        if name in {"ATOMIC_SPECIES", "ATOMIC_POSITIONS"}:
+            # Read the actual card through the next recognized card header.
+            # Slicing by ntyp/nat would hide surplus rows and, when the
+            # declaration is too large, consume the following card as data.
+            end = i + 1
+            while end < len(lines) and _header(lines[end])[0] not in _CARDS:
+                end += 1
+            result[name] = (option, lines[i + 1 : end])
+            i = end
+            continue
         if name == "K_POINTS":
             if option in {"gamma", "automatic"}:
                 count = 0 if option == "gamma" else 1
@@ -329,15 +664,185 @@ def _collect_cards(lines: list[str], system: dict[str, Any]) -> dict[str, tuple[
     return result
 
 
+def _kpoint_real(token: str, description: str) -> float:
+    normalized = re.sub(r"(?<=[0-9.])[dD](?=[+-]?\d)", "e", token)
+    try:
+        value = float(normalized)
+    except ValueError as exc:
+        raise QEInputError(f"invalid {description} value {token!r}") from exc
+    if not np.isfinite(value):
+        raise QEInputError(f"{description} values must be finite")
+    return value
+
+
+def _fortran_nint(value: float) -> int:
+    """Fortran NINT, including its half-away-from-zero tie behavior."""
+    return (
+        int(np.floor(value + 0.5))
+        if value >= 0.0
+        else int(np.ceil(value - 0.5))
+    )
+
+
+def _kpoint_to_crystal(
+    vector: np.ndarray,
+    coordinate_type: str,
+    reciprocal: np.ndarray,
+    alat: float,
+) -> np.ndarray:
+    if coordinate_type == "crystal":
+        return np.asarray(vector, dtype=float)
+    cartesian = np.asarray(vector, dtype=float) * (TWO_PI / alat)
+    return cartesian @ np.linalg.inv(reciprocal)
+
+
+def _special_kpoint(
+    label: str,
+    lattice: np.ndarray,
+) -> tuple[np.ndarray, str]:
+    """Resolve QE's default SC high-symmetry labels in the input cell basis."""
+    try:
+        from ase.cell import Cell
+    except ImportError as exc:  # pragma: no cover - dependency installation failure
+        raise UnsupportedFeatureError(
+            "labeled K_POINTS paths require the 'ase' package"
+        ) from exc
+    requested = label.strip()
+    key = requested
+    if key.lower() in {"gamma", "gg"}:
+        key = "G"
+    elif len(key) > 1 and key[0] == "g":
+        # QE prefixes Greek-letter labels with g: gG, gS, gS1, ...
+        key = key[1:]
+    key = key.upper()
+    try:
+        special_points = Cell(lattice).bandpath(npoints=0).special_points
+    except (ValueError, RuntimeError) as exc:
+        raise QEInputError(
+            f"cannot determine the Brillouin-zone labels for {label!r}"
+        ) from exc
+    if key not in special_points:
+        available = ", ".join(sorted(special_points))
+        raise QEInputError(
+            f"K_POINTS label {label!r} is not defined for this lattice; "
+            f"available SC labels are: {available}"
+        )
+    return np.asarray(special_points[key], dtype=float), requested
+
+
+def _band_path_kpoints(
+    rows: list[str],
+    coordinate_type: str,
+    lattice: np.ndarray,
+    reciprocal: np.ndarray,
+    alat: float,
+) -> list[KPoint]:
+    anchors: list[tuple[np.ndarray, int, str | None]] = []
+    for row in rows:
+        bits = row.split()
+        try:
+            first_coordinate = _kpoint_real(bits[0], "K_POINTS coordinate")
+            numeric = True
+        except QEInputError:
+            numeric = False
+        if numeric:
+            if len(bits) not in {4, 5}:
+                raise QEInputError(
+                    "K_POINTS *_b numeric rows require kx ky kz N "
+                    "and an optional label"
+                )
+            vector = np.asarray(
+                [
+                    first_coordinate,
+                    _kpoint_real(bits[1], "K_POINTS coordinate"),
+                    _kpoint_real(bits[2], "K_POINTS coordinate"),
+                ]
+            )
+            count_value = _kpoint_real(bits[3], "K_POINTS path count")
+            coordinate = _kpoint_to_crystal(
+                vector, coordinate_type, reciprocal, alat
+            )
+            label = bits[4] if len(bits) == 5 else None
+        else:
+            if len(bits) != 2:
+                raise QEInputError(
+                    "K_POINTS *_b label rows require a label followed by N"
+                )
+            coordinate, label = _special_kpoint(bits[0], lattice)
+            count_value = _kpoint_real(bits[1], "K_POINTS path count")
+        anchors.append((coordinate, _fortran_nint(count_value), label))
+
+    generated: list[tuple[np.ndarray, str | None]] = [
+        (anchors[0][0].copy(), anchors[0][2])
+    ]
+    for index in range(len(anchors) - 1):
+        start, count, _start_label = anchors[index]
+        stop, _unused_count, stop_label = anchors[index + 1]
+        if count < 0:
+            raise QEInputError("K_POINTS *_b path counts must be nonnegative")
+        if count == 0:
+            generated.append((stop.copy(), stop_label))
+            continue
+        for step in range(1, count + 1):
+            fraction = step / count
+            coordinate = start + fraction * (stop - start)
+            generated.append(
+                (coordinate, stop_label if step == count else None)
+            )
+    weight = 1.0 / len(generated)
+    return [KPoint(point, weight, label) for point, label in generated]
+
+
+def _contour_kpoints(
+    rows: list[str],
+    coordinate_type: str,
+    reciprocal: np.ndarray,
+    alat: float,
+) -> list[KPoint]:
+    if len(rows) != 3:
+        raise QEInputError("K_POINTS *_c requires exactly 3 supplied k-points")
+    anchors = []
+    counts = []
+    for row in rows:
+        bits = row.split()
+        if len(bits) != 4:
+            raise QEInputError("K_POINTS *_c rows require kx ky kz N")
+        vector = np.asarray(
+            [_kpoint_real(token, "K_POINTS coordinate") for token in bits[:3]]
+        )
+        anchors.append(
+            _kpoint_to_crystal(vector, coordinate_type, reciprocal, alat)
+        )
+        counts.append(_fortran_nint(_kpoint_real(bits[3], "K_POINTS mesh count")))
+    n1, n2 = counts[1], counts[2]
+    if n1 < 2 or n2 < 2:
+        raise QEInputError("K_POINTS *_c direction counts must both be at least 2")
+    first_step = (anchors[1] - anchors[0]) / (n1 - 1)
+    second_step = (anchors[2] - anchors[0]) / (n2 - 1)
+    weight = 1.0 / (n1 * n2)
+    return [
+        KPoint(anchors[0] + i * first_step + j * second_step, weight)
+        for i in range(n1)
+        for j in range(n2)
+    ]
+
+
 def _parse_kpoints(card: tuple[str, list[str]], lattice: np.ndarray, alat: float) -> list[KPoint]:
     option, rows = card
     reciprocal = TWO_PI * np.linalg.inv(lattice).T
     if option == "gamma":
         return [KPoint(np.zeros(3), 1.0)]
     if option == "automatic":
-        values = [int(x) for x in rows[0].split()]
+        try:
+            values = [int(x) for x in rows[0].split()]
+        except ValueError as exc:
+            raise QEInputError(
+                "K_POINTS automatic requires six integer values"
+            ) from exc
         if len(values) != 6 or any(n <= 0 for n in values[:3]):
             raise QEInputError("K_POINTS automatic requires nk1 nk2 nk3 sk1 sk2 sk3")
+        if any(shift not in {0, 1} for shift in values[3:]):
+            raise QEInputError("K_POINTS automatic offsets must be 0 or 1")
         grid, shift = values[:3], values[3:]
         points = []
         for i in range(grid[0]):
@@ -357,19 +862,48 @@ def _parse_kpoints(card: tuple[str, list[str]], lattice: np.ndarray, alat: float
                     frac -= np.floor(frac + 0.5)
                     points.append(KPoint(frac, 1.0 / np.prod(grid)))
         return points
-    n = int(rows[0].split()[0])
+    allowed = {"", "tpiba", "crystal", "tpiba_b", "crystal_b", "tpiba_c", "crystal_c"}
+    if option not in allowed:
+        raise QEInputError(f"unknown K_POINTS option {option!r}")
+    try:
+        n = int(rows[0].split()[0])
+    except (IndexError, ValueError) as exc:
+        raise QEInputError(
+            "K_POINTS requires an integer number of supplied points"
+        ) from exc
+    if n <= 0:
+        raise QEInputError("K_POINTS requires a positive number of supplied points")
     raw = rows[1 : n + 1]
-    weights = np.array([float(row.split()[3]) for row in raw])
-    weights /= weights.sum()
+    coordinate_type = "crystal" if option.startswith("crystal") else "tpiba"
+    if option.endswith("_b"):
+        return _band_path_kpoints(
+            raw, coordinate_type, lattice, reciprocal, alat
+        )
+    if option.endswith("_c"):
+        return _contour_kpoints(raw, coordinate_type, reciprocal, alat)
+
+    parsed_rows = [row.split() for row in raw]
+    if any(len(bits) not in {4, 5} for bits in parsed_rows):
+        raise QEInputError(
+            "explicit K_POINTS rows require kx ky kz weight and an optional label"
+        )
+    weights = np.asarray(
+        [_kpoint_real(bits[3], "K_POINTS weight") for bits in parsed_rows]
+    )
+    total_weight = float(weights.sum())
+    if not np.isfinite(total_weight) or total_weight <= 0.0:
+        raise QEInputError("explicit K_POINTS weights must have a positive sum")
+    weights /= total_weight
     points = []
-    for row, weight in zip(raw, weights):
-        vector = np.array([float(x) for x in row.split()[:3]])
-        if option in {"crystal", "crystal_b"}:
-            crystal = vector
-        else:
-            cart = vector * (TWO_PI / alat)
-            crystal = cart @ np.linalg.inv(reciprocal)
-        points.append(KPoint(crystal, float(weight)))
+    for bits, weight in zip(parsed_rows, weights):
+        vector = np.asarray(
+            [_kpoint_real(token, "K_POINTS coordinate") for token in bits[:3]]
+        )
+        crystal = _kpoint_to_crystal(
+            vector, coordinate_type, reciprocal, alat
+        )
+        label = bits[4] if len(bits) == 5 else None
+        points.append(KPoint(crystal, float(weight), label))
     return points
 
 
@@ -428,11 +962,12 @@ def read_pw_input(source: str | Path | TextIO) -> PWInput:
         if key in system and normalized not in {False, "", "pz", "lda"}:
             raise UnsupportedFeatureError(f"{feature} is not ported")
     if "input_dft" in system:
-        input_dft = str(system["input_dft"]).lower().replace("-", "")
-        if input_dft not in {"pz", "pz81", "lda", "pbe"}:
+        if canonical_xc_name(system["input_dft"]) is None:
             raise UnsupportedFeatureError(
                 f"input_dft={system['input_dft']!r} is not ported; "
-                "use 'PZ', 'LDA', or 'PBE'"
+                "supported LDA functionals are 'LDA'/'PZ'/'PZ81' and "
+                "'PW'/'PW92'; supported GGA functionals are 'PBE', "
+                "'PBEsol', 'revPBE', and 'RPBE'"
             )
     cards = _collect_cards(card_lines, system)
     lattice, alat = _lattice(system, cards)
@@ -442,32 +977,66 @@ def read_pw_input(source: str | Path | TextIO) -> PWInput:
     for row in cards["ATOMIC_SPECIES"][1]:
         bits = shlex.split(row)
         species.append(Species(bits[0], float(bits[1]), bits[2]))
-    if len(species) != int(system.get("ntyp", len(species))):
-        raise QEInputError("ntyp does not match ATOMIC_SPECIES")
+    declared_ntyp = int(system.get("ntyp", len(species)))
+    if len(species) != declared_ntyp:
+        raise QEInputError(
+            f"ntyp={declared_ntyp} does not match "
+            f"{len(species)} ATOMIC_SPECIES entries"
+        )
     pos_unit, rows = cards["ATOMIC_POSITIONS"]
-    atoms = []
-    for row in rows:
-        bits = row.split()
-        vector = np.array([float(x) for x in bits[1:4]])
-        if pos_unit == "crystal":
-            vector = vector @ lattice
-        elif pos_unit in {"angstrom", "ang"}:
-            vector *= BOHR_PER_ANGSTROM
-        elif pos_unit == "bohr":
-            pass
-        elif pos_unit in {"alat", ""}:
-            vector *= alat
-        else:
-            raise QEInputError(f"unknown ATOMIC_POSITIONS unit {pos_unit!r}")
-        atoms.append(Atom(bits[0], vector))
-    if len(atoms) != int(system.get("nat", len(atoms))):
-        raise QEInputError("nat does not match ATOMIC_POSITIONS")
+    declared_nat = int(system.get("nat", len(rows)))
+    if len(rows) != declared_nat:
+        raise QEInputError(
+            f"nat={declared_nat} does not match "
+            f"{len(rows)} ATOMIC_POSITIONS entries"
+        )
+    if pos_unit == "crystal_sg":
+        atoms = _expand_crystal_sg(rows, system, lattice)
+        # QE replaces the input count of inequivalent sites with the expanded
+        # number before entering the electronic-structure path.
+        system["nat"] = len(atoms)
+    else:
+        use_hexagonal_rhombohedral_coordinates = (
+            int(system.get("ibrav", 0)) == 5
+            and not bool(system.get("rhombohedral", True))
+            and pos_unit == "crystal"
+        )
+        atoms = []
+        for row in rows:
+            bits = row.split()
+            if len(bits) not in {4, 7}:
+                raise QEInputError(
+                    "ATOMIC_POSITIONS rows require x y z followed optionally "
+                    "by three if_pos values"
+                )
+            vector = np.array([_coordinate_expression(x) for x in bits[1:4]])
+            if_pos = _position_constraints(bits[4:])
+            if pos_unit == "crystal":
+                if use_hexagonal_rhombohedral_coordinates:
+                    vector = _hexagonal_to_rhombohedral(vector)
+                vector = vector @ lattice
+            elif pos_unit in {"angstrom", "ang"}:
+                vector *= BOHR_PER_ANGSTROM
+            elif pos_unit == "bohr":
+                pass
+            elif pos_unit in {"alat", ""}:
+                vector *= alat
+            else:
+                raise QEInputError(f"unknown ATOMIC_POSITIONS unit {pos_unit!r}")
+            atoms.append(Atom(bits[0], vector, if_pos))
     labels = {item.label for item in species}
     unknown = sorted({atom.label for atom in atoms} - labels)
     if unknown:
         raise QEInputError(f"ATOMIC_POSITIONS contains unknown species: {', '.join(unknown)}")
     kcard = cards.get("K_POINTS", ("gamma", []))
     kpoints = _parse_kpoints(kcard, lattice, alat)
+    if kcard[0] == "automatic":
+        automatic_values = tuple(int(value) for value in kcard[1][0].split())
+        kpoint_grid = automatic_values[:3]
+        kpoint_shift = automatic_values[3:]
+    else:
+        kpoint_grid = None
+        kpoint_shift = None
     no_time_reversal = bool(system.get("noinv", False))
     nosym_evc = bool(system.get("nosym_evc", False))
     if nosym_evc:
@@ -481,7 +1050,9 @@ def read_pw_input(source: str | Path | TextIO) -> PWInput:
         kpoints = _bravais_kpoint_closure(
             kpoints, bravais_operations, time_reversal=not no_time_reversal
         )
+    full_kpoints = tuple(kpoints)
     full_kpoint_count = len(kpoints)
+    full_to_irreducible = np.arange(full_kpoint_count, dtype=np.int32)
     operations = (
         SymmetryOperation(np.eye(3, dtype=int), np.zeros(3)),
     )
@@ -510,13 +1081,14 @@ def read_pw_input(source: str | Path | TextIO) -> PWInput:
         operations = mesh_compatible_operations(
             np.array([point.crystal for point in kpoints]), operations
         )
-        coordinates, weights = reduce_kpoints(
+        coordinates, weights, full_to_irreducible = reduce_kpoints(
             np.array([point.crystal for point in kpoints]),
             np.array([point.weight for point in kpoints]),
             operations,
             # ``noinv`` disables QE's ordinary inversion/time-reversal
             # reduction in this scalar, nonmagnetic implementation.
             time_reversal=not no_time_reversal,
+            return_mapping=True,
         )
         kpoints = [
             KPoint(coordinate, float(weight))
@@ -532,6 +1104,10 @@ def read_pw_input(source: str | Path | TextIO) -> PWInput:
         kpoints=kpoints,
         kpoint_mode=kcard[0] or "tpiba",
         full_kpoint_count=full_kpoint_count,
+        full_kpoints=full_kpoints,
+        full_to_irreducible=full_to_irreducible,
+        kpoint_grid=kpoint_grid,
+        kpoint_shift=kpoint_shift,
         symmetry_operations=operations,
         source=source_name,
     )

@@ -1,10 +1,19 @@
+# Python and test caches
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.ruff_cache/
+
+# Local environments and editor state
 .venv/
+.vscode/
+
+# Packaging and native-extension build products
 *.egg-info/
 build/
 dist/
-.vscode/
-quantum-espresso/
-=3.1
+qepy_pw/_native_fft.c
+qepy_pw/_native_fft*.so
+
+# Files attached to a local Codex task are not project sources.
+.codex-remote-attachments/
