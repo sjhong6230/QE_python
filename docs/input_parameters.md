@@ -5,7 +5,8 @@ quoted strings, indexed names such as `celldm(1)`, comma- or newline-separated
 assignments, `D` exponents, and comments beginning with `!` or `#` are
 accepted. Names are case-insensitive.
 
-Only variables listed below affect the implemented scalar SCF calculation.
+Only variables listed below affect the implemented scalar SCF, NSCF, and
+band-structure calculations.
 Supplying a valid QE 7.5 variable outside this list produces an explicit
 not-implemented error; a misspelled or unknown variable produces a QE-style
 bad-namelist error.
@@ -43,7 +44,7 @@ K_POINTS automatic
 | Variable | Type and default | Implemented behavior |
 |---|---|---|
 | `title` | string, empty | Printed and written to save metadata. |
-| `calculation` | string, `'scf'` | Only `'scf'` is implemented. |
+| `calculation` | string, `'scf'` | `'scf'`, `'nscf'`, or `'bands'`. The latter two read the converged density from `<outdir>/<prefix>.save`, diagonalize the resulting fixed Kohn--Sham potential at the requested `K_POINTS`, and do not mix a new density. |
 | `verbosity` | string, `'low'` | `'high'` enables additional QE-shaped structural output; other strings behave as low verbosity. |
 | `restart_mode` | string, `'from_scratch'` | `'from_scratch'` or `'restart'`. Restart requires compatible saved density and wavefunctions. |
 | `tstress` | logical, `.false.` | Compute and print the implemented analytic stress contributions. |
@@ -51,8 +52,8 @@ K_POINTS automatic
 | `outdir` | string, `ESPRESSO_TMPDIR` or `.` | Parent of `<prefix>.save`; environment variables and `~` are expanded. |
 | `prefix` | string, `'pwscf'` | Save-directory prefix. It must be a filename component, not a path. |
 | `pseudo_dir` | string, `.` | UPF directory. A relative path is resolved relative to the input file. |
-| `disk_io` | string, `'low'` | `none` disables persistent output. Every other value currently enables the same QE-shaped XML/HDF5 save path; QE's finer `low`/`medium`/`high` policies are not distinguished. |
-| `iprint` | integer, `100000` in saved metadata | Accepted for QE compatibility. It does not introduce ionic-step printing because only SCF is implemented. |
+| `disk_io` | string, `'low'` | One of `none`, `low`, `medium`, or `high`. `none` disables persistent output; the other levels write the QE-shaped XML/HDF5 save data. `medium` is suitable for an SCF → NSCF/bands workflow. Checkpoint frequency differences between the three persistent levels are not yet distinguished. |
+| `iprint` | integer, `100000` in saved metadata | Accepted for QE compatibility. It does not introduce ionic-step printing because ionic dynamics are not implemented. |
 
 `tprfor` is not an alias for `tprnfor`; it is diagnosed as an unknown variable,
 matching QE spelling requirements.
@@ -243,4 +244,3 @@ The parser distinguishes three cases:
    error or warning path.
 
 See [QE-compatible diagnostics](qe_diagnostics.md) for the detailed list.
-

@@ -595,7 +595,10 @@ def _format_qe_duration(seconds: float, label: str) -> str:
 
 def format_footer(pw: PWInput, result: SCFResult) -> str:
     out = io.StringIO()
-    if result.converged:
+    calculation = str(pw.control.get("calculation", "scf")).strip().lower()
+    if calculation in {"nscf", "bands"}:
+        print("     End of band structure calculation\n", file=out)
+    elif result.converged:
         print("     End of self-consistent calculation\n", file=out)
     else:
         print("     convergence NOT achieved after the maximum number of iterations\n", file=out)
@@ -677,7 +680,8 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
                 file=out,
             )
     marker = "!" if result.converged else " "
-    print(f"\n{marker}    total energy              = {result.total_energy_ha * 2:18.10f} Ry", file=out)
+    if calculation == "scf":
+        print(f"\n{marker}    total energy              = {result.total_energy_ha * 2:18.10f} Ry", file=out)
     if result.iterations:
         print(
             f"     estimated scf accuracy    < "

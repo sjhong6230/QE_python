@@ -1060,10 +1060,17 @@ def read_pw_input(source: str | Path | TextIO) -> PWInput:
         )
     _reject_unimplemented_variables(namelists)
     calculation = str(control.get("calculation", "scf")).strip().lower()
-    if calculation != "scf":
+    if calculation not in {"scf", "nscf", "bands"}:
         raise UnsupportedFeatureError(
             not_implemented(f"calculation {calculation}"), routine="iosys"
         )
+    control["calculation"] = calculation
+    disk_io = str(control.get("disk_io", "low")).strip().lower()
+    if disk_io not in {"none", "low", "medium", "high"}:
+        raise QEInputError(
+            f"unknown disk_io {disk_io}", routine="iosys"
+        )
+    control["disk_io"] = disk_io
     restart_mode = str(
         control.get("restart_mode", "from_scratch")
     ).strip().lower()
@@ -1078,6 +1085,13 @@ def read_pw_input(source: str | Path | TextIO) -> PWInput:
     starting_wavefunctions = str(
         electrons.get("startingwfc", "atomic+random")
     ).strip().lower()
+    if calculation in {"nscf", "bands"}:
+        # A non-self-consistent calculation always evaluates the Kohn--Sham
+        # Hamiltonian built from the charge density saved by a preceding SCF
+        # run.  Wavefunctions need not be reusable because the requested
+        # k-point set commonly differs from the SCF mesh.
+        starting_potential = "file"
+        electrons["startingpot"] = "file"
     if starting_potential not in {"atomic", "file"}:
         input_warnings.append(
             QEWarning("iosys", "wrong startingpot: use default (1)")

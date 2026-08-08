@@ -1673,6 +1673,10 @@ def _run_scf(
     cpu_start = time.process_time()
     timers = TimingRegistry()
     init_started = timers.start()
+    calculation = str(
+        pw.control.get("calculation", "scf")
+    ).strip().lower()
+    fixed_potential = calculation in {"nscf", "bands"}
     ecut = float(pw.system.get("ecutwfc", 0.0))
     if ecut <= 0:
         raise QEInputError("ecutwfc not set", routine="set_cutoff")
@@ -1681,6 +1685,11 @@ def _run_scf(
         raise QEInputError("ecutrho <= ecutwfc?!?", routine="set_cutoff")
     calculate_forces = bool(pw.control.get("tprnfor", False))
     calculate_stress = bool(pw.control.get("tstress", False))
+    if fixed_potential and (calculate_forces or calculate_stress):
+        raise QEInputError(
+            "forces and stress are available only for calculation='scf'",
+            routine="iosys",
+        )
     restart_mode = str(
         pw.control.get("restart_mode", "from_scratch")
     ).strip().lower()
@@ -1709,6 +1718,8 @@ def _run_scf(
     if restart_mode == "restart":
         starting_potential = "file"
         starting_wavefunctions = "file"
+    if fixed_potential:
+        starting_potential = "file"
     starting_messages: list[str] = []
     save_wavefunctions = (
         str(pw.control.get("disk_io", "low")).strip().lower() != "none"
@@ -1849,11 +1860,17 @@ def _run_scf(
         save_directory = resolve_save_directory(pw)
         density_path = save_directory / "charge-density.hdf5"
         if starting_potential == "file" and not density_path.is_file():
-            starting_messages.append(
-                f"Cannot read rho: {density_path} not found; "
-                "using atomic starting potential"
-            )
-            starting_potential = "atomic"
+            if fixed_potential:
+                raise QEInputError(
+                    f"Cannot read rho: {density_path} not found; run an "
+                    "SCF calculation with the same prefix and outdir first"
+                )
+            else:
+                starting_messages.append(
+                    f"Cannot read rho: {density_path} not found; "
+                    "using atomic starting potential"
+                )
+                starting_potential = "atomic"
         if starting_wavefunctions == "file":
             missing_wavefunctions = [
                 save_directory / f"wfc{index}.hdf5"
@@ -1871,7 +1888,12 @@ def _run_scf(
         # initialization while still sharing the exact QE save schema.
         from .save import validate_restart_metadata
 
-        validate_restart_metadata(pw, shape, nbnd)
+        validate_restart_metadata(
+            pw,
+            shape,
+            nbnd,
+            electronic_states=not fixed_potential,
+        )
     fft_scratch_pool = FFTScratchPool()
     if mpi.size > 1:
         catalog = bases[0].catalog
@@ -3079,6 +3101,58 @@ def _run_scf(
                 band_occupations.append(values_occupations)
             fermi_energy = None
             smearing_energy = 0.0
+        if fixed_potential:
+            # NSCF and bands calculations stop after diagonalizing the fixed
+            # SCF potential.  In particular, do not construct rho_out, test a
+            # density residual, or enter the mixing path.
+            timers.stop("electrons", electrons_started)
+            result_density = mpi.gather_z_slabs_root(rho, shape)
+            if save_wavefunctions:
+                (
+                    final_wavefunctions,
+                    final_miller_indices,
+                    final_wavefunction_rows,
+                    wavefunctions_distributed,
+                ) = _final_wavefunction_payload(
+                    eigenvectors,
+                    bases,
+                    local_workspaces,
+                    mpi,
+                )
+            else:
+                final_wavefunctions = []
+                final_miller_indices = []
+                final_wavefunction_rows = []
+                wavefunctions_distributed = False
+            peak_per_rank, peak_all_ranks = _peak_memory_across_ranks(mpi)
+            final_pss = int(mpi.sum_scalar(current_pss_bytes()))
+            peak_sampled_pss_all_ranks = max(
+                peak_sampled_pss_all_ranks, final_pss
+            )
+            return SCFResult(
+                converged=True,
+                # A fixed-potential diagonalization does not define a new
+                # self-consistent total energy.  Keep this field finite for
+                # API compatibility; reporting suppresses it for these modes.
+                total_energy_ha=0.0,
+                eigenvalues_ha=eigenvalues,
+                density=result_density,
+                wall_seconds=time.perf_counter() - start,
+                plane_waves_per_k=sizes,
+                peak_rss_bytes_per_rank=peak_per_rank,
+                peak_rss_bytes_all_ranks=peak_all_ranks,
+                peak_sampled_pss_bytes_all_ranks=(
+                    peak_sampled_pss_all_ranks
+                ),
+                timings=timers.snapshot(),
+                occupations=[values.copy() for values in band_occupations],
+                fermi_energy_ha=fermi_energy,
+                mpi_processes=mpi.size,
+                wavefunctions=final_wavefunctions,
+                wavefunction_miller_indices=final_miller_indices,
+                wavefunction_row_indices=final_wavefunction_rows,
+                wavefunctions_distributed=wavefunctions_distributed,
+            )
         sum_band_started = timers.start()
         rho_out = _density_from_states(
             eigenvectors,

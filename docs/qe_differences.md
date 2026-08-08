@@ -42,12 +42,12 @@ The parser accepts QE-style Fortran namelists and the supported cards, but only
 the variables listed in [Input parameters](input_parameters.md) are active.
 Important distinctions are:
 
-- only `calculation='scf'` is available;
+- `calculation='scf'`, `'nscf'`, and `'bands'` are available; the fixed-potential modes require a compatible density saved by a preceding SCF calculation;
 - `&IONS` and `&CELL` have no implemented variables;
 - explicit FFT dimensions such as `nr1`, `nr2`, and `nr3` are not available;
 - `occupations='from_input'` and a working `OCCUPATIONS` card are absent;
 - `mixing_pulay_frequency` is a qepy-pw research extension;
-- `disk_io` currently distinguishes only `none` from persistent output;
+- `disk_io` accepts QE's `none`, `low`, `medium`, and `high` values, while the persistent levels currently share one end-of-run save policy;
 - QE-recognized variables outside the implemented subset fail explicitly.
 
 The error/warning presentation deliberately resembles QE 7.5 where the same
@@ -220,4 +220,3 @@ energy, `1e-4 eV` for bands/Fermi levels, `1e-4 Ry/bohr` for total force, and
 `0.01 kbar` for pressure. Passing these tests demonstrates stability of the
 implemented port; it is not a general certification over all materials,
 pseudopotentials, cutoffs, or QE features.
-

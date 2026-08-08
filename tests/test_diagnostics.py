@@ -96,6 +96,37 @@ def test_invalid_starting_options_warn_and_use_qe_defaults() -> None:
     ]
 
 
+@pytest.mark.parametrize("calculation", ["nscf", "bands"])
+def test_fixed_potential_calculations_select_saved_density(
+    calculation: str,
+) -> None:
+    pw = _read(
+        _input().replace(
+            "calculation = 'scf'", f"calculation = '{calculation}'"
+        )
+    )
+    assert pw.control["calculation"] == calculation
+    assert pw.electrons["startingpot"] == "file"
+    assert pw.electrons.get("startingwfc", "atomic+random") == "atomic+random"
+
+
+def test_disk_io_medium_and_known_levels_are_accepted() -> None:
+    for level in ("none", "low", "medium", "high"):
+        text = _input().replace(
+            "calculation = 'scf'",
+            f"calculation = 'scf', disk_io = '{level}'",
+        )
+        assert _read(text).control["disk_io"] == level
+
+    with pytest.raises(QEInputError, match="unknown disk_io mystery"):
+        _read(
+            _input().replace(
+                "calculation = 'scf'",
+                "calculation = 'scf', disk_io = 'mystery'",
+            )
+        )
+
+
 def test_unported_qe_variable_is_never_silently_ignored() -> None:
     with pytest.raises(UnsupportedFeatureError) as caught:
         _read(_input(system_extra="assume_isolated='mt'"))

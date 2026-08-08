@@ -32,7 +32,7 @@ class _Parser:
             if token in {"-h", "--help"}:
                 print(
                     self._usage
-                    + "\n\nPython scalar-SCF port of QE pw.x\n\n"
+                    + "\n\nPython scalar pw.x port (SCF, NSCF, bands)\n\n"
                     + "options:\n"
                     + "  -h, --help            show this help message and exit\n"
                     + "  -in, -inp, --input INPUT_FILE"

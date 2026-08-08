@@ -498,8 +498,16 @@ def validate_restart_metadata(
     pw: PWInput,
     shape: tuple[int, int, int],
     number_of_bands: int,
+    *,
+    electronic_states: bool = True,
 ) -> None:
-    """Reject saved electronic states incompatible with the present basis."""
+    """Reject saved data incompatible with the requested calculation.
+
+    A restart reuses both density and wavefunctions and therefore requires an
+    identical FFT grid, band count, and k-point list.  NSCF/bands runs reuse
+    only the density; their band count and k points are deliberately allowed
+    to differ from the preceding SCF calculation.
+    """
     root = _saved_xml(pw)
     ns = {"qes": QES_NAMESPACE}
     saved_lattice = np.vstack(
@@ -529,6 +537,8 @@ def validate_restart_metadata(
         raise QEInputError("restart wavefunction cutoff does not match the current input")
     if saved_ecutrho is None or not np.isclose(float(saved_ecutrho), current_ecutrho):
         raise QEInputError("restart charge-density cutoff does not match the current input")
+    if not electronic_states:
+        return
     grid = root.find("qes:output/qes:basis_set/qes:fft_grid", ns)
     saved_shape = (() if grid is None else tuple(
         int(grid.attrib[name]) for name in ("nr1", "nr2", "nr3")
