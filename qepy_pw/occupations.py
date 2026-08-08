@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+from functools import lru_cache
 
 import numpy as np
 
@@ -76,7 +77,7 @@ _OPTIMIZED_TETRA_WEIGHTS = np.asarray(
 ) / 1260.0
 
 
-def _tetrahedra(
+def _build_tetrahedra(
     grid: tuple[int, int, int],
     full_to_irreducible: np.ndarray,
     reciprocal: np.ndarray,
@@ -154,6 +155,45 @@ def _tetrahedra(
     return np.asarray(tetrahedra, dtype=np.int32), stencil_weights
 
 
+@lru_cache(maxsize=16)
+def _cached_tetrahedra(
+    grid: tuple[int, int, int],
+    mapping_bytes: bytes,
+    reciprocal_bytes: bytes,
+    shortest_diagonal: bool,
+    optimized_weights: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    mapping = np.frombuffer(mapping_bytes, dtype=np.int32)
+    reciprocal = np.frombuffer(reciprocal_bytes, dtype=np.float64).reshape(3, 3)
+    return _build_tetrahedra(
+        grid,
+        mapping,
+        reciprocal,
+        shortest_diagonal,
+        optimized_weights,
+    )
+
+
+def _tetrahedra(
+    grid: tuple[int, int, int],
+    full_to_irreducible: np.ndarray,
+    reciprocal: np.ndarray,
+    shortest_diagonal: bool,
+    optimized_weights: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return immutable-in-use connectivity cached across SCF iterations."""
+    normalized_grid = tuple(int(value) for value in grid)
+    mapping = np.ascontiguousarray(full_to_irreducible, dtype=np.int32)
+    reciprocal_matrix = np.ascontiguousarray(reciprocal, dtype=np.float64)
+    return _cached_tetrahedra(
+        normalized_grid,
+        mapping.tobytes(),
+        reciprocal_matrix.tobytes(),
+        shortest_diagonal,
+        optimized_weights,
+    )
+
+
 def _integrated_tetra_fraction(sorted_energies: np.ndarray, energy: float) -> np.ndarray:
     e1, e2, e3, e4 = np.moveaxis(sorted_energies, -1, 0)
     result = np.zeros_like(e1)
@@ -223,6 +263,135 @@ def _linear_tetra_moments(energies: np.ndarray, energy: float) -> tuple[np.ndarr
     return moments, dos
 
 
+def _linear_tetra_moments_block(
+    energies: np.ndarray, energy: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Vectorized ``_linear_tetra_moments`` over tetrahedron/band rows."""
+    values = np.asarray(energies, dtype=float)
+    if values.ndim < 2 or values.shape[-1] != 4:
+        raise ValueError("tetrahedron energies must end in four vertices")
+    original_shape = values.shape
+    flat = values.reshape(-1, 4)
+    e1, e2, e3, e4 = flat.T
+    moments = np.zeros_like(flat)
+    dos = np.zeros(len(flat), dtype=float)
+
+    full = energy >= e4
+    moments[full] = 0.25
+
+    low = (energy >= e1) & (energy < e2)
+    if np.any(low):
+        selected = flat[low]
+        q1 = (energy - selected[:, 0]) / (
+            selected[:, 1] - selected[:, 0]
+        )
+        q2 = (energy - selected[:, 0]) / (
+            selected[:, 2] - selected[:, 0]
+        )
+        q3 = (energy - selected[:, 0]) / (
+            selected[:, 3] - selected[:, 0]
+        )
+        coefficient = 0.25 * q1 * q2 * q3
+        moments[low] = coefficient[:, None] * np.column_stack(
+            (4.0 - q1 - q2 - q3, q1, q2, q3)
+        )
+        dos[low] = (
+            3.0 * (energy - selected[:, 0]) ** 2
+            / (
+                (selected[:, 1] - selected[:, 0])
+                * (selected[:, 2] - selected[:, 0])
+                * (selected[:, 3] - selected[:, 0])
+            )
+        )
+
+    middle = (energy >= e2) & (energy < e3)
+    if np.any(middle):
+        selected = flat[middle]
+        differences = energy - selected
+        # a[i,j]=(E-e[j])/(e[i]-e[j]), matching QE's linear tetrahedron
+        # moments. Diagonal elements remain zero.
+        denominator = selected[:, :, None] - selected[:, None, :]
+        numerator = differences[:, None, :]
+        a = np.zeros_like(denominator)
+        np.divide(
+            numerator,
+            denominator,
+            out=a,
+            where=np.abs(denominator) > 1.0e-14,
+        )
+        c1 = 0.25 * a[:, 3, 0] * a[:, 2, 0]
+        c2 = 0.25 * a[:, 3, 0] * a[:, 2, 1] * a[:, 0, 2]
+        c3 = 0.25 * a[:, 3, 1] * a[:, 2, 1] * a[:, 0, 3]
+        moments[middle] = np.column_stack(
+            (
+                c1 + (c1 + c2) * a[:, 0, 2]
+                + (c1 + c2 + c3) * a[:, 0, 3],
+                c1 + c2 + c3 + (c2 + c3) * a[:, 1, 2]
+                + c3 * a[:, 1, 3],
+                (c1 + c2) * a[:, 2, 0]
+                + (c2 + c3) * a[:, 2, 1],
+                (c1 + c2 + c3) * a[:, 3, 0]
+                + c3 * a[:, 3, 1],
+            )
+        )
+        x = energy - selected[:, 1]
+        dos[middle] = (
+            3.0 * (selected[:, 1] - selected[:, 0])
+            + 6.0 * x
+            - 3.0
+            * (selected[:, 2] - selected[:, 0]
+               + selected[:, 3] - selected[:, 1])
+            * x**2
+            / (
+                (selected[:, 2] - selected[:, 1])
+                * (selected[:, 3] - selected[:, 1])
+            )
+        ) / (
+            (selected[:, 2] - selected[:, 0])
+            * (selected[:, 3] - selected[:, 0])
+        )
+
+    high = (energy >= e3) & (energy < e4)
+    if np.any(high):
+        selected = flat[high]
+        differences = energy - selected
+        denominator = selected[:, :, None] - selected[:, None, :]
+        numerator = differences[:, None, :]
+        a = np.zeros_like(denominator)
+        np.divide(
+            numerator,
+            denominator,
+            out=a,
+            where=np.abs(denominator) > 1.0e-14,
+        )
+        coefficient = a[:, 0, 3] * a[:, 1, 3] * a[:, 2, 3]
+        moments[high] = 0.25 * np.column_stack(
+            (
+                1.0 - coefficient * a[:, 0, 3],
+                1.0 - coefficient * a[:, 1, 3],
+                1.0 - coefficient * a[:, 2, 3],
+                1.0
+                - coefficient
+                * (1.0 + a[:, 3, 0] + a[:, 3, 1] + a[:, 3, 2]),
+            )
+        )
+        dos[high] = (
+            3.0 * (selected[:, 3] - energy) ** 2
+            / (
+                (selected[:, 3] - selected[:, 0])
+                * (selected[:, 3] - selected[:, 1])
+                * (selected[:, 3] - selected[:, 2])
+            )
+        )
+
+    degenerate = np.ptp(flat, axis=1) < 1.0e-14
+    moments[degenerate] = (
+        0.25 * (energy >= flat[degenerate, 0])[:, None]
+    )
+    dos[degenerate] = 0.0
+    return moments.reshape(original_shape), dos.reshape(original_shape[:-1])
+
+
 def tetrahedron_occupations(
     eigenvalues: list[np.ndarray],
     irreducible_weights: np.ndarray,
@@ -248,7 +417,9 @@ def tetrahedron_occupations(
     matrix = np.stack([np.asarray(values, dtype=float) for values in eigenvalues])
     point_energies = matrix[tetra]
     effective = np.einsum("cp,tpb->tbc", interpolation, point_energies)
-    sorted_effective = np.sort(effective, axis=-1)
+    sorted_effective = np.ascontiguousarray(
+        np.sort(effective, axis=-1), dtype=np.float64
+    )
     capacity = 2.0 * matrix.shape[1]
     if nelec <= 0.0 or nelec >= capacity - 1.0e-12:
         raise QEInputError(
@@ -257,9 +428,17 @@ def tetrahedron_occupations(
     lower = float(np.min(effective))
     upper = float(np.max(effective))
     ntetra = len(tetra)
+    from .basis import _load_native_fft
+    native = _load_native_fft()
     for _ in range(300):
         fermi = 0.5 * (lower + upper)
-        count = 2.0 * float(np.sum(_integrated_tetra_fraction(sorted_effective, fermi))) / ntetra
+        count = (
+            2.0
+            * float(native.tetrahedron_integrated_sum(
+                sorted_effective, fermi
+            ))
+            / ntetra
+        )
         if abs(count - nelec) < 1.0e-10:
             break
         if count < nelec:
@@ -268,29 +447,29 @@ def tetrahedron_occupations(
             upper = fermi
     else:
         raise QEInputError("tetrahedron Fermi-energy search did not converge")
+    order = np.argsort(effective, axis=-1, kind="stable")
+    sorted_e = np.take_along_axis(effective, order, axis=-1)
+    moments, dos = _linear_tetra_moments_block(sorted_e, fermi)
+    unsorted = np.empty_like(moments)
+    np.put_along_axis(unsorted, order, moments, axis=-1)
+    if normalized == "tetrahedra":
+        correction = (
+            dos[..., None]
+            * (np.sum(sorted_e, axis=-1)[..., None] - 4.0 * effective)
+            / 40.0
+        )
+        weights_at_points = unsorted + correction
+    else:
+        weights_at_points = np.einsum(
+            "cp,tbc->tbp", interpolation, unsorted
+        )
     integrated = np.zeros_like(matrix)
-    blochl = normalized == "tetrahedra"
-    for itetra in range(ntetra):
-        for band in range(matrix.shape[1]):
-            order = np.argsort(effective[itetra, band], kind="stable")
-            sorted_e = effective[itetra, band, order]
-            moments, dos = _linear_tetra_moments(sorted_e, fermi)
-            if blochl and dos:
-                original_e = effective[itetra, band]
-                correction = dos * (np.sum(sorted_e) - 4.0 * original_e) / 40.0
-                unsorted = np.empty(4)
-                unsorted[order] = moments
-                moments = unsorted + correction
-                for corner, point in enumerate(tetra[itetra, :4]):
-                    integrated[point, band] += moments[corner]
-                continue
-            unsorted = np.empty(4)
-            unsorted[order] = moments
-            weights_at_points = interpolation.T @ unsorted
-            if not optimized and interpolation.shape[1] == 4:
-                weights_at_points = unsorted
-            for point, value in zip(tetra[itetra], weights_at_points):
-                integrated[point, band] += value
+    for corner in range(tetra.shape[1]):
+        np.add.at(
+            integrated,
+            tetra[:, corner],
+            weights_at_points[:, :, corner],
+        )
     integrated *= 2.0 / ntetra
     point_weights = np.asarray(irreducible_weights, dtype=float)
     if np.any(point_weights <= 0.0):

@@ -10,11 +10,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from collections.abc import Sequence
+import os
 import time
 from typing import Callable, Literal
 
 import numpy as np
-from threadpoolctl import threadpool_limits
 
 from .basis import (
     FFTGridDescriptor,
@@ -32,12 +32,13 @@ from .diagonalization import (
     PlaneWaveHamiltonian,
     ProjectorTerm,
     _lowest_generalized_eigh,
+    _matmul_f,
     conjugate_gradient,
     davidson,
     parallel_orbital,
     rmm_diis,
 )
-from .errors import QEInputError, UnsupportedFeatureError
+from .errors import QEInputError, UnsupportedFeatureError, not_implemented
 from .ewald import ewald_energy, ewald_forces, ewald_stress
 from .input import PWInput
 from .mixing import (
@@ -63,6 +64,7 @@ from .timing import TimingEntry, TimingRegistry
 from .mpi import MPIContext
 from .upf import LocalPotential, read_upf
 from .xc import (
+    GGA_POINT_BLOCK_SIZE,
     GGA_FUNCTIONALS,
     canonical_xc_name,
     pbe_unpolarized_components,
@@ -96,12 +98,12 @@ def _canonical_diagonalization(value: object) -> str:
     if canonical is not None:
         return canonical
     if requested.lower() == "ppcg":
-        raise UnsupportedFeatureError(
-            "PPCG diagonalization is no longer supported by QE"
+        raise QEInputError(
+            "PPCG diagonalization not supported anymore (Dec. 2024)",
+            routine="iosys",
         )
     raise QEInputError(
-        f"invalid diagonalization={requested!r}; use 'david', 'cg', "
-        "'paro', 'rmm-davidson', or 'rmm-paro'"
+        f"diagonalization {requested} not implemented", routine="iosys"
     )
 
 
@@ -435,28 +437,15 @@ class _QERandom:
         self, plane_waves: int, bands: int
     ) -> tuple[np.ndarray, np.ndarray]:
         """Draw rr1,rr2 in QE's band-outer, G-inner loop order."""
-        count = 2 * plane_waves * bands
-        values = np.empty(count, dtype=float)
-        table = self._table
-        table_size = self._table_size
-        modulus = self._modulus
-        multiplier = self._multiplier
-        increment = self._increment
-        current = self._current
-        seed = self._seed
-        # Keep the stateful shuffle recurrence in one tight loop. Calling
-        # ``random`` through a generator adds millions of Python function
-        # calls for dense k meshes, although the recurrence itself is tiny.
-        for index in range(count):
-            table_index = (table_size * current) // modulus
-            current = int(table[table_index])
-            values[index] = current / modulus
-            seed = (multiplier * seed + increment) % modulus
-            table[table_index] = seed
-        self._current = current
-        self._seed = seed
-        first = values[0::2].reshape(bands, plane_waves).T
-        second = values[1::2].reshape(bands, plane_waves).T
+        first, second, current, seed = _load_native_fft().qe_random_pairs(
+            int(plane_waves),
+            int(bands),
+            self._table,
+            self._current,
+            self._seed,
+        )
+        self._current = int(current)
+        self._seed = int(seed)
         return first, second
 
     def pairs_by_band_rows(
@@ -473,35 +462,29 @@ class _QERandom:
             or len(np.unique(selected)) != len(selected)
         ):
             raise ValueError("selected random plane-wave rows are invalid")
-        positions = np.full(plane_waves, -1, dtype=np.int32)
-        positions[selected] = np.arange(len(selected), dtype=np.int32)
-        first = np.empty((len(selected), bands), dtype=float)
-        second = np.empty_like(first)
-        table = self._table
-        table_size = self._table_size
-        modulus = self._modulus
-        multiplier = self._multiplier
-        increment = self._increment
-        current = self._current
-        seed = self._seed
-        for band in range(bands):
-            for row in range(plane_waves):
-                table_index = (table_size * current) // modulus
-                current = int(table[table_index])
-                amplitude = current / modulus
-                seed = (multiplier * seed + increment) % modulus
-                table[table_index] = seed
-                table_index = (table_size * current) // modulus
-                current = int(table[table_index])
-                phase = current / modulus
-                seed = (multiplier * seed + increment) % modulus
-                table[table_index] = seed
-                destination = int(positions[row])
-                if destination >= 0:
-                    first[destination, band] = amplitude
-                    second[destination, band] = phase
-        self._current = current
-        self._seed = seed
+        # local FFT ownership rows are sorted.  The native recurrence scans
+        # the same global stream but writes only matching rows, avoiding both
+        # Python's O(npw*nband) loop and the former O(npw) positions table.
+        order = np.argsort(selected, kind="stable")
+        sorted_rows = np.ascontiguousarray(selected[order], dtype=np.int64)
+        first, second, current, seed = (
+            _load_native_fft().qe_random_pairs_rows(
+                int(plane_waves),
+                int(bands),
+                sorted_rows,
+                self._table,
+                self._current,
+                self._seed,
+            )
+        )
+        if not np.array_equal(order, np.arange(len(selected))):
+            restored_first = np.empty_like(first)
+            restored_second = np.empty_like(second)
+            restored_first[order] = first
+            restored_second[order] = second
+            first, second = restored_first, restored_second
+        self._current = int(current)
+        self._seed = int(seed)
         return first, second
 
 
@@ -572,21 +555,93 @@ def _nonlocal_projector_terms(
     """Build the compact atom-projector representation of the nonlocal term."""
     basis_vectors = basis.vectors
     if factorized or packed:
-        terms: list[ProjectorTerm] = []
         vectors = (
             basis_vectors
             if local_rows is None
             else basis_vectors[local_rows]
         )
+        layouts = []
         for species in pw.species:
             pseudo = pseudos[species.label]
-            positions = [
-                atom.position
-                for atom in pw.atoms
-                if atom.label == species.label
-            ]
-            if not positions or not pseudo.projectors:
+            positions = np.asarray(
+                [
+                    atom.position
+                    for atom in pw.atoms
+                    if atom.label == species.label
+                ],
+                dtype=np.float64,
+            )
+            if not len(positions) or not pseudo.projectors:
                 continue
+            layouts.append((pseudo, positions))
+
+        total_channels = sum(
+            pseudo.number_of_projector_channels * len(positions)
+            for pseudo, positions in layouts
+        )
+        if (
+            packed
+            and total_channels
+            and total_channels <= _PACKED_PROJECTOR_CHANNEL_LIMIT
+        ):
+            # Allocate the final atom-packed representation first and consume
+            # one species at a time.  The former two-pass path retained every
+            # species beta/phase pair while also constructing packed_beta,
+            # making the setup peak grow with their sum.  Here it grows only
+            # with the largest current species and the final packed owner.
+            packed_beta = np.empty(
+                (len(vectors), total_channels),
+                dtype=complex,
+                order="F",
+            )
+            packed_coupling = np.zeros(
+                (total_channels, total_channels), dtype=float
+            )
+            packed_diagonal = np.zeros(len(vectors), dtype=float)
+            offset = 0
+            for pseudo, positions in layouts:
+                beta, coupling = pseudo.projector_basis(
+                    vectors, pw.volume
+                )
+                beta = np.asfortranarray(beta)
+                phases = _load_native_fft().phase_matrix(
+                    np.asarray(vectors, dtype=np.float64),
+                    np.ascontiguousarray(positions, dtype=np.float64),
+                )
+                channels = beta.shape[1]
+                first_block = slice(offset, offset + channels)
+                # D_G = N_atom Re[beta_G D beta_G^H].  Use the first final
+                # atom block as beta*D scratch, then immediately overwrite it
+                # with its eventual phased beta values below.  This retains
+                # BLAS speed without an extra Npw-by-projector owner.
+                np.matmul(
+                    beta,
+                    coupling,
+                    out=packed_beta[:, first_block],
+                )
+                _load_native_fft().accumulate_projector_diagonal(
+                    packed_diagonal,
+                    packed_beta[:, first_block],
+                    beta,
+                    float(len(positions)),
+                )
+                for atom in range(len(positions)):
+                    block = slice(offset, offset + channels)
+                    np.multiply(
+                        beta,
+                        phases[:, atom, None],
+                        out=packed_beta[:, block],
+                    )
+                    packed_coupling[block, block] = coupling
+                    offset += channels
+            return (
+                PackedProjectorTerm(
+                    packed_beta, packed_coupling, packed_diagonal
+                ),
+            )
+
+        terms: list[ProjectorTerm] = []
+        for pseudo, positions in layouts:
             beta, coupling = pseudo.projector_basis(
                 vectors, pw.volume
             )
@@ -600,53 +655,6 @@ def _nonlocal_projector_terms(
                     np.asfortranarray(phases),
                     coupling,
                 )
-            )
-        if packed and terms:
-            factorized_terms = [
-                term
-                for term in terms
-                if isinstance(term, FactorizedProjectorTerm)
-            ]
-            total_channels = sum(
-                term.beta.shape[1] * term.phases.shape[1]
-                for term in factorized_terms
-            )
-            if total_channels > _PACKED_PROJECTOR_CHANNEL_LIMIT:
-                return tuple(terms)
-            packed_beta = np.empty(
-                (len(vectors), total_channels),
-                dtype=complex,
-                order="F",
-            )
-            packed_coupling = np.zeros(
-                (total_channels, total_channels), dtype=float
-            )
-            packed_diagonal = np.zeros(len(vectors), dtype=float)
-            offset = 0
-            for term in factorized_terms:
-                packed_diagonal += term.phases.shape[1] * np.real(
-                    np.einsum(
-                        "gi,ij,gj->g",
-                        term.beta,
-                        term.coupling,
-                        term.beta.conj(),
-                        optimize=True,
-                    )
-                )
-                channels = term.beta.shape[1]
-                for atom in range(term.phases.shape[1]):
-                    block = slice(offset, offset + channels)
-                    np.multiply(
-                        term.beta,
-                        term.phases[:, atom, None],
-                        out=packed_beta[:, block],
-                    )
-                    packed_coupling[block, block] = term.coupling
-                    offset += channels
-            return (
-                PackedProjectorTerm(
-                    packed_beta, packed_coupling, packed_diagonal
-                ),
             )
         return tuple(terms)
     terms: list[ProjectorTerm] = []
@@ -839,11 +847,12 @@ def _rotate_starting_subspace(
     trials: np.ndarray,
     number_of_bands: int,
     mpi: MPIContext | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Reproduce QE ``wfcinit:rotate_wfc`` before the first Davidson call."""
     atomic_basis = np.asarray(trials, dtype=complex)
     mpi = mpi if mpi is not None else MPIContext()
-    applied = operator.apply(atomic_basis)
+    applied = np.empty_like(atomic_basis, order="F")
+    operator.apply_into(atomic_basis, applied)
     projected_local = atomic_basis.conj().T @ applied
     overlap_local = atomic_basis.conj().T @ atomic_basis
     split = projected_local.size
@@ -859,41 +868,11 @@ def _rotate_starting_subspace(
         overlap,
         number_of_bands,
     )
-    return atomic_basis @ rotation, values
-
-
-def _frozen_core_density(
-    pw: PWInput,
-    pseudos: dict[str, LocalPotential],
-    shape: tuple[int, int, int],
-    g2_cutoff: float,
-    geometry: ReciprocalGrid | None = None,
-) -> np.ndarray:
-    """Superpose the UPF NLCC pseudo-core densities on the periodic FFT grid."""
-    geometry = (
-        geometry
-        if geometry is not None
-        else ReciprocalGrid.build(shape, pw.reciprocal, g2_cutoff)
+    return (
+        _matmul_f(atomic_basis, rotation),
+        values,
+        _matmul_f(applied, rotation),
     )
-    gvec = geometry.charge_vectors
-    q = np.sqrt(geometry.charge_g2)
-    coefficients = np.zeros(len(gvec), dtype=complex)
-    for species in pw.species:
-        pseudo = pseudos[species.label]
-        if not pseudo.has_nlcc:
-            continue
-        radial = pseudo.core_density_fourier(q, pw.volume)
-        positions = [
-            atom.position for atom in pw.atoms if atom.label == species.label
-        ]
-        structure = sum(
-            np.exp(-1j * np.einsum("...j,j->...", gvec, position))
-            for position in positions
-        )
-        coefficients += radial * structure
-    core_g = np.zeros(shape, dtype=complex)
-    core_g[tuple(geometry.charge_slots.T)] = coefficients
-    return np.real(np.fft.ifftn(core_g * np.prod(shape)))
 
 
 def _atomic_starting_density(
@@ -950,17 +929,12 @@ def _atomic_starting_density(
         coefficients[geometry.charge_g2 < 1.0e-14] = nelec / pw.volume
     else:
         coefficients *= nelec / starting_charge
-    if workspace is not None:
-        transformed = workspace.coefficients_to_grid(
-            coefficients, use_scratch=True
-        )
-        density = np.ascontiguousarray(np.real(transformed))
-    else:
-        density_g = np.zeros(shape, dtype=complex)
-        density_g[tuple(geometry.charge_slots.T)] = coefficients
-        density = np.ascontiguousarray(
-            np.real(np.fft.ifftn(density_g * np.prod(shape)))
-        )
+    if workspace is None:
+        raise ValueError("atomic density requires the native FFT workspace")
+    transformed = workspace.coefficients_to_grid(
+        coefficients, use_scratch=True
+    )
+    density = np.ascontiguousarray(np.real(transformed))
     return density, starting_charge
 
 
@@ -1017,19 +991,35 @@ def _xc_energy_potential(
     *,
     workspace: LocalPotentialWorkspace | None = None,
     g_vectors: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
+    need_epsilon: bool = True,
+    energy_density_out: np.ndarray | None = None,
+) -> tuple[np.ndarray | None, np.ndarray]:
     """Evaluate the selected XC functional on a rank-local FFT slab."""
     if functional == "pz":
-        return pz81_unpolarized(density)
-    if functional == "pw":
-        return pw92_lda_unpolarized(density)
+        epsilon, potential = pz81_unpolarized(density)
+    elif functional == "pw":
+        epsilon, potential = pw92_lda_unpolarized(density)
+    else:
+        epsilon = potential = None
+    if potential is not None:
+        if energy_density_out is not None:
+            np.multiply(density, epsilon, out=energy_density_out)
+        if not need_epsilon:
+            epsilon = None
+        return epsilon, potential
     if functional not in GGA_FUNCTIONALS:
         raise ValueError(f"unknown XC functional {functional!r}")
     if workspace is None or g_vectors is None:
         raise ValueError("GGA requires an FFT workspace and reciprocal vectors")
 
-    epsilon, potential, _gradient, _coefficient = _gga_energy_potential_data(
-        density, workspace, g_vectors, functional
+    epsilon, potential, _stress_tensor = _gga_energy_potential_data(
+        density,
+        workspace,
+        g_vectors,
+        functional,
+        need_stress=False,
+        need_epsilon=need_epsilon,
+        energy_density_out=energy_density_out,
     )
     return epsilon, potential
 
@@ -1039,253 +1029,74 @@ def _gga_energy_potential_data(
     workspace: LocalPotentialWorkspace,
     g_vectors: np.ndarray,
     functional: str,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Return GGA energy/potential plus fields needed by analytic stress."""
+    *,
+    need_stress: bool = False,
+    need_epsilon: bool = True,
+    energy_density_out: np.ndarray | None = None,
+) -> tuple[np.ndarray | None, np.ndarray, np.ndarray | None]:
+    """Return GGA energy/potential and an optional analytic-stress tensor."""
     coefficients = workspace.grid_to_coefficients(density)
-    gradient = np.moveaxis(
-        workspace.coefficients_to_grid(
-            1j * g_vectors * coefficients[:, None]
-        ),
-        -1,
-        0,
-    ).real
-
-    def divergence(field: np.ndarray) -> np.ndarray:
-        # Put Cartesian components last while entering the FFT workspace: its
-        # C-order batch layout then keeps grid points contiguous in memory.
-        flux_coefficients = workspace.grid_to_coefficients(
-            np.moveaxis(field, 0, -1)
-        )
-        derivatives = workspace.coefficients_to_grid(
-            1j * g_vectors * flux_coefficients
-        )
-        return np.sum(derivatives.real, axis=-1)
+    gradient_coefficients = np.multiply(
+        g_vectors,
+        coefficients[:, None],
+        dtype=np.complex128,
+    )
+    gradient_coefficients *= 1j
+    del coefficients
+    gradient_grid = workspace.coefficients_to_grid(gradient_coefficients)
+    del gradient_coefficients
+    gradient = np.moveaxis(gradient_grid, -1, 0).real
 
     epsilon, local_potential, gradient_coefficient = (
         pbe_unpolarized_components(
-            density, gradient, functional=functional
+            density,
+            gradient,
+            functional=functional,
+            need_epsilon=need_epsilon,
+            energy_density_out=energy_density_out,
         )
     )
-    potential = local_potential - divergence(
-        gradient_coefficient[None, ...] * gradient
-    )
-    return epsilon, potential, gradient, gradient_coefficient
-
-
-def _hartree(
-    density_g: np.ndarray,
-    reciprocal: np.ndarray,
-    mpi: MPIContext | None = None,
-    geometry: ReciprocalGrid | None = None,
-) -> tuple[np.ndarray, float]:
-    """Distributed reciprocal-space Hartree kernel over contiguous G chunks."""
-    mpi = mpi if mpi is not None else MPIContext()
-    shape = density_g.shape
-    if mpi.size == 1:
-        g2 = (
-            geometry.g2
-            if geometry is not None
-            else ReciprocalGrid.build(
-                shape, reciprocal, float("inf")
-            ).g2
+    stress_tensor = (
+        np.einsum(
+            "...,i...,j...->ij",
+            gradient_coefficient,
+            gradient,
+            gradient,
+            optimize=True,
         )
-        vh = np.zeros(shape, dtype=complex)
-        mask = g2 > 1.0e-14
-        vh[mask] = 4.0 * np.pi * density_g[mask] / g2[mask]
-        energy = 0.5 * float(
-            np.real(np.sum(np.conj(density_g) * vh))
-        )
-        return vh, energy
-    size = int(np.prod(shape))
-    local_slice = mpi.slab(size)
-    if geometry is not None:
-        g2 = geometry.g2.ravel()[local_slice]
-    else:
-        linear = np.arange(local_slice.start, local_slice.stop)
-        slots = np.column_stack(np.unravel_index(linear, shape))
-        for axis, axis_size in enumerate(shape):
-            slots[:, axis] = np.where(
-                slots[:, axis] <= axis_size // 2,
-                slots[:, axis],
-                slots[:, axis] - axis_size,
-            )
-        gvec = slots @ reciprocal
-        g2 = np.einsum("ij,ij->i", gvec, gvec)
-    rho_local = density_g.ravel()[local_slice]
-    vh_local = np.zeros(rho_local.size, dtype=complex)
-    mask = g2 > 1.0e-14
-    vh_local[mask] = 4.0 * np.pi * rho_local[mask] / g2[mask]
-    energy_local = 0.5 * float(
-        np.real(np.vdot(rho_local, vh_local))
+        if need_stress
+        else None
     )
-    vh = mpi.gather_flat_chunks(vh_local, size).reshape(shape)
-    return vh, mpi.sum_scalar(energy_local)
-
-
-def _iteration_energy(
-    band_energy: float,
-    e_ion: float,
-    rho_out: np.ndarray,
-    rho_energy: np.ndarray,
-    input_hxc: np.ndarray,
-    core_density: np.ndarray,
-    reciprocal: np.ndarray,
-    volume: float,
-    mpi: MPIContext | None = None,
-    functional: str = "pz",
-    workspace: LocalPotentialWorkspace | None = None,
-    g_vectors: np.ndarray | None = None,
-    smearing_energy: float = 0.0,
-    geometry: ReciprocalGrid | None = None,
-    real_workspace: np.ndarray | None = None,
-) -> tuple[float, SCFEnergyTerms]:
-    """QE ``delta_e`` plus ``delta_escf`` energy for one SCF iteration."""
-    rho_energy_g = np.fft.fftn(rho_energy) / np.prod(rho_energy.shape)
-    mpi = mpi if mpi is not None else MPIContext()
-    z_slab = mpi.slab(rho_out.shape[2])
-    grid_points = float(np.prod(rho_out.shape))
-    deband = -volume / grid_points * mpi.sum_scalar(
-        float(
-            np.sum(
-                rho_out[:, :, z_slab] * input_hxc[:, :, z_slab]
-            )
-        )
+    # The gradient is no longer needed after the optional 3x3 contraction.
+    # Reuse its complex FFT grid as c*grad(rho), avoiding a second 3-component
+    # real field. The following forward/inverse transforms are sequential, so
+    # this also shortens the lifetime of every large GGA array.
+    np.multiply(
+        gradient_grid.real,
+        gradient_coefficient[..., None],
+        out=gradient_grid.real,
     )
-    vh_energy_g, eh_density = _hartree(
-        rho_energy_g, reciprocal, mpi, geometry
+    gradient_grid.imag.fill(0.0)
+    del gradient
+    flux_coefficients = workspace.grid_to_coefficients(gradient_grid)
+    del gradient_grid
+    np.multiply(
+        flux_coefficients,
+        g_vectors,
+        out=flux_coefficients,
     )
-    eh = volume * eh_density
-    if real_workspace is None:
-        total_density = rho_energy + core_density
-    else:
-        if real_workspace.shape != rho_energy.shape:
-            raise ValueError("real-space energy workspace has the wrong shape")
-        np.add(rho_energy, core_density, out=real_workspace)
-        total_density = real_workspace
-    epsilon_energy, vxc_energy = _xc_energy_potential(
-        total_density,
-        functional,
-        workspace=workspace,
-        g_vectors=g_vectors,
+    flux_coefficients *= 1j
+    derivatives = workspace.coefficients_to_grid(flux_coefficients)
+    del flux_coefficients
+    np.add.reduce(
+        derivatives.real,
+        axis=-1,
+        out=gradient_coefficient,
     )
-    if real_workspace is None:
-        xc_integral = float(np.sum(total_density * epsilon_energy))
-    else:
-        np.multiply(total_density, epsilon_energy, out=real_workspace)
-        xc_integral = float(np.sum(real_workspace))
-    exc = volume / grid_points * xc_integral
-    vh_energy = np.real(
-        np.fft.ifftn(vh_energy_g * np.prod(rho_energy.shape))
-    )
-    if real_workspace is None:
-        density_difference = rho_energy - rho_out
-        energy_potential = vh_energy + vxc_energy
-    else:
-        np.subtract(rho_energy, rho_out, out=input_hxc)
-        density_difference = input_hxc
-        np.add(vh_energy, vxc_energy, out=real_workspace)
-        energy_potential = real_workspace
-    if real_workspace is None:
-        descf_integral = float(
-            np.sum(
-                density_difference[:, :, z_slab]
-                * energy_potential[:, :, z_slab]
-            )
-        )
-    else:
-        np.multiply(
-            density_difference,
-            energy_potential,
-            out=input_hxc,
-        )
-        descf_integral = float(np.sum(input_hxc[:, :, z_slab]))
-    descf = -volume / grid_points * mpi.sum_scalar(descf_integral)
-    terms = SCFEnergyTerms(
-        one_electron_ha=band_energy + deband,
-        hartree_ha=eh,
-        xc_ha=exc,
-        ewald_ha=e_ion,
-        descf_ha=descf,
-        smearing_ha=smearing_energy,
-    )
-    return (
-        terms.one_electron_ha
-        + terms.hartree_ha
-        + terms.xc_ha
-        + terms.ewald_ha
-        + terms.descf_ha
-        + terms.smearing_ha,
-        terms,
-    )
-
-
-def _density_error_ry(
-    density_in: np.ndarray,
-    density_out: np.ndarray,
-    reciprocal: np.ndarray,
-    volume: float,
-    g2_cutoff: float | None = None,
-    mpi: MPIContext | None = None,
-    geometry: ReciprocalGrid | None = None,
-    residual_workspace: np.ndarray | None = None,
-) -> float:
-    """QE ``rho_ddot`` norm of the scalar density residual, in Ry."""
-    if residual_workspace is None:
-        residual = density_out - density_in
-    else:
-        if residual_workspace.shape != density_in.shape:
-            raise ValueError("density-residual workspace has the wrong shape")
-        np.subtract(density_out, density_in, out=residual_workspace)
-        residual = residual_workspace
-    residual_g = np.fft.fftn(residual) / np.prod(density_in.shape)
-    mpi = mpi if mpi is not None else MPIContext()
-    shape = density_in.shape
-    if mpi.size == 1:
-        g2 = (
-            geometry.g2
-            if geometry is not None
-            else ReciprocalGrid.build(
-                shape,
-                reciprocal,
-                float("inf") if g2_cutoff is None else g2_cutoff,
-            ).g2
-        )
-        mask = g2 > 1.0e-14
-        if g2_cutoff is not None:
-            mask &= g2 <= g2_cutoff + 1.0e-12
-        return volume * float(
-            np.sum(
-                4.0 * np.pi * np.abs(residual_g[mask]) ** 2 / g2[mask]
-            )
-        )
-    local_slice = mpi.slab(int(np.prod(shape)))
-    if geometry is not None:
-        g2 = geometry.g2.ravel()[local_slice]
-    else:
-        linear = np.arange(local_slice.start, local_slice.stop)
-        indices = np.column_stack(np.unravel_index(linear, shape))
-        for axis, size in enumerate(shape):
-            indices[:, axis] = np.where(
-                indices[:, axis] <= size // 2,
-                indices[:, axis],
-                indices[:, axis] - size,
-            )
-        vectors = indices @ reciprocal
-        g2 = np.einsum("ij,ij->i", vectors, vectors)
-    mask = g2 > 1.0e-14
-    if g2_cutoff is not None:
-        mask &= g2 <= g2_cutoff + 1.0e-12
-    residual_local = residual_g.ravel()[local_slice]
-    return volume * mpi.sum_scalar(
-        float(
-            np.sum(
-                4.0
-                * np.pi
-                * np.abs(residual_local[mask]) ** 2
-                / g2[mask]
-            )
-        )
-    )
+    local_potential -= gradient_coefficient
+    del gradient_coefficient
+    del derivatives
+    return epsilon, local_potential, stress_tensor
 
 
 def _functional_family(name: str) -> str | None:
@@ -1700,10 +1511,13 @@ def _hellmann_feynman_stress(
         (
             epsilon_xc,
             potential_xc,
-            density_gradient,
-            gradient_coefficient,
+            gga_stress_tensor,
         ) = _gga_energy_potential_data(
-            total_density, charge_workspace, g_vectors, xc_functional
+            total_density,
+            charge_workspace,
+            g_vectors,
+            xc_functional,
+            need_stress=True,
         )
     else:
         epsilon_xc, potential_xc = _xc_energy_potential(
@@ -1712,7 +1526,7 @@ def _hellmann_feynman_stress(
             workspace=charge_workspace,
             g_vectors=g_vectors,
         )
-        density_gradient = gradient_coefficient = None
+        gga_stress_tensor = None
     grid_scale = volume / np.prod(shape)
     xc_energy = grid_scale * mpi.sum_scalar(
         float(np.sum(total_density * epsilon_xc))
@@ -1721,17 +1535,9 @@ def _hellmann_feynman_stress(
         float(np.sum(density * potential_xc))
     )
     stress -= (xc_energy - xc_potential_energy) / volume * np.eye(3)
-    if density_gradient is not None and gradient_coefficient is not None:
-        stress += mpi.sum_array(
-            np.einsum(
-                "...,i...,j...->ij",
-                gradient_coefficient,
-                density_gradient,
-                density_gradient,
-                optimize=True,
-            )
-        ) / np.prod(shape)
-    del epsilon_xc, total_density, density_gradient, gradient_coefficient
+    if gga_stress_tensor is not None:
+        stress += mpi.sum_array(gga_stress_tensor) / np.prod(shape)
+    del epsilon_xc, total_density, gga_stress_tensor
 
     # Nonlinear core correction. This is QE's stres_cc: the diagonal term
     # restores the frozen-core part omitted from vtxc, and the radial tensor
@@ -1837,6 +1643,17 @@ def run_scf(
     # explicitly large band dimension; symmetry and npwx do not make a narrow
     # GEMM wide. Native FFT/projector/PW kernels retain requested threads.
     blas_threads = _serial_blas_thread_count(pw, mpi, threads)
+    # The CLI re-exec has already set every BLAS runtime to one thread before
+    # NumPy import. MPI and narrow-band serial runs can skip threadpoolctl's
+    # rank-private Python object graph. Library callers lack that guarantee,
+    # while a wide-band serial run must raise the active BLAS limit.
+    if (
+        blas_threads == 1
+        and os.environ.get("QEPY_RUNTIME_CONFIGURED") == "1"
+    ):
+        return _run_scf(pw, progress, mpi)
+    from threadpoolctl import threadpool_limits
+
     with threadpool_limits(limits=blas_threads):
         return _run_scf(pw, progress, mpi)
 
@@ -1858,10 +1675,10 @@ def _run_scf(
     init_started = timers.start()
     ecut = float(pw.system.get("ecutwfc", 0.0))
     if ecut <= 0:
-        raise QEInputError("ecutwfc must be positive")
+        raise QEInputError("ecutwfc not set", routine="set_cutoff")
     ecutrho = float(pw.system.get("ecutrho", 4.0 * ecut))
     if ecutrho <= 0.0:
-        raise QEInputError("ecutrho must be positive")
+        raise QEInputError("ecutrho <= ecutwfc?!?", routine="set_cutoff")
     calculate_forces = bool(pw.control.get("tprnfor", False))
     calculate_stress = bool(pw.control.get("tstress", False))
     restart_mode = str(
@@ -1869,7 +1686,7 @@ def _run_scf(
     ).strip().lower()
     if restart_mode not in {"from_scratch", "restart"}:
         raise QEInputError(
-            "restart_mode must be 'from_scratch' or 'restart'"
+            f"unknown restart_mode {restart_mode}", routine="iosys"
         )
     starting_potential = str(
         pw.electrons.get("startingpot", "atomic")
@@ -1907,13 +1724,32 @@ def _run_scf(
     }
     if occupations_mode not in {"fixed", "smearing", *tetrahedron_modes}:
         raise UnsupportedFeatureError(
-            f"occupations={occupations_mode!r} is not ported; use "
-            "'fixed', 'smearing', 'tetrahedra', 'tetrahedra_lin', "
-            "or 'tetrahedra_opt'"
+            not_implemented(f"occupations {occupations_mode}"),
+            routine="set_occupations",
         )
-    pseudo_by_label = {}
-    for species in pw.species:
-        pseudo_by_label[species.label] = read_upf(pw.pseudo_dir / species.pseudo_file)
+    pseudo_payload: tuple[bool, object] | None = None
+    if mpi.is_root:
+        try:
+            pseudo_payload = (
+                True,
+                {
+                    species.label: read_upf(
+                        pw.pseudo_dir / species.pseudo_file
+                    )
+                    for species in pw.species
+                },
+            )
+        except Exception as exc:
+            # Broadcast failures too, otherwise non-root ranks remain blocked
+            # after rank zero exits this initialization phase.
+            pseudo_payload = (False, f"{type(exc).__name__}: {exc}")
+    pseudo_payload = mpi.broadcast(pseudo_payload)
+    assert isinstance(pseudo_payload, tuple) and len(pseudo_payload) == 2
+    pseudo_succeeded, pseudo_value = pseudo_payload
+    if not pseudo_succeeded:
+        raise QEInputError(str(pseudo_value))
+    assert isinstance(pseudo_value, dict)
+    pseudo_by_label = pseudo_value
     xc_functional = _resolve_xc_functional(pw, pseudo_by_label)
     pw.system["_resolved_xc"] = xc_functional
     z_by_label = {label: pseudo.z_valence for label, pseudo in pseudo_by_label.items()}
@@ -1931,14 +1767,15 @@ def _run_scf(
         )
     )
     if nbnd <= 0:
-        raise QEInputError("nbnd must be positive")
+        raise QEInputError("nbnd less than 1", routine="iosys")
     if occupations_mode == "fixed" and nbnd < occupied:
         raise QEInputError("nbnd is smaller than the number of occupied states")
     if occupations_mode == "smearing":
         degauss_ry = float(pw.system.get("degauss", 0.0))
         if degauss_ry <= 0.0:
             raise QEInputError(
-                "degauss must be positive when occupations='smearing'"
+                "smearing requires a value for gaussian broadening (degauss)",
+                routine="set_occupations",
             )
         gaussian_order = smearing_order(
             pw.system.get("smearing", "gaussian")
@@ -2178,15 +2015,15 @@ def _run_scf(
         * (local_z_slab.stop - local_z_slab.start)
     )
     # Count the actual grid representations rather than treating ten grids
-    # as complex128.  At the SCF high-water point there are at most nine
-    # rank-local float64 density/potential grids (rho, core, ionic, Hartree,
-    # XC, input-HXC, effective, output, and mixed/energy density).  The
+    # as complex128.  At the SCF high-water point there are at most seven
+    # rank-local float64 density/potential grids (core, ionic, Hartree, XC,
+    # the shared Hxc/effective owner, output, and mixed/energy density). The
     # ReciprocalGrid geometry initially contains one float64 g2 grid, two
     # int32 triplet tables, one float64 G-vector triplet table, and one
     # float64 |G|^2 vector. The targeted MPI symmetry path releases those
     # replicated setup tables below; all other paths retain them. The final
     # term counts rank-local charge-vector and |G|^2 caches.
-    density_potential_grid_bytes = 9 * local_real_points * 8
+    density_potential_grid_bytes = 7 * local_real_points * 8
     release_replicated_reciprocal_grid = (
         mpi.size > 1
         and pw.full_kpoint_count > len(pw.kpoints)
@@ -2264,16 +2101,26 @@ def _run_scf(
     factorized_projector_columns = sum(
         channels + atoms for channels, atoms in projector_species_layout
     )
-    projector_columns = (
-        packed_projector_channels
+    # The packed path consumes one species at a time.  At its peak, final beta
+    # coexists only with that species' beta, phase, and short-lived conjugated
+    # beta used to form the diagonal.  The factorized fallback retains every
+    # beta/phase pair and briefly conjugates the largest beta.
+    largest_species_setup = max(
+        (2 * channels + atoms for channels, atoms in projector_species_layout),
+        default=0,
+    )
+    projector_peak_columns = (
+        packed_projector_channels + largest_species_setup
         if packed_projector_channels <= _PACKED_PROJECTOR_CHANNEL_LIMIT
         else factorized_projector_columns
+        + max(
+            (channels for channels, _atoms in projector_species_layout),
+            default=0,
+        )
     )
     projector_workspace_bytes = max(
         (
-            local_rows
-            * projector_columns
-            * 16
+            local_rows * projector_peak_columns * 16
             for local_rows in local_plane_wave_counts
         ),
         default=0,
@@ -2302,15 +2149,50 @@ def _run_scf(
             ("dense eigensolver workspace", estimated_workspace)
         ]
     else:
-        davidson_rows = (
+        solver_rows = (
             max(sizes) if mpi.size == 1 else local_plane_waves
         )
+        davidson_subspace_columns = min(
+            max(sizes), davidson_ndim * nbnd
+        )
         davidson_bytes = (
-            2
-            * davidson_rows
-            * min(max(sizes), davidson_ndim * nbnd)
+            (
+                2 * solver_rows * davidson_subspace_columns
+                # The previous pair is released after its residual has been
+                # preconditioned and copied into basis_storage.  Only the new
+                # Ritz vectors and residuals coexist at the expansion peak.
+                + 2 * solver_rows * nbnd
+            )
             * 16
         )
+        # psi and Hpsi are views into the two persistent band blocks; five
+        # rank-local work vectors remain for CG.
+        cg_bytes = (2 * solver_rows * nbnd + 5 * solver_rows) * 16
+        paro_columns = min(
+            max(sizes), nbnd + max(int(np.rint(0.5 * nbnd)), 4)
+        )
+        paro_bytes = (
+            2 * solver_rows * paro_columns + 3 * solver_rows * nbnd
+        ) * 16
+        rmm_bytes = (
+            2 * solver_rows * nbnd * rmm_ndim
+            + 5 * solver_rows * nbnd
+        ) * 16
+        if diagonalization == "david":
+            solver_bytes = davidson_bytes
+            solver_label = "Davidson workspace"
+        elif diagonalization == "cg":
+            solver_bytes = cg_bytes
+            solver_label = "CG workspace"
+        elif diagonalization == "paro":
+            solver_bytes = paro_bytes
+            solver_label = "ParO workspace"
+        elif diagonalization == "rmm-paro":
+            solver_bytes = max(rmm_bytes, paro_bytes)
+            solver_label = "RMM/ParO workspace"
+        else:
+            solver_bytes = max(rmm_bytes, davidson_bytes)
+            solver_label = "RMM/Davidson workspace"
         local_stick_points = shape[2] * (
             len(wave_fft_descriptor.sticks_by_rank[mpi.rank])
             if wave_fft_descriptor is not None
@@ -2318,8 +2200,13 @@ def _run_scf(
         )
         if mpi.size == 1:
             # One full grid per concurrently transformed band, bounded by the
-            # rank-local thread count, plus compact reciprocal results.
-            serial_fft_batch = min(threads_per_process, maximum_block)
+            # rank-local thread count, plus compact reciprocal results. GGA
+            # differentiates all three Cartesian components in one FFT batch
+            # even for a single-threaded calculation.
+            serial_fft_batch = max(
+                min(threads_per_process, maximum_block),
+                3 if xc_functional in GGA_FUNCTIONALS else 1,
+            )
             serial_grid_stride = local_real_points
             if threads_per_process > 1 and serial_fft_batch > 1:
                 # Native band-parallel FFTs pad only the distance between
@@ -2374,13 +2261,26 @@ def _run_scf(
                 * 16
             )
         estimated_workspace = (
-            davidson_bytes + fft_bytes + projector_workspace_bytes
+            solver_bytes + fft_bytes + projector_workspace_bytes
         )
         workspace_components = [
-            ("Davidson workspace", davidson_bytes),
+            (solver_label, solver_bytes),
             ("FFT/MPI workspace", fft_bytes),
             ("nonlocal-projector workspace", projector_workspace_bytes),
         ]
+    if xc_functional in GGA_FUNCTIONALS:
+        # PW92 ec/vc and the four reusable PBE work arrays are pointwise and
+        # therefore limited to one cache-sized tile.  Full-size epsilon,
+        # potential, and gradient-coefficient outputs are already included in
+        # the density/potential-grid high-water set above; the three-component
+        # complex gradient is represented by the FFT workspace.
+        gga_xc_workspace_bytes = (
+            6 * min(local_real_points, GGA_POINT_BLOCK_SIZE) * 8
+        )
+        estimated_workspace += gga_xc_workspace_bytes
+        workspace_components.append(
+            ("GGA XC workspace", gga_xc_workspace_bytes)
+        )
     if save_wavefunctions and mpi.size > 1:
         save_workspace = (
             max(sizes) * nbnd * np.dtype(np.complex128).itemsize
@@ -2520,21 +2420,42 @@ def _run_scf(
     potinit_started = timers.start()
     starting_coefficients: np.ndarray | None = None
     if starting_potential == "file":
-        from .save import read_saved_density
+        from .save import read_saved_density_coefficients
 
-        saved_density = None
-        density_error = None
-        if mpi.is_root:
-            try:
-                saved_density = read_saved_density(pw, shape, nelec)
-            except QEInputError as exc:
-                density_error = str(exc)
-        density_error = mpi.broadcast(density_error)
-        if density_error is not None:
-            raise QEInputError(density_error)
-        rho = mpi.scatter_z_slabs_root(saved_density, shape)
+        # Load directly into the rank-local compact G basis. This avoids the
+        # old root-only full complex grid and NumPy FFT temporaries, whose
+        # lifetimes overlapped the persistent SCF FFT workspace.
+        saved_coefficients = read_saved_density_coefficients(
+            pw, charge_indices[local_charge_rows]
+        )
+        saved_charge = pw.volume * mpi.sum_scalar(
+            float(
+                np.real(
+                    np.sum(
+                        saved_coefficients[
+                            local_charge_g2 < 1.0e-14
+                        ]
+                    )
+                )
+            )
+        )
+        if (
+            not np.isfinite(saved_charge)
+            or abs(saved_charge - nelec) > 1.0e-7 * max(1.0, nelec)
+        ):
+            raise QEInputError(
+                f"saved density contains {saved_charge:.12g} electrons; "
+                f"expected {nelec:.12g}"
+            )
+        rho = np.ascontiguousarray(
+            np.real(
+                charge_workspace.coefficients_to_grid(
+                    saved_coefficients, use_scratch=True
+                )
+            )
+        )
         _starting_charge = nelec
-        del saved_density
+        del saved_coefficients
     elif mpi.size == 1:
         rho, _starting_charge = _atomic_starting_density(
             pw,
@@ -2618,12 +2539,17 @@ def _run_scf(
         .replace("_", "-")
     )
     mixing_ndim = int(pw.electrons.get("mixing_ndim", 8))
-    if not np.isfinite(mixing) or not 0.0 < mixing <= 1.0:
-        raise QEInputError(
-            "mixing_beta must satisfy 0 < mixing_beta <= 1"
-        )
+    mixing_pulay_frequency = int(
+        pw.electrons.get("mixing_pulay_frequency", 1)
+    )
+    if not np.isfinite(mixing):
+        raise QEInputError("mixing_beta is not finite", routine="iosys")
     if not 1 <= mixing_ndim <= 25:
         raise QEInputError("mixing_ndim must be between 1 and 25")
+    if mixing_pulay_frequency < 1:
+        raise QEInputError(
+            "mixing_pulay_frequency must be at least 1"
+        )
     if mixing_mode in {"plain", "default", "tf", "local-tf"}:
         # The compact rho(G) implementation is valid for one rank as well as
         # MPI.  Using it in serial removes PlainBroydenMixer's second full FFT
@@ -2637,6 +2563,7 @@ def _run_scf(
             mode=mixing_mode,
             nelec=nelec,
             volume=pw.volume,
+            pulay_frequency=mixing_pulay_frequency,
         )
     elif mixing_mode == "linear":
         density_mixer = LinearMixer(beta=mixing)
@@ -2669,6 +2596,10 @@ def _run_scf(
                     if mpi.size > 1 else None
                 ),
             )
+            # HDF5 selection and Miller-order work arrays are one-k-point
+            # temporaries. Return them before loading the next persistent
+            # wavefunction block so they do not stack at the restart peak.
+            trim_allocator()
     starting_fft_scratch_pool: FFTScratchPool | None = None
     starting_local_workspaces: _LazyWorkspaceSequence | None = None
     if (
@@ -2726,53 +2657,80 @@ def _run_scf(
     electrons_started = timers.start()
     iteration = 1
     first_scf_diagonalization = True
+    # The end of each completed iteration computes V_Hxc[rho_mixed] for the
+    # total-energy correction.  Retain that grid as the next iteration's
+    # input potential instead of repeating identical Hartree and GGA FFTs.
+    input_hxc: np.ndarray | None = None
     while iteration <= maxiter:
-        potential_started = timers.start()
-        hartree_started = timers.start()
-        rho_g_local = charge_workspace.grid_to_coefficients(rho)
-        vh_g_local = np.zeros_like(rho_g_local)
-        hartree_mask = local_charge_g2 > 1.0e-14
-        vh_g_local[hartree_mask] = (
-            4.0
-            * np.pi
-            * rho_g_local[hartree_mask]
-            / local_charge_g2[hartree_mask]
+        build_input_hxc = input_hxc is None
+        potential_started = (
+            timers.start() if build_input_hxc else None
         )
-        vh = np.ascontiguousarray(
-            np.real(
-                charge_workspace.coefficients_to_grid(
-                    vh_g_local, use_scratch=True
+        if build_input_hxc:
+            hartree_started = timers.start()
+            rho_g_local = charge_workspace.grid_to_coefficients(rho)
+            vh_g_local = np.zeros_like(rho_g_local)
+            _load_native_fft().hartree_coefficients(
+                rho_g_local,
+                local_charge_g2,
+                vh_g_local,
+            )
+            vh = np.ascontiguousarray(
+                np.real(
+                    charge_workspace.coefficients_to_grid(
+                        vh_g_local, use_scratch=True
+                    )
                 )
             )
-        )
-        del rho_g_local, vh_g_local, hartree_mask
-        timers.stop("v_h", hartree_started)
+            del rho_g_local, vh_g_local
+            timers.stop("v_h", hartree_started)
+        else:
+            vh = None
         # Allocate the effective-potential owner before XC and use it first as
         # the total-density workspace. This removes ``rho + rho_core`` as a
         # separate full-grid temporary on every SCF iteration.
-        if (
+        native_potential_layout = (
             (mpi.size > 1 or threads_per_process > 1)
             and diagonalization != "dense"
-        ):
-            local_z_count = rho.shape[2]
-            v_eff_local = np.empty(
-                (local_z_count, shape[0], shape[1]), dtype=np.float64
-            )
-            v_eff_grid = np.moveaxis(v_eff_local, 0, 2)
-        else:
-            v_eff_local = np.empty_like(v_ion_local)
-            v_eff_grid = v_eff_local
-        np.add(rho, rho_core, out=v_eff_grid)
-        xc_started = timers.start()
-        epsilon_input, vxc = _xc_energy_potential(
-            v_eff_grid,
-            xc_functional,
-            workspace=charge_workspace,
-            g_vectors=local_charge_vectors,
         )
-        timers.stop("v_xc", xc_started)
-        input_hxc = vh + vxc
-        del vh, vxc, epsilon_input
+        if build_input_hxc:
+            if native_potential_layout:
+                local_z_count = rho.shape[2]
+                v_eff_local = np.empty(
+                    (local_z_count, shape[0], shape[1]), dtype=np.float64
+                )
+                v_eff_grid = np.moveaxis(v_eff_local, 0, 2)
+            else:
+                v_eff_local = np.empty_like(v_ion_local)
+                v_eff_grid = v_eff_local
+        else:
+            # The previous iteration left Hxc in the effective-potential
+            # owner. Re-form its native z,x,y view instead of allocating a
+            # separate Veff grid. The view recovers the contiguous owner that
+            # the threaded local-potential kernel consumes.
+            assert input_hxc is not None
+            v_eff_grid = input_hxc
+            v_eff_local = (
+                np.moveaxis(v_eff_grid, 2, 0)
+                if native_potential_layout
+                else v_eff_grid
+            )
+        if build_input_hxc:
+            np.add(rho, rho_core, out=v_eff_grid)
+            xc_started = timers.start()
+            _epsilon_input, vxc = _xc_energy_potential(
+                v_eff_grid,
+                xc_functional,
+                workspace=charge_workspace,
+                g_vectors=local_charge_vectors,
+                need_epsilon=False,
+            )
+            timers.stop("v_xc", xc_started)
+            assert vh is not None
+            np.add(vh, vxc, out=vh)
+            input_hxc = vh
+            assert _epsilon_input is None
+            del vxc, _epsilon_input
         # QE constructs vrs once per SCF iteration and shares it across the
         # entire k loop.  Keep the same real-space array in serial as well as
         # MPI instead of inverse-transforming identical v_eff(G) for every k.
@@ -2784,7 +2742,8 @@ def _run_scf(
             v_eff_g = np.fft.fftn(v_eff_local) / np.prod(shape)
         else:
             v_eff_g = np.asarray([potential_average], dtype=complex)
-        timers.stop("v_of_rho", potential_started)
+        if potential_started is not None:
+            timers.stop("v_of_rho", potential_started)
         eigenvalues, eigenvectors = [], []
         diagonalization_iterations: list[int] = []
         hamiltonian_applications: list[int] = []
@@ -2882,6 +2841,7 @@ def _run_scf(
                 )
                 trial_vectors = previous_eigenvectors[kpoint_index]
                 trial_eigenvalues = None
+                trial_applied = None
                 if trial_vectors is None:
                     wfcinit_started = timers.start()
                     starting = _atomic_starting_orbitals(
@@ -2930,6 +2890,7 @@ def _run_scf(
                     (
                         trial_vectors,
                         trial_eigenvalues,
+                        trial_applied,
                     ) = _rotate_starting_subspace(
                         rotation_operator, starting, nbnd, mpi
                     )
@@ -2971,16 +2932,18 @@ def _run_scf(
                         ),
                         initial_is_orthonormal=True,
                         initial_eigenvalues=trial_eigenvalues,
+                        initial_applied=trial_applied,
                         mpi=mpi,
                         global_dimension=len(basis),
                         global_row_indices=operator.local_rows,
                         timers=timers,
+                        operator_into=operator.apply_into,
                     )
                     timer_name = "cegterg"
                 elif active_diagonalization == "cg":
                     solution = conjugate_gradient(
                         operator.apply,
-                        operator.diagonal,
+                        operator.local_kinetic,
                         nbnd,
                         initial_vectors=trial_vectors,
                         tolerance=davidson_tolerance,
@@ -2988,7 +2951,11 @@ def _run_scf(
                         occupied_roots=occupied_roots,
                         full_accuracy=full_accuracy,
                         initial_is_orthonormal=True,
+                        initial_applied=trial_applied,
+                        initial_eigenvalues=trial_eigenvalues,
+                        initial_is_ritz=(trial_applied is not None),
                         mpi=mpi,
+                        operator_into=operator.apply_into,
                     )
                     timer_name = "ccgdiagg"
                 elif active_diagonalization == "paro":
@@ -3002,13 +2969,17 @@ def _run_scf(
                         occupied_roots=occupied_roots,
                         full_accuracy=full_accuracy,
                         initial_is_orthonormal=True,
+                        initial_applied=trial_applied,
+                        initial_eigenvalues=trial_eigenvalues,
+                        initial_is_ritz=(trial_applied is not None),
                         mpi=mpi,
+                        operator_into=operator.apply_into,
                     )
                     timer_name = "paro"
                 else:
                     solution = rmm_diis(
                         operator.apply,
-                        operator.diagonal,
+                        operator.local_kinetic,
                         nbnd,
                         initial_vectors=trial_vectors,
                         tolerance=davidson_tolerance,
@@ -3019,7 +2990,11 @@ def _run_scf(
                         occupied_roots=occupied_roots,
                         full_accuracy=full_accuracy,
                         initial_is_orthonormal=True,
+                        initial_applied=trial_applied,
+                        initial_eigenvalues=trial_eigenvalues,
+                        initial_is_ritz=(trial_applied is not None),
                         mpi=mpi,
+                        operator_into=operator.apply_into,
                     )
                     timer_name = "rmm-diis"
                 timers.stop(timer_name, diagonalization_started)
@@ -3060,6 +3035,7 @@ def _run_scf(
                     solution,
                     trial_vectors,
                     trial_eigenvalues,
+                    trial_applied,
                 )
         if starting_local_workspaces is not None:
             # The last temporary Hamiltonian/workspace was deleted above;
@@ -3133,34 +3109,29 @@ def _run_scf(
                 weights, eigenvalues, band_occupations
             )
         )
+        grid_scale = pw.volume / np.prod(shape)
+        # Preserve the input-potential expectation before reusing the Veff
+        # owner for the density residual below. Hxc = Veff - Vion.
+        deband = -grid_scale * mpi.sum_scalar(
+            float(
+                np.einsum("ijk,ijk->", rho_out, v_eff_grid)
+                - np.einsum("ijk,ijk->", rho_out, v_ion_local)
+            )
+        )
+        input_hxc = None
         real_grid_workspace = v_eff_grid
-        if mpi.size == 1:
-            accuracy = 0.5 * _density_error_ry(
-                rho,
-                rho_out,
-                pw.reciprocal,
-                pw.volume,
-                ecutrho,
-                mpi,
-                reciprocal_grid,
-                residual_workspace=real_grid_workspace,
+        np.subtract(rho_out, rho, out=real_grid_workspace)
+        # Keep the compact residual produced for QE's dr2 metric and hand it
+        # to Broyden below. Previously mix_rho repeated this forward FFT.
+        residual_g_local = charge_workspace.grid_to_coefficients(
+            real_grid_workspace
+        )
+        accuracy = 0.5 * pw.volume * mpi.sum_scalar(
+            _load_native_fft().hartree_residual_metric(
+                residual_g_local,
+                local_charge_g2,
             )
-        else:
-            np.subtract(rho_out, rho, out=real_grid_workspace)
-            residual_g_local = charge_workspace.grid_to_coefficients(
-                real_grid_workspace
-            )
-            error_mask = local_charge_g2 > 1.0e-14
-            accuracy = 0.5 * pw.volume * mpi.sum_scalar(
-                float(
-                    np.sum(
-                        4.0
-                        * np.pi
-                        * np.abs(residual_g_local[error_mask]) ** 2
-                        / local_charge_g2[error_mask]
-                    )
-                )
-            )
+        )
         previous_accuracy = accuracy
         # QE estimates the first-solve eigensolver error as ethr*nelec. If
         # the newly measured dr2 is smaller, it repeats the same first SCF
@@ -3178,8 +3149,7 @@ def _run_scf(
             )
             first_scf_diagonalization = False
             del rho_out, real_grid_workspace, v_eff_grid, v_eff_local
-            if mpi.size > 1:
-                del residual_g_local, error_mask
+            del residual_g_local
             trim_allocator()
             continue
         first_scf_diagonalization = False
@@ -3194,101 +3164,96 @@ def _run_scf(
         # the fixed-point history and can move the calculation away again.
         converged = density_converged
         mix_started = timers.start()
-        rho_energy = (
-            rho_out
-            if converged
-            else density_mixer.mix(rho, rho_out)
-        )
-        timers.stop("mix_rho", mix_started)
-        if mpi.size == 1:
-            energy, energy_terms = _iteration_energy(
-                band_energy,
-                e_ion,
+        if converged:
+            rho_energy = rho_out
+        elif isinstance(density_mixer, DistributedBroydenMixer):
+            rho_energy = density_mixer.mix(
+                rho,
                 rho_out,
-                rho_energy,
-                input_hxc,
-                rho_core,
-                pw.reciprocal,
-                pw.volume,
-                mpi,
-                xc_functional,
-                charge_workspace,
-                local_charge_vectors,
-                smearing_energy,
-                reciprocal_grid,
-                real_workspace=real_grid_workspace,
+                residual_coefficients=residual_g_local,
             )
         else:
-            grid_scale = pw.volume / np.prod(shape)
-            deband = -grid_scale * mpi.sum_scalar(
-                float(np.sum(rho_out * input_hxc))
-            )
-            rho_energy_g_local = (
-                charge_workspace.grid_to_coefficients(rho_energy)
-            )
-            vh_energy_g_local = np.zeros_like(rho_energy_g_local)
-            energy_mask = local_charge_g2 > 1.0e-14
-            vh_energy_g_local[energy_mask] = (
-                4.0
-                * np.pi
-                * rho_energy_g_local[energy_mask]
-                / local_charge_g2[energy_mask]
-            )
-            eh = pw.volume * mpi.sum_scalar(
-                0.5
-                * float(
-                    np.real(
-                        np.vdot(
-                            rho_energy_g_local,
-                            vh_energy_g_local,
-                        )
-                    )
-                )
-            )
-            np.add(rho_energy, rho_core, out=real_grid_workspace)
-            epsilon_energy, vxc_energy = _xc_energy_potential(
-                real_grid_workspace,
-                xc_functional,
-                workspace=charge_workspace,
-                g_vectors=local_charge_vectors,
-            )
-            np.multiply(
-                real_grid_workspace,
-                epsilon_energy,
-                out=real_grid_workspace,
-            )
-            exc = grid_scale * mpi.sum_scalar(
-                float(np.sum(real_grid_workspace))
-            )
-            vh_energy = np.ascontiguousarray(
+            rho_energy = density_mixer.mix(rho, rho_out)
+        timers.stop("mix_rho", mix_started)
+        del residual_g_local
+        # The mixer has produced the next input density.  The preceding input
+        # grid is not part of the energy expression below; release it before
+        # XC/Hartree workspaces are allocated rather than carrying eight real
+        # grids through the energy high-water phase.
+        del rho
+        energy_potential_started = timers.start()
+        rho_energy_g_local = charge_workspace.grid_to_coefficients(
+            rho_energy
+        )
+        vh_energy_g_local = np.zeros_like(rho_energy_g_local)
+        _load_native_fft().hartree_coefficients(
+            rho_energy_g_local,
+            local_charge_g2,
+            vh_energy_g_local,
+        )
+        eh = pw.volume * mpi.sum_scalar(
+            0.5
+            * float(
                 np.real(
-                    charge_workspace.coefficients_to_grid(
-                        vh_energy_g_local, use_scratch=True
+                    np.vdot(
+                        rho_energy_g_local,
+                        vh_energy_g_local,
                     )
                 )
             )
-            np.subtract(rho_energy, rho_out, out=input_hxc)
-            np.add(vh_energy, vxc_energy, out=real_grid_workspace)
-            np.multiply(input_hxc, real_grid_workspace, out=input_hxc)
-            descf = -grid_scale * mpi.sum_scalar(
-                float(np.sum(input_hxc))
+        )
+        del rho_energy_g_local
+        np.add(rho_energy, rho_core, out=real_grid_workspace)
+        xc_started = timers.start()
+        epsilon_energy, vxc_energy = _xc_energy_potential(
+            real_grid_workspace,
+            xc_functional,
+            workspace=charge_workspace,
+            g_vectors=local_charge_vectors,
+            need_epsilon=False,
+            energy_density_out=real_grid_workspace,
+        )
+        timers.stop("v_xc", xc_started)
+        assert epsilon_energy is None
+        del epsilon_energy
+        exc = grid_scale * mpi.sum_scalar(
+            float(np.sum(real_grid_workspace))
+        )
+        vh_energy = np.ascontiguousarray(
+            np.real(
+                charge_workspace.coefficients_to_grid(
+                    vh_energy_g_local, use_scratch=True
+                )
             )
-            energy_terms = SCFEnergyTerms(
-                one_electron_ha=band_energy + deband,
-                hartree_ha=eh,
-                xc_ha=exc,
-                ewald_ha=e_ion,
-                descf_ha=descf,
-                smearing_ha=smearing_energy,
+        )
+        del vh_energy_g_local
+        timers.stop("v_of_rho", energy_potential_started)
+        np.add(vh_energy, vxc_energy, out=real_grid_workspace)
+        descf = -grid_scale * mpi.sum_scalar(
+            float(
+                np.einsum("ijk,ijk->", rho_energy, real_grid_workspace)
+                - np.einsum("ijk,ijk->", rho_out, real_grid_workspace)
             )
-            energy = (
-                energy_terms.one_electron_ha
-                + energy_terms.hartree_ha
-                + energy_terms.xc_ha
-                + energy_terms.ewald_ha
-                + energy_terms.descf_ha
-                + energy_terms.smearing_ha
-            )
+        )
+        # The Veff owner is now exactly V_Hxc[rho_energy]. Preserve its native
+        # storage as next iteration's input potential without a copy.
+        input_hxc = real_grid_workspace
+        energy_terms = SCFEnergyTerms(
+            one_electron_ha=band_energy + deband,
+            hartree_ha=eh,
+            xc_ha=exc,
+            ewald_ha=e_ion,
+            descf_ha=descf,
+            smearing_ha=smearing_energy,
+        )
+        energy = (
+            energy_terms.one_electron_ha
+            + energy_terms.hartree_ha
+            + energy_terms.xc_ha
+            + energy_terms.ewald_ha
+            + energy_terms.descf_ha
+            + energy_terms.smearing_ha
+        )
         iteration_density_bytes = (
             3
             * shape[0]
@@ -3308,14 +3273,9 @@ def _run_scf(
             else 0
         )
         iteration_davidson_bytes = (
-            2
-            * (
-                max(sizes)
-                if mpi.size == 1
-                else local_plane_waves
-            )
-            * min(max(sizes), davidson_ndim * nbnd)
-            * 16
+            estimated_workspace
+            if diagonalization == "dense"
+            else solver_bytes
         )
         iteration_fft_scratch_bytes = fft_scratch_pool.nbytes
         iteration_fft_exchange_bytes = mpi.exchange_buffer_bytes
@@ -3379,18 +3339,11 @@ def _run_scf(
                 v_eff_local,
                 input_hxc,
             )
-            if mpi.size > 1:
-                del (
-                    residual_g_local,
-                    error_mask,
-                    rho_energy_g_local,
-                    vh_energy_g_local,
-                    energy_mask,
-                    epsilon_energy,
-                    vxc_energy,
-                    vh_energy,
-                )
-            else:
+            del (
+                vxc_energy,
+                vh_energy,
+            )
+            if mpi.size == 1:
                 del reciprocal_grid, charge_slots, charge_indices
             trim_allocator()
             forces_ha_per_bohr = None
@@ -3558,29 +3511,20 @@ def _run_scf(
         iteration += 1
         # None of these current-output/energy workspaces is an input to the
         # next diagonalization.  Leaving their Python names alive retained two
-        # real grids (and, in MPI, compact energy vectors) until after the next
-        # iteration's memory sample.  QE reuses this storage at the iteration
-        # boundary; release it here and let the shared FFT pool remain the one
-        # intentional grow-only owner.
+        # real grids until after the next iteration's memory sample. QE reuses
+        # this storage at the iteration boundary; release it here and let the
+        # shared FFT pool remain the one intentional grow-only owner.
         del (
             rho_out,
             rho_energy,
             real_grid_workspace,
             v_eff_grid,
             v_eff_local,
-            input_hxc,
         )
-        if mpi.size > 1:
-            del (
-                residual_g_local,
-                error_mask,
-                rho_energy_g_local,
-                vh_energy_g_local,
-                energy_mask,
-                epsilon_energy,
-                vxc_energy,
-                vh_energy,
-            )
+        del (
+            vxc_energy,
+            vh_energy,
+        )
         trim_allocator()
     timers.stop("electrons", electrons_started)
     result_density = mpi.gather_z_slabs_root(rho, shape)

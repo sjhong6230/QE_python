@@ -54,6 +54,13 @@ _PBE_FAMILY_PARAMETERS = {
     "rpbe": (0.804, 0.2195149727645171, 0.06672455060314922, "exponential"),
 }
 
+# Pointwise GGA algebra needs several same-shaped work arrays.  Keeping those
+# arrays proportional to the entire FFT slab made the transient XC high-water
+# mark scale with the charge grid even though every operation is local in real
+# space.  A 32k-point tile fits the active doubles comfortably in cache while
+# remaining large enough that NumPy ufunc dispatch is negligible.
+GGA_POINT_BLOCK_SIZE = 32_768
+
 
 def pw92_unpolarized(
     rho: np.ndarray,
@@ -65,44 +72,65 @@ def pw92_unpolarized(
     PBE; it is intentionally separate from the PZ81 correlation used by the
     LDA path below.
     """
-    density = np.abs(np.asarray(rho, dtype=float))
-    epsilon = np.zeros_like(density)
-    potential = np.zeros_like(density)
+    density = np.abs(np.asarray(rho, dtype=np.float64))
     active = density > 1.0e-10
-    if not np.any(active):
-        return epsilon, potential
+    np.maximum(density, 1.0e-10, out=density)
 
-    n = density[active]
-    rs = 0.6203504908994 / np.cbrt(n)
+    # Evaluate QE's PW92 rational form with a bounded set of reusable arrays.
+    # The names follow the published formula; ``work`` is deliberately reused
+    # between terms so a grid-sized temporary is not created per expression.
+    rs = np.cbrt(density)
+    np.divide(0.6203504908994, rs, out=rs)
     root_rs = np.sqrt(rs)
-    rs32 = rs * root_rs
-    rs2 = rs * rs
+    work = np.empty_like(density)
+    epsilon = np.empty_like(density)
+    potential = np.empty_like(density)
     a = 0.031091
     a1 = 0.21370
-    omega = 2.0 * a * (
-        7.5957 * root_rs
-        + 3.5876 * rs
-        + 1.6382 * rs32
-        + 0.49294 * rs2
-    )
-    domega = 2.0 * a * (
-        0.5 * 7.5957 * root_rs
-        + 3.5876 * rs
-        + 1.5 * 1.6382 * rs32
-        + 2.0 * 0.49294 * rs2
-    )
-    logarithm = np.log1p(1.0 / omega)
-    ec = -2.0 * a * (1.0 + a1 * rs) * logarithm
-    vc = (
-        -2.0 * a * (1.0 + (2.0 / 3.0) * a1 * rs) * logarithm
-        - (2.0 / 3.0)
-        * a
-        * (1.0 + a1 * rs)
-        * domega
-        / (omega * (omega + 1.0))
-    )
-    epsilon[active] = ec
-    potential[active] = vc
+
+    np.multiply(root_rs, 7.5957, out=epsilon)
+    np.multiply(rs, 3.5876, out=work)
+    epsilon += work
+    np.multiply(rs, root_rs, out=work)
+    work *= 1.6382
+    epsilon += work
+    np.square(rs, out=work)
+    work *= 0.49294
+    epsilon += work
+    epsilon *= 2.0 * a  # omega
+
+    np.multiply(root_rs, 0.5 * 7.5957, out=potential)
+    np.multiply(rs, 3.5876, out=work)
+    potential += work
+    np.multiply(rs, root_rs, out=work)
+    work *= 1.5 * 1.6382
+    potential += work
+    np.square(rs, out=work)
+    work *= 2.0 * 0.49294
+    potential += work
+    potential *= 2.0 * a  # d omega / d ln(rs)
+
+    np.reciprocal(epsilon, out=root_rs)
+    np.log1p(root_rs, out=root_rs)
+    np.add(epsilon, 1.0, out=work)
+    work *= epsilon
+    np.divide(potential, work, out=potential)
+    np.multiply(rs, a1, out=work)
+    work += 1.0
+    potential *= work
+    potential *= -(2.0 / 3.0) * a
+    np.multiply(rs, (2.0 / 3.0) * a1, out=work)
+    work += 1.0
+    work *= root_rs
+    work *= -2.0 * a
+    potential += work
+    np.multiply(rs, a1, out=work)
+    work += 1.0
+    work *= root_rs
+    work *= -2.0 * a
+    epsilon[...] = work
+    epsilon[~active] = 0.0
+    potential[~active] = 0.0
     return epsilon, potential
 
 
@@ -133,118 +161,277 @@ def pbe_unpolarized_components(
     rho: np.ndarray,
     gradient: np.ndarray,
     functional: str = "pbe",
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    *,
+    need_epsilon: bool = True,
+    energy_density_out: np.ndarray | None = None,
+) -> tuple[np.ndarray | None, np.ndarray, np.ndarray]:
     """Return PBE-family energy, local potential, and gradient coefficient.
 
     If ``f_xc = rho * epsilon_xc``, the final array is the scalar
     coefficient ``c`` in ``d f_xc / d(grad rho) = c * grad rho``.  Keeping
     this pointwise quantity available lets the SCF driver form both
     ``-div(c grad rho)`` in the potential and QE's analytic GGA stress.
+    If ``need_epsilon`` is false, the first result is ``None``.  Supplying
+    ``energy_density_out`` writes ``rho * epsilon_xc`` directly into that
+    array, allowing the SCF energy path to avoid a full epsilon owner.
     """
-    density = np.abs(np.asarray(rho, dtype=float))
-    gradient = np.asarray(gradient, dtype=float)
+    density_array = np.asarray(rho, dtype=np.float64)
+    gradient_array = np.asarray(gradient, dtype=np.float64)
+    if gradient_array.shape != (3, *density_array.shape):
+        raise ValueError("gradient must have shape (3, *rho.shape)")
     try:
-        kappa, mu, beta, exchange_form = _PBE_FAMILY_PARAMETERS[functional]
+        _PBE_FAMILY_PARAMETERS[functional]
     except KeyError as exc:
         raise ValueError(
             f"unsupported PBE-family functional {functional!r}"
         ) from exc
-    if gradient.shape != (3, *density.shape):
-        raise ValueError("gradient must have shape (3, *rho.shape)")
 
-    epsilon = np.zeros_like(density)
-    local_potential = np.zeros_like(density)
+    energy_density = None
+    if energy_density_out is not None:
+        energy_density = np.asarray(energy_density_out)
+        if energy_density.shape != density_array.shape:
+            raise ValueError("energy_density_out must have rho.shape")
+        if energy_density.dtype != np.float64:
+            raise ValueError("energy_density_out must have dtype float64")
+        if not energy_density.flags.writeable:
+            raise ValueError("energy_density_out must be writeable")
+
+    point_count = density_array.size
+    if point_count <= GGA_POINT_BLOCK_SIZE:
+        epsilon, local_potential, coefficient = (
+            _pbe_unpolarized_components_block(
+                density_array, gradient_array, functional
+            )
+        )
+        if energy_density is not None:
+            np.multiply(density_array, epsilon, out=energy_density)
+        if not need_epsilon:
+            epsilon = None
+        return epsilon, local_potential, coefficient
+
+    # MPI real slabs are frequently moveaxis views.  ``empty_like`` would
+    # preserve those non-C strides, after which reshape(-1) may return a copy
+    # and tile assignments would miss the actual output owner.  Explicit
+    # C-order outputs are also the layout consumed by the following ufuncs.
+    epsilon = (
+        np.empty(density_array.shape, dtype=np.float64, order="C")
+        if need_epsilon
+        else None
+    )
+    local_potential = np.empty(
+        density_array.shape, dtype=np.float64, order="C"
+    )
+    coefficient = np.empty(
+        density_array.shape, dtype=np.float64, order="C"
+    )
+    density_flat = density_array.reshape(-1)
+    gradient_flat = gradient_array.reshape(3, -1)
+    epsilon_flat = None if epsilon is None else epsilon.reshape(-1)
+    # ``flat`` writes through even when the MPI slab is a moveaxis view;
+    # reshape(-1) could silently create a full-grid copy in that case.
+    energy_density_flat = (
+        None if energy_density is None else energy_density.flat
+    )
+    potential_flat = local_potential.reshape(-1)
+    coefficient_flat = coefficient.reshape(-1)
+    for first in range(0, point_count, GGA_POINT_BLOCK_SIZE):
+        last = min(first + GGA_POINT_BLOCK_SIZE, point_count)
+        block_epsilon, block_potential, block_coefficient = (
+            _pbe_unpolarized_components_block(
+                density_flat[first:last],
+                gradient_flat[:, first:last],
+                functional,
+            )
+        )
+        if epsilon_flat is not None:
+            epsilon_flat[first:last] = block_epsilon
+        if energy_density_flat is not None:
+            block_epsilon *= density_flat[first:last]
+            energy_density_flat[first:last] = block_epsilon
+        potential_flat[first:last] = block_potential
+        coefficient_flat[first:last] = block_coefficient
+    return epsilon, local_potential, coefficient
+
+
+def _pbe_unpolarized_components_block(
+    rho: np.ndarray,
+    gradient: np.ndarray,
+    functional: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Evaluate the published PBE-family formula on one real-space tile."""
+    density = np.abs(np.asarray(rho, dtype=np.float64))
+    gradient = np.asarray(gradient, dtype=np.float64)
+    kappa, mu, beta, exchange_form = _PBE_FAMILY_PARAMETERS[functional]
+
+    # Start from Slater exchange plus PW92 local correlation.  Correlation is
+    # retained until the PBE correction below needs ec and vc; the returned
+    # energy and potential are independent copies.
+    correlation, correlation_potential = pw92_unpolarized(density)
+    epsilon = correlation.copy()
+    local_potential = correlation_potential.copy()
     lda_active = density > 1.0e-10
-    if np.any(lda_active):
-        n = density[lda_active]
-        rs = 0.6203504908994 / np.cbrt(n)
-        exchange = (-0.687247939924714 * (2.0 / 3.0)) / rs
-        epsilon[lda_active] = exchange
-        local_potential[lda_active] = (4.0 / 3.0) * exchange
-    ec, vc = pw92_unpolarized(density)
-    epsilon += ec
-    local_potential += vc
+    np.maximum(density, 1.0e-10, out=density)
+    work0 = np.cbrt(density)
+    work0 *= (
+        (-0.687247939924714 * (2.0 / 3.0))
+        / 0.6203504908994
+    )
+    np.add(epsilon, work0, out=epsilon, where=lda_active)
+    work0 *= 4.0 / 3.0
+    np.add(
+        local_potential,
+        work0,
+        out=local_potential,
+        where=lda_active,
+    )
 
-    sigma = np.sum(gradient * gradient, axis=0)
-    gradient_active = (density > 1.0e-6) & (sigma > 1.0e-10)
-    coefficient = np.zeros_like(density)
-    if np.any(gradient_active):
-        n = density[gradient_active]
-        grad = np.sqrt(sigma[gradient_active])
+    # sigma and the active mask are formed without materializing
+    # ``gradient * gradient``.  From here density and sigma are safe n and
+    # |grad n| work arrays; the physical input arrays are not modified.
+    sigma = np.einsum("i...,i...->...", gradient, gradient)
+    gradient_active = density > 1.0e-6
+    np.greater(sigma, 1.0e-10, out=lda_active)
+    np.logical_and(
+        gradient_active,
+        lda_active,
+        out=gradient_active,
+    )
+    np.logical_not(gradient_active, out=lda_active)
+    # PW92 correctly returns zero below its LDA threshold.  PBE does not use
+    # those points, but a benign finite ec keeps the full-grid, mask-free
+    # algebra away from the removable A=beta/[gamma*(exp(-ec/gamma)-1)]
+    # singularity before inactive outputs are reset below.
+    correlation[lda_active] = -0.0310906908696548950
+    correlation_potential[lda_active] = 0.0
+    np.maximum(density, 1.0e-6, out=density)
+    np.maximum(sigma, 1.0e-10, out=sigma)
+    np.sqrt(sigma, out=sigma)  # |grad n|
 
-        # PBE-family exchange correction (QE XClib ``pbex``).
-        kf = 3.093667726280136 * np.cbrt(n)
-        dsg = 0.5 / kf
-        reduced_gradient = grad * dsg / n
-        scaled_gradient = mu * reduced_gradient**2 / kappa
-        if exchange_form == "rational":
-            denominator = 1.0 + scaled_gradient
-            enhancement_correction = kappa - kappa / denominator
-            derivative_enhancement = (
-                2.0 * mu * reduced_gradient / denominator**2
-            )
-        else:
-            exponential = np.exp(-scaled_gradient)
-            enhancement_correction = kappa * (1.0 - exponential)
-            derivative_enhancement = (
-                2.0 * mu * reduced_gradient * exponential
-            )
-        exchange_uniform = -(0.75 / np.pi) * kf
-        exchange_per_particle = exchange_uniform * enhancement_correction
-        v1_exchange = (
-            exchange_per_particle
-            + (exchange_uniform / 3.0) * enhancement_correction
-            - (4.0 / 3.0)
-            * exchange_uniform
-            * derivative_enhancement
-            * reduced_gradient
-        )
-        v2_exchange = (
-            exchange_uniform
-            * derivative_enhancement
-            * dsg
-            / grad
-        )
-        exchange_energy_density = n * exchange_per_particle
+    # PBE-family exchange correction (QE XClib ``pbex``).  Four reusable
+    # arrays carry k_F, s, F_x-1, and the current expression.  This preserves
+    # the published algebra while avoiding one allocation per named scalar.
+    np.cbrt(density, out=work0)
+    work0 *= 3.093667726280136  # k_F
+    work1 = np.multiply(work0, density)
+    work1 *= 2.0
+    np.divide(sigma, work1, out=work1)  # reduced gradient s
+    work2 = np.square(work1)
+    work2 *= mu / kappa
+    work3 = np.empty_like(density)
+    coefficient = np.empty_like(density)
+    if exchange_form == "rational":
+        work2 += 1.0  # 1 + mu*s^2/kappa
+        np.divide(kappa, work2, out=work3)
+        np.subtract(kappa, work3, out=work3)  # F_x - 1
+        np.multiply(work1, 2.0 * mu, out=coefficient)
+        coefficient /= work2
+        coefficient /= work2  # dF_x/ds
+    else:
+        np.negative(work2, out=work2)
+        np.exp(work2, out=work2)
+        np.subtract(1.0, work2, out=work3)
+        work3 *= kappa  # F_x - 1
+        np.multiply(work1, work2, out=coefficient)
+        coefficient *= 2.0 * mu  # dF_x/ds
 
-        # PBE correlation gradient correction (QE XClib ``pbec``, iflag=1).
-        rs = 0.6203504908994 / np.cbrt(n)
-        kf_correlation = 1.919158292677513 / rs
-        ks = 1.128379167095513 * np.sqrt(kf_correlation)
-        t = grad / (2.0 * ks * n)
-        gamma = 0.0310906908696548950
-        ec_active = ec[gradient_active]
-        vc_active = vc[gradient_active]
-        exponential = np.exp(-ec_active / gamma)
-        af = (beta / gamma) / (exponential - 1.0)
-        bf = exponential * (vc_active - ec_active)
-        y = af * t * t
-        y_denominator = 1.0 + y + y * y
-        xy = (1.0 + y) / y_denominator
-        qy = y * y * (2.0 + y) / y_denominator**2
-        logarithm_argument = 1.0 + (beta / gamma) * t * t * xy
-        h0 = gamma * np.log(logarithm_argument)
-        dh0 = beta * t * t / logarithm_argument * (
-            -(7.0 / 3.0) * xy
-            - qy * (af * bf / beta - 7.0 / 3.0)
-        )
-        v2_correlation = (
-            beta
-            / (2.0 * ks * ks * n)
-            * (xy - qy)
-            / logarithm_argument
-        )
-        correlation_energy_density = n * h0
+    # First form v2x, then use v2x*|grad n|^2/n to evaluate the last v1x
+    # term.  This identity lets k_F and dF_x/ds share their buffers.
+    coefficient *= 0.5
+    coefficient /= work0
+    coefficient /= sigma
+    work0 *= -(0.75 / np.pi)  # uniform exchange per particle
+    coefficient *= work0  # v2 exchange
+    np.multiply(work0, work3, out=work2)  # gradient exchange energy / n
+    np.add(epsilon, work2, out=epsilon, where=gradient_active)
+    work3 *= work0
+    work3 /= 3.0
+    work2 += work3
+    np.square(sigma, out=work3)
+    work3 /= density
+    work3 *= coefficient
+    work3 *= 4.0 / 3.0
+    work2 -= work3  # v1 exchange
+    np.add(
+        local_potential,
+        work2,
+        out=local_potential,
+        where=gradient_active,
+    )
 
-        correction_energy_density = (
-            exchange_energy_density + correlation_energy_density
-        )
-        epsilon[gradient_active] += correction_energy_density / n
-        local_potential[gradient_active] += (
-            v1_exchange + h0 + dh0
-        )
-        coefficient[gradient_active] = v2_exchange + v2_correlation
+    # PBE correlation correction (QE XClib ``pbec``, iflag=1).  The arrays
+    # holding ec and vc become A and A*B only after those local quantities have
+    # been consumed, keeping the formula visible without retaining its many
+    # intermediate fields simultaneously.
+    np.cbrt(density, out=work0)
+    np.divide(0.6203504908994, work0, out=work0)  # r_s
+    np.divide(1.919158292677513, work0, out=work1)
+    np.sqrt(work1, out=work1)
+    work1 *= 1.128379167095513  # k_s
+    np.multiply(work1, density, out=work2)
+    work2 *= 2.0
+    np.divide(sigma, work2, out=work2)  # t
+    gamma = 0.0310906908696548950
+    np.divide(correlation, -gamma, out=work3)
+    np.exp(work3, out=work3)  # exp(-ec/gamma)
+    correlation_potential -= correlation
+    correlation_potential *= work3  # B
+    work3 -= 1.0
+    np.divide(beta / gamma, work3, out=correlation)  # A
+    correlation_potential *= correlation  # A*B
+    np.square(work2, out=work0)
+    work0 *= correlation  # y=A*t^2
+    np.square(work0, out=work3)
+    work3 += work0
+    work3 += 1.0  # 1+y+y^2
+    np.add(work0, 1.0, out=correlation)
+    correlation /= work3  # x(y)
+    np.add(work0, 2.0, out=work1)
+    work1 *= work0
+    work1 *= work0
+    np.square(work3, out=work3)
+    work1 /= work3  # q(y)
+    np.square(work2, out=work3)
+    work3 *= beta / gamma
+    work3 *= correlation
+    work3 += 1.0  # logarithm argument
 
+    # dh0 is accumulated in correlation_potential before x and q are reused
+    # for v2c.  k_s is reconstructed below from r_s, which costs one sqrt but
+    # avoids another persistent grid-sized array.
+    correlation_potential /= beta
+    correlation_potential -= 7.0 / 3.0
+    correlation_potential *= work1
+    work0 = np.multiply(correlation, 7.0 / 3.0, out=work0)
+    correlation_potential += work0
+    correlation_potential *= -1.0
+    np.square(work2, out=work0)
+    work0 *= beta
+    work0 /= work3
+    correlation_potential *= work0  # dh0
+
+    correlation -= work1  # x(y)-q(y)
+    np.cbrt(density, out=work0)
+    np.divide(0.6203504908994, work0, out=work0)
+    np.divide(1.919158292677513, work0, out=work0)
+    work0 *= 1.128379167095513**2  # k_s^2
+    work0 *= 2.0
+    work0 *= density
+    work0 *= work3
+    correlation *= beta
+    correlation /= work0  # v2 correlation
+    coefficient += correlation
+
+    np.log(work3, out=work0)
+    work0 *= gamma  # H0
+    np.add(epsilon, work0, out=epsilon, where=gradient_active)
+    work0 += correlation_potential
+    np.add(
+        local_potential,
+        work0,
+        out=local_potential,
+        where=gradient_active,
+    )
+    coefficient[lda_active] = 0.0
     return epsilon, local_potential, coefficient
 
 
@@ -252,19 +439,15 @@ def pw92_lda_unpolarized(
     rho: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return Slater exchange plus PW92 LDA correlation in Hartree."""
-    density = np.abs(np.asarray(rho, dtype=float))
-    epsilon = np.zeros_like(density)
-    potential = np.zeros_like(density)
+    density = np.abs(np.asarray(rho, dtype=np.float64))
+    epsilon, potential = pw92_unpolarized(density)
     active = density > 1.0e-10
-    if np.any(active):
-        n = density[active]
-        rs = 0.6203504908994 / np.cbrt(n)
-        exchange = (-0.687247939924714 * (2.0 / 3.0)) / rs
-        epsilon[active] = exchange
-        potential[active] = (4.0 / 3.0) * exchange
-    correlation, correlation_potential = pw92_unpolarized(density)
-    epsilon += correlation
-    potential += correlation_potential
+    np.maximum(density, 1.0e-10, out=density)
+    exchange = np.cbrt(density)
+    exchange *= (-0.687247939924714 * (2.0 / 3.0)) / 0.6203504908994
+    np.add(epsilon, exchange, out=epsilon, where=active)
+    exchange *= 4.0 / 3.0
+    np.add(potential, exchange, out=potential, where=active)
     return epsilon, potential
 
 
@@ -274,36 +457,65 @@ def pz81_unpolarized(
     """Return (epsilon_xc, v_xc) in Hartree for an unpolarized density."""
     # Match QE's XClib LDA driver: it evaluates the functional at |rho|,
     # and returns exactly zero below rho_threshold_lda.
-    density = np.abs(np.asarray(rho, dtype=float))
-    epsilon_xc = np.zeros_like(density)
-    potential_xc = np.zeros_like(density)
+    density = np.abs(np.asarray(rho, dtype=np.float64))
     active = density > 1.0e-10
-    if not np.any(active):
-        return epsilon_xc, potential_xc
+    np.maximum(density, 1.0e-10, out=density)
+    rs = np.cbrt(density)
+    np.divide(0.6203504908994, rs, out=rs)
+    epsilon_xc = np.divide(
+        -0.687247939924714 * (2.0 / 3.0), rs
+    )
+    potential_xc = (4.0 / 3.0) * epsilon_xc
+    low_density_rs = rs < 1.0
+    work = np.empty_like(density)
+    auxiliary = np.empty_like(density)
 
-    active_density = density[active]
-    # These deliberately retain the decimal constants used by QE rather than
-    # recomputing them from pi, which changes the last few XC digits.
-    rs = 0.6203504908994 / np.cbrt(active_density)
-    ex = (-0.687247939924714 * (2.0 / 3.0)) / rs
-    vx = (4.0 / 3.0) * ex
-    ec = np.empty_like(rs)
-    vc = np.empty_like(rs)
-    high = rs >= 1.0
-    low = ~high
-    if np.any(low):
-        r = rs[low]
-        a, b, c, d = 0.0311, -0.048, 0.0020, -0.0116
-        ec[low] = a * np.log(r) + b + c * r * np.log(r) + d * r
-        derivative = a / r + c * (np.log(r) + 1.0) + d
-        vc[low] = ec[low] - r * derivative / 3.0
-    if np.any(high):
-        r = rs[high]
-        gamma, beta1, beta2 = -0.1423, 1.0529, 0.3334
-        denominator = 1.0 + beta1 * np.sqrt(r) + beta2 * r
-        ec[high] = gamma / denominator
-        derivative = -gamma * (0.5 * beta1 / np.sqrt(r) + beta2) / denominator**2
-        vc[high] = ec[high] - r * derivative / 3.0
-    epsilon_xc[active] = ex + ec
-    potential_xc[active] = vx + vc
+    # High-density branch (rs < 1): Perdew-Zunger logarithmic form.
+    np.log(rs, out=density)
+    np.multiply(density, 0.0311, out=work)
+    work -= 0.048
+    np.multiply(rs, density, out=auxiliary)
+    auxiliary *= 0.0020
+    work += auxiliary
+    np.multiply(rs, -0.0116, out=auxiliary)
+    work += auxiliary
+    np.add(epsilon_xc, work, out=epsilon_xc, where=low_density_rs)
+    np.add(potential_xc, work, out=potential_xc, where=low_density_rs)
+    np.add(density, 1.0, out=auxiliary)
+    auxiliary *= 0.0020
+    auxiliary -= 0.0116
+    auxiliary *= rs
+    auxiliary += 0.0311
+    auxiliary /= 3.0
+    np.subtract(
+        potential_xc,
+        auxiliary,
+        out=potential_xc,
+        where=low_density_rs,
+    )
+
+    # Low-density branch (rs >= 1): rational Perdew-Zunger form.
+    np.sqrt(rs, out=density)
+    np.multiply(density, 1.0529, out=work)
+    work += 1.0
+    np.multiply(rs, 0.3334, out=auxiliary)
+    work += auxiliary  # denominator
+    np.divide(-0.1423, work, out=auxiliary)
+    np.add(epsilon_xc, auxiliary, out=epsilon_xc, where=~low_density_rs)
+    np.add(potential_xc, auxiliary, out=potential_xc, where=~low_density_rs)
+    np.reciprocal(density, out=auxiliary)
+    auxiliary *= 0.5 * 1.0529
+    auxiliary += 0.3334
+    auxiliary *= rs
+    auxiliary *= -0.1423 / 3.0
+    np.square(work, out=work)
+    auxiliary /= work
+    np.add(
+        potential_xc,
+        auxiliary,
+        out=potential_xc,
+        where=~low_density_rs,
+    )
+    epsilon_xc[~active] = 0.0
+    potential_xc[~active] = 0.0
     return epsilon_xc, potential_xc

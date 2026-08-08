@@ -3,7 +3,10 @@
 ``PlainBroydenMixer`` follows the algebra in QE ``PW/src/mix_rho.f90`` for
 the ``plain``, ``TF``, and ``local-TF`` mixing modes. Despite the historical
 name, this is a multisecant modified-Broyden/Anderson method, not simple
-linear mixing.
+linear mixing.  A Pulay frequency greater than one implements periodic
+Pulay: history is collected on every step, while multisecant extrapolation
+is used only periodically and intervening steps use preconditioned linear
+mixing.
 """
 
 from __future__ import annotations
@@ -17,6 +20,8 @@ from .basis import LocalPotentialWorkspace
 
 
 _MIXING_MODES = {"plain", "tf", "local-tf"}
+_LOCAL_TF_SUBSPACE = 12
+_LOCAL_TF_MAX_REFRESHES = 4
 
 
 def _normalise_mixing_mode(mode: str) -> str:
@@ -30,11 +35,15 @@ def _normalise_mixing_mode(mode: str) -> str:
     return normalised
 
 
-def _validate_mixing_controls(beta: float, ndim: int) -> None:
+def _validate_mixing_controls(
+    beta: float, ndim: int, pulay_frequency: int = 1
+) -> None:
     if not np.isfinite(beta) or not 0.0 < beta <= 1.0:
         raise ValueError("mixing_beta must satisfy 0 < mixing_beta <= 1")
     if ndim < 1 or ndim > 25:
         raise ValueError("mixing_ndim must be between 1 and 25")
+    if pulay_frequency < 1:
+        raise ValueError("mixing_pulay_frequency must be at least 1")
 
 
 def _thomas_fermi_g2(nelec: float, volume: float) -> float:
@@ -71,68 +80,95 @@ def _local_thomas_fermi_direction(
     average_rs = points / inverse_rs
     screening_g2 = (12.0 / np.pi) ** (2.0 / 3.0) / average_rs
     alpha = local_rs * (3.0 * (2.0 * np.pi / 3.0) ** (5.0 / 3.0))
+    real_workspace = absolute_density
 
     def multiply_by_alpha(vector: np.ndarray) -> np.ndarray:
         real = coefficients_to_grid(vector)
+        np.multiply(np.real(real), alpha, out=real_workspace)
         return np.asarray(
-            grid_to_coefficients(alpha * np.real(real)),
-            dtype=np.complex128,
-        ).copy()
+            grid_to_coefficients(real_workspace), dtype=np.complex128
+        )
+
+    metric_weights = np.zeros_like(g2, dtype=float)
+    metric_weights[active] = 1.0 / g2[active]
+    metric_workspace = np.empty_like(residual)
 
     def metric(left: np.ndarray, right: np.ndarray) -> float:
-        local = np.sum(
-            np.conj(left[active]) * right[active] / g2[active]
-        )
+        np.multiply(right, metric_weights, out=metric_workspace)
+        local = np.vdot(left, metric_workspace)
         return mpi.sum_scalar(float(np.real(local)))
 
     alpha_residual = multiply_by_alpha(residual)
     source = g2 * alpha_residual
     direction = alpha_residual * g2 / (g2 + screening_g2)
     direction[g2 <= 1.0e-14] = 0.0
-    best_direction = direction.copy()
+    best_direction = np.empty_like(residual)
+    remainder = np.empty_like(residual)
     target: float | None = None
     refreshes = 0
-    vectors: list[np.ndarray] = []
-    images: list[np.ndarray] = []
-    while refreshes < 4:
-        image = 4.0 * np.pi * direction + g2 * multiply_by_alpha(direction)
-        vectors.append(direction.copy())
-        images.append(image)
-        size = len(vectors)
-        gram = np.empty((size, size), dtype=float)
-        projection = np.empty(size, dtype=float)
-        for row in range(size):
-            projection[row] = metric(images[row], source)
-            for column in range(row + 1):
-                value = metric(images[row], images[column])
-                gram[row, column] = value
-                gram[column, row] = value
+    vectors = np.empty(
+        (_LOCAL_TF_SUBSPACE, residual.size), dtype=np.complex128
+    )
+    images = np.empty_like(vectors)
+    gram = np.empty(
+        (_LOCAL_TF_SUBSPACE, _LOCAL_TF_SUBSPACE), dtype=float
+    )
+    projection = np.empty(_LOCAL_TF_SUBSPACE, dtype=float)
+    size = 0
+    while True:
+        vectors[size] = direction
+        # QE works in Rydberg atomic units, where e2=2. Its local-TF
+        # operator is therefore 4*pi*e2 + G^2*alpha = 8*pi + G^2*alpha.
+        np.multiply(direction, 8.0 * np.pi, out=images[size])
+        np.multiply(
+            multiply_by_alpha(direction),
+            g2,
+            out=metric_workspace,
+        )
+        images[size] += metric_workspace
+
+        # Only the new row/column changes. QE likewise retains the previous
+        # aa/bb entries instead of rebuilding the full Gram matrix at every
+        # inner iteration.
+        projection[size] = metric(images[size], source)
+        for row in range(size + 1):
+            value = metric(images[row], images[size])
+            gram[row, size] = value
+            gram[size, row] = value
+        dimension = size + 1
         try:
-            coefficients = np.linalg.solve(gram, projection)
+            coefficients = np.linalg.solve(
+                gram[:dimension, :dimension], projection[:dimension]
+            )
         except np.linalg.LinAlgError:
             coefficients = np.linalg.lstsq(
-                gram, projection, rcond=1.0e-14
+                gram[:dimension, :dimension],
+                projection[:dimension],
+                rcond=1.0e-14,
             )[0]
-        best_direction = np.zeros_like(residual)
-        remainder = source.copy()
-        for coefficient, vector, vector_image in zip(
-            coefficients, vectors, images
-        ):
-            best_direction += coefficient * vector
-            remainder -= coefficient * vector_image
+        best_direction.fill(0.0)
+        remainder[...] = source
+        for index, coefficient in enumerate(coefficients):
+            best_direction += coefficient * vectors[index]
+            remainder -= coefficient * images[index]
         remainder_norm = metric(remainder, remainder)
         if target is None:
             target = max(1.0e-12, 1.0e-6 * remainder_norm)
-        if remainder_norm <= target:
+        if remainder_norm < target or (
+            dimension >= _LOCAL_TF_SUBSPACE
+            and refreshes >= _LOCAL_TF_MAX_REFRESHES
+        ):
             return best_direction
-        if size == 12:
+        if dimension >= _LOCAL_TF_SUBSPACE:
             refreshes += 1
-            vectors.clear()
-            images.clear()
-            direction = best_direction.copy()
+            direction[...] = best_direction
+            size = 0
         else:
-            direction = remainder / (g2 + screening_g2)
+            np.divide(
+                remainder, g2 + screening_g2, out=direction
+            )
             direction[g2 <= 1.0e-14] = 0.0
+            size += 1
     # QE uses the best accumulated direction after the bounded inner solve.
     return best_direction
 
@@ -144,6 +180,7 @@ class _HistoryBuffer(Sequence[np.ndarray]):
         self.capacity = int(capacity)
         self._storage: np.ndarray | None = None
         self._count = 0
+        self._next = 0
 
     def append(self, value: np.ndarray) -> None:
         array = np.asarray(value, dtype=np.complex128)
@@ -156,13 +193,13 @@ class _HistoryBuffer(Sequence[np.ndarray]):
         if self._count < self.capacity:
             self._storage[self._count] = array
             self._count += 1
+            self._next = self._count % self.capacity
             return
-        # Preserve QE/deque's chronological ordering, and copy one row at a
-        # time so an overlapping whole-array assignment cannot allocate a
-        # second history-sized temporary.
-        for row in range(self.capacity - 1):
-            self._storage[row] = self._storage[row + 1]
-        self._storage[-1] = array
+        # QE overwrites one cyclic history slot. The multisecant equations do
+        # not depend on chronological row ordering, so avoid shifting every
+        # stored G-vector once per SCF iteration.
+        self._storage[self._next] = array
+        self._next = (self._next + 1) % self.capacity
 
     @property
     def array(self) -> np.ndarray:
@@ -213,11 +250,14 @@ class PlainBroydenMixer:
         mode: str = "plain",
         nelec: float | None = None,
         volume: float | None = None,
+        pulay_frequency: int = 1,
     ) -> None:
-        _validate_mixing_controls(beta, ndim)
+        _validate_mixing_controls(beta, ndim, pulay_frequency)
         self.shape = shape
         self.beta = float(beta)
         self.ndim = int(ndim)
+        self.pulay_frequency = int(pulay_frequency)
+        self.mixing_step = 0
         self.mpi = mpi if mpi is not None else MPIContext()
         self.mode = _normalise_mixing_mode(mode)
         self.screening_g2 = (
@@ -239,6 +279,12 @@ class PlainBroydenMixer:
         active_slab = self.mpi.slab(len(all_active))
         self.active = all_active[active_slab]
         self.active_g2 = self.g2.ravel()[self.active].copy()
+        self.tf_factor = (
+            self.active_g2
+            / (self.active_g2 + self.screening_g2)
+            if self.mode == "tf"
+            else None
+        )
         self.delta_inputs = _HistoryBuffer(self.ndim)
         self.delta_residuals = _HistoryBuffer(self.ndim)
         self.previous_input: np.ndarray | None = None
@@ -257,6 +303,7 @@ class PlainBroydenMixer:
 
     def mix(self, density_in: np.ndarray, density_out: np.ndarray) -> np.ndarray:
         """Return the next input density and append the current secant pair."""
+        self.mixing_step += 1
         normalization = np.prod(self.shape)
         current = np.fft.fftn(density_in) / normalization
         residual = np.fft.fftn(density_out) / normalization
@@ -273,7 +320,10 @@ class PlainBroydenMixer:
             self.delta_residuals.append(
                 self.previous_residual - residual_active
             )
-        if self.delta_inputs:
+        if (
+            self.delta_inputs
+            and self.mixing_step % self.pulay_frequency == 0
+        ):
             delta_inputs = self.delta_inputs.array
             delta_residuals = self.delta_residuals.array
             projection, gram = _broyden_projection_and_gram(
@@ -294,16 +344,20 @@ class PlainBroydenMixer:
             current_active -= gamma @ delta_inputs
             residual_active -= gamma @ delta_residuals
         if self.mode == "tf":
-            assert self.screening_g2 is not None
-            residual_active *= self.active_g2 / (
-                self.active_g2 + self.screening_g2
-            )
+            assert self.tf_factor is not None
+            residual_active *= self.tf_factor
         elif self.mode == "local-tf":
             full_residual = np.zeros_like(residual)
             full_residual.ravel()[self.active] = residual_active
+            projected_input = self.mpi.gather_flat_chunks(
+                current_active, len(self.all_active)
+            )
+            best_current = current.copy()
+            best_current.ravel()[self.all_active] = projected_input
+            best_density = np.fft.ifftn(best_current * normalization)
             screened = _local_thomas_fermi_direction(
                 full_residual.ravel(),
-                density_in,
+                np.real(best_density),
                 self.g2.ravel(),
                 self.all_active,
                 self.mpi,
@@ -356,14 +410,17 @@ class DistributedBroydenMixer:
         mode: str = "plain",
         nelec: float | None = None,
         volume: float | None = None,
+        pulay_frequency: int = 1,
     ) -> None:
-        _validate_mixing_controls(beta, ndim)
+        _validate_mixing_controls(beta, ndim, pulay_frequency)
         if g2_cutoff is not None and g2_cutoff <= 0.0:
             raise ValueError("charge-density cutoff must be positive")
         self.workspace = workspace
         self.mpi = workspace.mpi
         self.beta = float(beta)
         self.ndim = int(ndim)
+        self.pulay_frequency = int(pulay_frequency)
+        self.mixing_step = 0
         self.mode = _normalise_mixing_mode(mode)
         self.screening_g2 = (
             None
@@ -376,6 +433,12 @@ class DistributedBroydenMixer:
             active &= self.local_g2 <= g2_cutoff + 1.0e-12
         self.active = np.flatnonzero(active)
         self.active_g2 = self.local_g2[self.active]
+        self.tf_factor = (
+            self.active_g2
+            / (self.active_g2 + self.screening_g2)
+            if self.mode == "tf"
+            else None
+        )
         self.delta_inputs = _HistoryBuffer(self.ndim)
         self.delta_residuals = _HistoryBuffer(self.ndim)
         self.previous_input: np.ndarray | None = None
@@ -387,10 +450,30 @@ class DistributedBroydenMixer:
         )
         return self.mpi.sum_scalar(local)
 
-    def mix(self, density_in: np.ndarray, density_out: np.ndarray) -> np.ndarray:
+    def mix(
+        self,
+        density_in: np.ndarray,
+        density_out: np.ndarray,
+        *,
+        residual_coefficients: np.ndarray | None = None,
+    ) -> np.ndarray:
+        self.mixing_step += 1
+        # grid_to_coefficients returns a writable compact owner (advanced
+        # sparse extraction in MPI, native compact output in serial).  Copying
+        # it here briefly doubled a charge-G vector immediately before the
+        # already memory-intensive Broyden update.
         current = self.workspace.grid_to_coefficients(density_in)
-        residual = self.workspace.grid_to_coefficients(density_out)
-        residual -= current
+        if residual_coefficients is None:
+            residual = self.workspace.grid_to_coefficients(density_out)
+            residual -= current
+        else:
+            residual = np.asarray(
+                residual_coefficients, dtype=np.complex128
+            )
+            if residual.shape != current.shape:
+                raise ValueError(
+                    "precomputed density residual has the wrong shape"
+                )
         current_active = current[self.active].copy()
         residual_active = residual[self.active].copy()
         saved_input = current_active.copy()
@@ -400,7 +483,10 @@ class DistributedBroydenMixer:
             self.delta_residuals.append(
                 self.previous_residual - residual_active
             )
-        if self.delta_inputs:
+        if (
+            self.delta_inputs
+            and self.mixing_step % self.pulay_frequency == 0
+        ):
             delta_inputs = self.delta_inputs.array
             delta_residuals = self.delta_residuals.array
             projection, gram = _broyden_projection_and_gram(
@@ -418,20 +504,24 @@ class DistributedBroydenMixer:
             current_active -= gamma @ delta_inputs
             residual_active -= gamma @ delta_residuals
         if self.mode == "tf":
-            assert self.screening_g2 is not None
-            residual_active *= self.active_g2 / (
-                self.active_g2 + self.screening_g2
-            )
+            assert self.tf_factor is not None
+            residual_active *= self.tf_factor
         elif self.mode == "local-tf":
             full_residual = np.zeros_like(residual)
             full_residual[self.active] = residual_active
+            current[self.active] = current_active
+            best_density = self.workspace.coefficients_to_grid(
+                current, use_scratch=True
+            )
             screened = _local_thomas_fermi_direction(
                 full_residual,
-                density_in,
+                np.real(best_density),
                 self.local_g2,
                 self.active,
                 self.mpi,
-                self.workspace.coefficients_to_grid,
+                lambda coefficients: self.workspace.coefficients_to_grid(
+                    coefficients, use_scratch=True
+                ),
                 self.workspace.grid_to_coefficients,
             )
             residual_active = screened[self.active]

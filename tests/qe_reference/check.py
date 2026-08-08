@@ -80,6 +80,14 @@ def extract_pw(text: str) -> dict[str, Any]:
         bands.extend(point_values[:5])
     if bands:
         values["bands_ev"] = bands
+    diagonalization_iterations = re.findall(
+        rf"avg # of iterations\s*=\s*({_FLOAT})", text
+    )
+    if diagonalization_iterations:
+        values["diagonalization_iterations"] = [
+            float(value.replace("D", "E").replace("d", "e"))
+            for value in diagonalization_iterations
+        ]
     return values
 
 
@@ -148,10 +156,12 @@ def verify_pseudos(manifest: dict[str, Any]) -> None:
             raise RuntimeError(f"checksum mismatch for {name}: {digest}")
 
 
-def generate_references() -> None:
+def generate_references(case_ids: set[str] | None = None) -> None:
     manifest = load_manifest()
     verify_pseudos(manifest)
     for case in manifest["cases"]:
+        if case_ids is not None and case["id"] not in case_ids:
+            continue
         output, _ = run_case(case)
         target = reference_path(case)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -161,8 +171,14 @@ def generate_references() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.parse_args(argv)
-    generate_references()
+    parser.add_argument(
+        "--case",
+        action="append",
+        dest="cases",
+        help="regenerate only this manifest case (repeatable)",
+    )
+    arguments = parser.parse_args(argv)
+    generate_references(set(arguments.cases) if arguments.cases else None)
     return 0
 
 

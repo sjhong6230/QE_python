@@ -215,6 +215,10 @@ def _input_xml(root: ET.Element, pw: PWInput, result: SCFResult) -> None:
         ("mixing_beta", pw.electrons.get("mixing_beta", 0.7)),
         ("conv_thr", pw.electrons.get("conv_thr", 1.0e-6)),
         ("mixing_ndim", pw.electrons.get("mixing_ndim", 8)),
+        (
+            "mixing_pulay_frequency",
+            pw.electrons.get("mixing_pulay_frequency", 1),
+        ),
         ("max_nstep", pw.electrons.get("electron_maxstep", 100)),
         ("tq_smoothing", False),
         ("tbeta_smoothing", False),
@@ -466,6 +470,30 @@ def _xml_vector(root: ET.Element, path: str) -> np.ndarray:
     return np.fromstring(element.text, sep=" ")
 
 
+def _miller_row_indices(
+    saved_miller: np.ndarray, requested_miller: np.ndarray
+) -> np.ndarray:
+    """Map requested Miller rows without a Python tuple dictionary."""
+    saved = np.ascontiguousarray(saved_miller, dtype=np.int32)
+    requested = np.ascontiguousarray(requested_miller, dtype=np.int32)
+    if saved.ndim != 2 or saved.shape[1] != 3:
+        raise QEInputError("saved Miller indices have an invalid shape")
+    if requested.ndim != 2 or requested.shape[1] != 3:
+        raise QEInputError("requested Miller indices have an invalid shape")
+    key_dtype = np.dtype([("x", "<i4"), ("y", "<i4"), ("z", "<i4")])
+    saved_keys = saved.view(key_dtype).reshape(-1)
+    requested_keys = requested.view(key_dtype).reshape(-1)
+    sorting = np.argsort(saved_keys, order=("x", "y", "z"))
+    sorted_keys = saved_keys[sorting]
+    positions = np.searchsorted(sorted_keys, requested_keys)
+    if np.any(positions >= len(sorted_keys)):
+        raise QEInputError("saved Miller indices do not cover the current basis")
+    order = sorting[positions]
+    if not np.array_equal(saved[order], requested):
+        raise QEInputError("saved Miller indices do not match the current basis")
+    return order
+
+
 def validate_restart_metadata(
     pw: PWInput,
     shape: tuple[int, int, int],
@@ -564,6 +592,49 @@ def read_saved_density(
     return density
 
 
+def read_saved_density_coefficients(
+    pw: PWInput,
+    current_miller: np.ndarray,
+) -> np.ndarray:
+    """Read saved density directly onto a compact current G-vector basis."""
+    path = resolve_save_directory(pw) / "charge-density.hdf5"
+    if not path.is_file():
+        raise QEInputError(f"startingpot='file' requires {path}")
+    h5py = _hdf5_module()
+    try:
+        with h5py.File(path, "r") as h5:
+            saved_miller = np.asarray(
+                h5["MillerIndices"][:], dtype=np.int32
+            )
+            coefficients = np.asarray(
+                h5["rhotot_g"][:], dtype=np.complex128
+            )
+            gamma_only = _attribute_bool(
+                h5.attrs.get("gamma_only", False)
+            )
+            nspin = int(h5.attrs.get("nspin", 1))
+    except (OSError, KeyError, ValueError) as exc:
+        raise QEInputError(f"cannot read saved charge density {path}: {exc}") from exc
+    if nspin != 1 or saved_miller.shape != (len(coefficients), 3):
+        raise QEInputError("saved charge density has an unsupported layout")
+
+    requested = np.ascontiguousarray(current_miller, dtype=np.int32).copy()
+    conjugate = np.zeros(len(requested), dtype=bool)
+    if gamma_only:
+        gx, gy, gz = requested.T
+        stored_half = (gz > 0) | ((gz == 0) & (gy > 0)) | (
+            (gz == 0) & (gy == 0) & (gx >= 0)
+        )
+        conjugate = ~stored_half
+        requested[conjugate] *= -1
+    order = _miller_row_indices(saved_miller, requested)
+    result = coefficients[order]
+    result[conjugate] = np.conjugate(result[conjugate])
+    if not np.all(np.isfinite(result)):
+        raise QEInputError(f"saved charge density {path} contains non-finite values")
+    return result
+
+
 def read_saved_wavefunction(
     pw: PWInput,
     kpoint_index: int,
@@ -578,7 +649,7 @@ def read_saved_wavefunction(
     h5py = _hdf5_module()
     try:
         with h5py.File(path, "r") as h5:
-            saved_miller = np.asarray(h5["MillerIndices"][:], dtype=np.int64)
+            saved_miller = np.asarray(h5["MillerIndices"][:], dtype=np.int32)
             if int(h5.attrs.get("ik", -1)) != kpoint_index + 1:
                 raise QEInputError(f"saved wavefunction k-point index is wrong in {path}")
             saved_xk = np.asarray(h5.attrs.get("xk", []), dtype=float)
@@ -597,18 +668,20 @@ def read_saved_wavefunction(
                 raise QEInputError("Gamma-packed saved wavefunctions are not supported")
             if h5["evc"].shape != (number_of_bands, len(saved_miller)):
                 raise QEInputError("saved wavefunction coefficient dimensions are inconsistent")
-            lookup = {tuple(row): i for i, row in enumerate(saved_miller)}
-            try:
-                order = np.asarray([lookup[tuple(row)] for row in current_miller], dtype=int)
-            except KeyError as exc:
-                raise QEInputError(
-                    f"saved wavefunction Miller indices do not match k point {kpoint_index + 1}"
-                ) from exc
-            if len(lookup) != len(current_miller):
+            if len(saved_miller) != len(current_miller):
                 raise QEInputError(
                     f"saved wavefunction basis size does not match k point {kpoint_index + 1}"
                 )
+            try:
+                order = _miller_row_indices(saved_miller, current_miller)
+            except QEInputError as exc:
+                raise QEInputError(
+                    f"saved wavefunction Miller indices do not match k point "
+                    f"{kpoint_index + 1}"
+                ) from exc
+            del saved_miller
             selected = order if local_rows is None else order[np.asarray(local_rows)]
+            del order
             # h5py requires increasing fancy indices; read bands one by one and
             # restore the requested current-basis ordering afterward.
             sorting = np.argsort(selected)
@@ -899,7 +972,8 @@ def write_qe_save(
 
 
 __all__ = [
-    "QES_NAMESPACE", "read_saved_density", "read_saved_wavefunction",
+    "QES_NAMESPACE", "read_saved_density", "read_saved_density_coefficients",
+    "read_saved_wavefunction",
     "resolve_save_directory", "saving_enabled", "validate_restart_metadata",
     "write_qe_save",
 ]

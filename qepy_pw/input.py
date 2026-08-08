@@ -19,7 +19,8 @@ import warnings
 import numpy as np
 
 from .constants import BOHR_PER_ANGSTROM, TWO_PI
-from .errors import QEInputError, UnsupportedFeatureError
+from .errors import QEInputError, QEWarning, UnsupportedFeatureError, not_implemented
+from .qe_input_schema import QE_NAMELIST_VARIABLES
 from .xc import canonical_xc_name
 from .symmetry import (
     SymmetryOperation,
@@ -30,6 +31,75 @@ from .symmetry import (
 
 _NAMELISTS = {"control", "system", "electrons", "ions", "cell"}
 _CARDS = {"ATOMIC_SPECIES", "ATOMIC_POSITIONS", "K_POINTS", "CELL_PARAMETERS", "OCCUPATIONS"}
+
+# Variables that affect the implemented scalar-SCF path.  Rejecting every
+# other explicitly supplied variable is intentional: silently accepting a QE
+# option whose physics is absent is substantially more dangerous than failing
+# with a precise "not implemented" diagnostic.
+_IMPLEMENTED_NAMELIST_VARIABLES = {
+    "control": {
+        "title", "calculation", "verbosity", "restart_mode", "tstress",
+        "tprnfor", "outdir", "prefix", "pseudo_dir", "disk_io", "iprint",
+    },
+    "system": {
+        "ibrav", "celldm", "a", "b", "c", "cosab", "cosac", "cosbc",
+        "nat", "ntyp", "nbnd", "ecutwfc", "ecutrho", "nosym",
+        "nosym_evc", "noinv", "use_all_frac", "force_symmorphic",
+        "starting_charge", "occupations", "degauss", "smearing", "input_dft",
+        "nspin", "noncolin", "lda_plus_u", "lspinorb", "tot_charge",
+        "space_group", "uniqueb", "origin_choice", "rhombohedral",
+    },
+    "electrons": {
+        "electron_maxstep", "mixing_mode", "mixing_beta", "mixing_ndim",
+        "mixing_pulay_frequency", "diagonalization", "startingpot",
+        "startingwfc", "conv_thr", "diago_thr_init", "diago_cg_maxiter",
+        "diago_david_ndim", "diago_rmm_ndim", "diago_rmm_conv",
+        "diago_gs_nblock", "diago_full_acc",
+    },
+    "ions": set(),
+    "cell": set(),
+}
+
+
+def _namelist_key_base(key: str) -> str:
+    return key.split("(", 1)[0].strip().lower()
+
+
+def _reject_unimplemented_variables(
+    namelists: dict[str, dict[str, Any]],
+) -> None:
+    for name, values in namelists.items():
+        implemented = _IMPLEMENTED_NAMELIST_VARIABLES[name]
+        for key in values:
+            base = _namelist_key_base(key)
+            if base in implemented:
+                continue
+            if name in QE_NAMELIST_VARIABLES and base not in QE_NAMELIST_VARIABLES[name]:
+                raise QEInputError(
+                    f"bad line in namelist &{name.upper()}: unknown variable '{key}'",
+                    routine="read_namelists",
+                )
+            else:
+                raise UnsupportedFeatureError(
+                    not_implemented(f"&{name.upper()} variable '{key}'"),
+                    routine="iosys",
+                )
+
+
+def _input_number(
+    values: dict[str, Any],
+    key: str,
+    default: Any,
+    conversion: type[float] | type[int],
+    namelist: str,
+) -> float | int:
+    try:
+        return conversion(values.get(key, default))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise QEInputError(
+            f"bad line in namelist &{namelist.upper()}: invalid value for '{key}'",
+            routine="read_namelists",
+        ) from exc
 
 
 @dataclass(frozen=True)
@@ -76,7 +146,7 @@ class PWInput:
         )
     )
     source: str = "<stdin>"
-    warnings: list[str] = field(default_factory=list)
+    warnings: list[QEWarning] = field(default_factory=list)
 
     @property
     def volume(self) -> float:
@@ -173,19 +243,35 @@ def _parse_namelists(lines: list[str]) -> tuple[dict[str, dict[str, Any]], list[
             continue
         if clean.startswith("&"):
             name = clean[1:].split()[0].lower()
+            if name not in _NAMELISTS:
+                raise UnsupportedFeatureError(
+                    not_implemented(f"namelist &{name.upper()}"),
+                    routine="read_namelists",
+                )
+            if name in result:
+                raise QEInputError(
+                    f"two occurrences of namelist &{name.upper()}",
+                    routine="read_namelists",
+                )
             body = clean[len(name) + 1 :]
             terminator = _namelist_terminator(body)
             while terminator is None:
                 i += 1
                 if i >= len(lines):
-                    raise QEInputError(f"unterminated &{name} namelist")
+                    raise QEInputError(
+                        f"unterminated &{name} namelist",
+                        routine="read_namelists",
+                    )
                 body += "\n" + _strip_comment(lines[i])
                 terminator = _namelist_terminator(body)
             body = body[:terminator]
             values: dict[str, Any] = {}
             for assignment in _split_assignments(body):
                 if "=" not in assignment:
-                    continue
+                    raise QEInputError(
+                        f"bad line in namelist &{name.upper()}: {assignment}",
+                        routine="read_namelists",
+                    )
                 key, raw = assignment.split("=", 1)
                 values[key.strip().lower()] = _value(raw)
             result[name] = values
@@ -520,7 +606,9 @@ def _lattice(system: dict[str, Any], cards: dict[str, tuple[str, list[str]]]) ->
     alat = celldm_1
     if ibrav == 0:
         if "CELL_PARAMETERS" not in cards:
-            raise QEInputError("ibrav=0 requires CELL_PARAMETERS")
+            raise QEInputError(
+                "ibrav=0 requires CELL_PARAMETERS", routine="cell_base_init"
+            )
         option, rows = cards["CELL_PARAMETERS"]
         if len(rows) < 3:
             raise QEInputError("CELL_PARAMETERS requires three vectors")
@@ -537,7 +625,9 @@ def _lattice(system: dict[str, Any], cards: dict[str, tuple[str, list[str]]]) ->
             raise QEInputError(f"unknown CELL_PARAMETERS unit {option!r}")
         return cell, alat or float(np.linalg.norm(cell[0]))
     if not alat:
-        raise QEInputError("ibrav /= 0 requires celldm(1) or A")
+        raise QEInputError(
+            "invalid lattice parameters ( celldm or a )", routine="iosys"
+        )
     def _length(name: str, celldm_index: int, default: float) -> float:
         """Read QE's Angstrom length or its dimensionless celldm ratio."""
         if name in system:
@@ -637,6 +727,15 @@ def _collect_cards(lines: list[str], system: dict[str, Any]) -> dict[str, tuple[
         if name not in _CARDS:
             i += 1
             continue
+        if name in result:
+            routine = {
+                "ATOMIC_SPECIES": "card_atomic_species",
+                "ATOMIC_POSITIONS": "card_atomic_positions",
+                "K_POINTS": "card_kpoints",
+                "CELL_PARAMETERS": "card_cell_parameters",
+                "OCCUPATIONS": "card_occupations",
+            }[name]
+            raise QEInputError("two occurrences", routine=routine)
         if name in {"ATOMIC_SPECIES", "ATOMIC_POSITIONS"}:
             # Read the actual card through the next recognized card header.
             # Slicing by ntyp/nat would hide surplus rows and, when the
@@ -840,9 +939,13 @@ def _parse_kpoints(card: tuple[str, list[str]], lattice: np.ndarray, alat: float
                 "K_POINTS automatic requires six integer values"
             ) from exc
         if len(values) != 6 or any(n <= 0 for n in values[:3]):
-            raise QEInputError("K_POINTS automatic requires nk1 nk2 nk3 sk1 sk2 sk3")
+            raise QEInputError(
+                "invalid values for nk1, nk2, nk3", routine="card_kpoints"
+            )
         if any(shift not in {0, 1} for shift in values[3:]):
-            raise QEInputError("K_POINTS automatic offsets must be 0 or 1")
+            raise QEInputError(
+                "invalid offsets: must be 0 or 1", routine="card_kpoints"
+            )
         grid, shift = values[:3], values[3:]
         points = []
         for i in range(grid[0]):
@@ -864,7 +967,9 @@ def _parse_kpoints(card: tuple[str, list[str]], lattice: np.ndarray, alat: float
         return points
     allowed = {"", "tpiba", "crystal", "tpiba_b", "crystal_b", "tpiba_c", "crystal_c"}
     if option not in allowed:
-        raise QEInputError(f"unknown K_POINTS option {option!r}")
+        raise QEInputError(
+            f"unknown K_POINTS option {option!r}", routine="card_kpoints"
+        )
     try:
         n = int(rows[0].split()[0])
     except (IndexError, ValueError) as exc:
@@ -947,12 +1052,162 @@ def read_pw_input(source: str | Path | TextIO) -> PWInput:
     control = namelists.get("control", {})
     system = namelists.get("system", {})
     electrons = namelists.get("electrons", {})
+    input_warnings: list[QEWarning] = []
     if "tprfor" in control:
-        raise QEInputError("unknown CONTROL variable 'tprfor'; use 'tprnfor'")
-    if str(control.get("calculation", "scf")).lower() != "scf":
-        raise UnsupportedFeatureError("the first port supports calculation='scf' only")
-    if int(system.get("nspin", 1)) != 1 or system.get("noncolin", False):
-        raise UnsupportedFeatureError("spin-polarized and noncollinear calculations are not ported")
+        raise QEInputError(
+            "bad line in namelist &CONTROL: unknown variable 'tprfor'",
+            routine="read_namelists",
+        )
+    _reject_unimplemented_variables(namelists)
+    calculation = str(control.get("calculation", "scf")).strip().lower()
+    if calculation != "scf":
+        raise UnsupportedFeatureError(
+            not_implemented(f"calculation {calculation}"), routine="iosys"
+        )
+    restart_mode = str(
+        control.get("restart_mode", "from_scratch")
+    ).strip().lower()
+    if restart_mode not in {"from_scratch", "restart"}:
+        raise QEInputError(
+            f"unknown restart_mode {restart_mode}", routine="iosys"
+        )
+
+    starting_potential = str(
+        electrons.get("startingpot", "atomic")
+    ).strip().lower()
+    starting_wavefunctions = str(
+        electrons.get("startingwfc", "atomic+random")
+    ).strip().lower()
+    if starting_potential not in {"atomic", "file"}:
+        input_warnings.append(
+            QEWarning("iosys", "wrong startingpot: use default (1)")
+        )
+        starting_potential = "atomic"
+        electrons["startingpot"] = starting_potential
+    if starting_wavefunctions not in {"atomic", "atomic+random", "random", "file"}:
+        input_warnings.append(
+            QEWarning("iosys", "wrong startingwfc: use default (atomic+random)")
+        )
+        starting_wavefunctions = "atomic+random"
+        electrons["startingwfc"] = starting_wavefunctions
+    if restart_mode == "restart":
+        if starting_wavefunctions != "file":
+            input_warnings.append(
+                QEWarning(
+                    "input",
+                    f'WARNING: "startingwfc" set to {starting_wavefunctions} may spoil restart',
+                )
+            )
+        if starting_potential != "file":
+            input_warnings.append(
+                QEWarning(
+                    "input",
+                    f'WARNING: "startingpot" set to {starting_potential} may spoil restart',
+                )
+            )
+            electrons["startingpot"] = "file"
+
+    diagonalization = str(
+        electrons.get("diagonalization", "david")
+    ).strip().lower()
+    diagonalization_options = {
+        "david", "davidson", "cg", "paro", "rmm", "rmm-diis",
+        "rmm-davidson", "rmm-paro", "direct", "dense",
+    }
+    if diagonalization == "ppcg":
+        raise QEInputError(
+            "PPCG diagonalization not supported anymore (Dec. 2024)",
+            routine="iosys",
+        )
+    if diagonalization not in diagonalization_options:
+        raise QEInputError(
+            f"diagonalization {diagonalization} not implemented",
+            routine="iosys",
+        )
+
+    mixing_mode = str(electrons.get("mixing_mode", "plain")).strip().lower()
+    if mixing_mode == "potential":
+        raise QEInputError(
+            "potential mixing no longer implemented", routine="iosys"
+        )
+    if mixing_mode.replace("_", "-") not in {
+        "plain", "default", "tf", "local-tf",
+    }:
+        raise QEInputError(
+            f"unknown mixing {mixing_mode}", routine="iosys"
+        )
+    if "mixing_beta" in electrons and _input_number(
+        electrons, "mixing_beta", 0.7, float, "electrons"
+    ) < 0.0:
+        electrons["mixing_beta"] = 0.7
+
+    ecutwfc = float(_input_number(system, "ecutwfc", 0.0, float, "system"))
+    if ecutwfc < 0.0:
+        raise QEInputError("ecutwfc out of range", routine="iosys")
+    if ecutwfc == 0.0:
+        raise QEInputError("ecutwfc not set", routine="set_cutoff")
+    if ecutwfc < 1.0 or ecutwfc > 10_000.0:
+        raise QEInputError("meaningless value for ecutwfc", routine="setup")
+    ecutrho = float(
+        _input_number(system, "ecutrho", 4.0 * ecutwfc, float, "system")
+    )
+    system["ecutrho"] = ecutrho
+    if ecutrho < 0.0:
+        raise QEInputError("ecutrho out of range", routine="iosys")
+    if ecutrho / ecutwfc <= 1.0:
+        raise QEInputError("ecutrho <= ecutwfc?!?", routine="set_cutoff")
+    if ecutrho < 4.0 * ecutwfc:
+        input_warnings.append(
+            QEWarning("set_cutoff", "ecutrho < 4*ecutwfc, are you sure?")
+        )
+
+    occupations = str(system.get("occupations", "fixed")).strip().lower()
+    normalized_occupations = occupations.replace("-", "_")
+    supported_occupations = {
+        "fixed", "smearing", "tetrahedra", "tetrahedra_lin", "tetrahedra_opt",
+    }
+    if normalized_occupations == "from_input":
+        raise UnsupportedFeatureError(
+            not_implemented("occupations from_input"),
+            routine="set_occupations",
+        )
+    if normalized_occupations not in supported_occupations:
+        raise QEInputError(
+            f"occupations {occupations} not implemented",
+            routine="set_occupations",
+        )
+    degauss = float(_input_number(system, "degauss", 0.0, float, "system"))
+    if normalized_occupations == "fixed" and degauss != 0.0:
+        # QE 7.5 calls errore(..., -1) here; errore immediately returns for
+        # ierr <= 0, so the broadening is reset without printed diagnostics.
+        system["degauss"] = 0.0
+    if normalized_occupations == "smearing":
+        if degauss <= 0.0:
+            raise QEInputError(
+                "smearing requires a value for gaussian broadening (degauss)",
+                routine="set_occupations",
+            )
+        smearing = str(system.get("smearing", "gaussian")).strip().lower()
+        if smearing not in {
+            "gaussian", "gauss", "0", "methfessel-paxton", "m-p", "mp",
+            "marzari-vanderbilt", "cold", "m-v", "mv", "fermi-dirac",
+            "f-d", "fd",
+        }:
+            raise QEInputError(
+                f"smearing {smearing} unknown", routine="set_occupations"
+            )
+    nspin = int(_input_number(system, "nspin", 1, int, "system"))
+    if nspin not in {1, 2, 4}:
+        raise QEInputError("nspin out of range", routine="iosys")
+    if nspin != 1 or system.get("noncolin", False):
+        raise UnsupportedFeatureError(
+            not_implemented("spin-polarized and noncollinear calculations"),
+            routine="iosys",
+        )
+    if "nbnd" in system and _input_number(
+        system, "nbnd", 0, int, "system"
+    ) < 1:
+        raise QEInputError("nbnd less than 1", routine="iosys")
     forbidden = {
         "lda_plus_u": "DFT+U", "lspinorb": "spin-orbit coupling",
     }
@@ -960,23 +1215,61 @@ def read_pw_input(source: str | Path | TextIO) -> PWInput:
         value = system.get(key)
         normalized = value.lower() if isinstance(value, str) else value
         if key in system and normalized not in {False, "", "pz", "lda"}:
-            raise UnsupportedFeatureError(f"{feature} is not ported")
+            raise UnsupportedFeatureError(
+                not_implemented(feature), routine="iosys"
+            )
     if "input_dft" in system:
         if canonical_xc_name(system["input_dft"]) is None:
             raise UnsupportedFeatureError(
-                f"input_dft={system['input_dft']!r} is not ported; "
+                f"input_dft={system['input_dft']!r} is not implemented in PWSCF-PY; "
                 "supported LDA functionals are 'LDA'/'PZ'/'PZ81' and "
                 "'PW'/'PW92'; supported GGA functionals are 'PBE', "
                 "'PBEsol', 'revPBE', and 'RPBE'"
+                ,
+                routine="set_dft_from_name",
             )
     cards = _collect_cards(card_lines, system)
+    if "ATOMIC_POSITIONS" in cards and cards["ATOMIC_POSITIONS"][0] == "":
+        input_warnings.extend(
+            (
+                QEWarning(
+                    "read_cards",
+                    "DEPRECATED: no units specified in ATOMIC_POSITIONS card",
+                ),
+                QEWarning("read_cards", "ATOMIC_POSITIONS: units set to alat"),
+            )
+        )
+    if "CELL_PARAMETERS" in cards and cards["CELL_PARAMETERS"][0] == "":
+        input_warnings.append(
+            QEWarning(
+                "read_cards",
+                "DEPRECATED: no units specified in CELL_PARAMETERS card",
+            )
+        )
     lattice, alat = _lattice(system, cards)
     if "ATOMIC_SPECIES" not in cards or "ATOMIC_POSITIONS" not in cards:
         raise QEInputError("ATOMIC_SPECIES and ATOMIC_POSITIONS are required")
     species = []
     for row in cards["ATOMIC_SPECIES"][1]:
         bits = shlex.split(row)
-        species.append(Species(bits[0], float(bits[1]), bits[2]))
+        if len(bits) != 3:
+            raise QEInputError(
+                f"cannot read atomic specie from: {row}",
+                routine="card_atomic_species",
+            )
+        try:
+            mass = float(bits[1])
+        except ValueError as exc:
+            raise QEInputError(
+                f"cannot read atomic specie from: {row}",
+                routine="card_atomic_species",
+            ) from exc
+        species.append(Species(bits[0], mass, bits[2]))
+    if len({item.label for item in species}) != len(species):
+        raise QEInputError(
+            "two occurrences of the same atomic label",
+            routine="card_atomic_species",
+        )
     declared_ntyp = int(system.get("ntyp", len(species)))
     if len(species) != declared_ntyp:
         raise QEInputError(
@@ -1006,8 +1299,8 @@ def read_pw_input(source: str | Path | TextIO) -> PWInput:
             bits = row.split()
             if len(bits) not in {4, 7}:
                 raise QEInputError(
-                    "ATOMIC_POSITIONS rows require x y z followed optionally "
-                    "by three if_pos values"
+                    "wrong number of columns in ATOMIC_POSITIONS",
+                    routine="card_atomic_positions",
                 )
             vector = np.array([_coordinate_expression(x) for x in bits[1:4]])
             if_pos = _position_constraints(bits[4:])
@@ -1027,7 +1320,27 @@ def read_pw_input(source: str | Path | TextIO) -> PWInput:
     labels = {item.label for item in species}
     unknown = sorted({atom.label for atom in atoms} - labels)
     if unknown:
-        raise QEInputError(f"ATOMIC_POSITIONS contains unknown species: {', '.join(unknown)}")
+        raise QEInputError(
+            f"species {unknown[0]} in ATOMIC_POSITIONS is nonexistent",
+            routine="card_atomic_positions",
+        )
+    fractional_atoms = np.asarray([atom.position for atom in atoms]) @ np.linalg.inv(lattice)
+    for first in range(len(atoms)):
+        for second in range(first + 1, len(atoms)):
+            difference = fractional_atoms[first] - fractional_atoms[second]
+            nearest_lattice_vector = np.rint(difference).astype(int)
+            wrapped = difference - nearest_lattice_vector
+            if np.linalg.norm(wrapped @ lattice) >= 1.0e-5:
+                continue
+            if np.all(nearest_lattice_vector == 0):
+                message = f"atoms # {first + 1:3d} and # {second + 1:3d} overlap!"
+            else:
+                i, j, k = nearest_lattice_vector
+                message = (
+                    f"atoms # {first + 1:3d} and # {second + 1:3d} differ by "
+                    f"lattice vector ({i:2d},{j:2d},{k:2d}) in crystal axis"
+                )
+            raise QEInputError(message, routine="check_atoms")
     kcard = cards.get("K_POINTS", ("gamma", []))
     kpoints = _parse_kpoints(kcard, lattice, alat)
     if kcard[0] == "automatic":
@@ -1110,4 +1423,5 @@ def read_pw_input(source: str | Path | TextIO) -> PWInput:
         kpoint_shift=kpoint_shift,
         symmetry_operations=operations,
         source=source_name,
+        warnings=input_warnings,
     )

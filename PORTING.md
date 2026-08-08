@@ -3,8 +3,16 @@
 ## pip installation
 
 The package builds a mandatory Cython extension linked against MPI, OpenMP,
-and the FFTW libraries distributed with `pyfftw`. The system must provide an
-MPI compiler wrapper before pip starts the build.
+and FFTW.  The build prefers a coherent system numerical stack in this order:
+
+1. the MPI implementation already used by `mpi4py` and its C wrapper;
+2. system `fftw3`/`fftw3_omp` and, when present, `fftw3_mpi`;
+3. explicitly installed Intel oneMKL or system OpenBLAS/LAPACKE;
+4. pyFFTW's bundled FFTW and NumPy's BLAS/LAPACK as portable fallbacks.
+
+The extension never deliberately preloads pyFFTW's FFTW into a system-FFTW
+build, because mixing two FFTW copies or two MPI ABIs in one rank is unsafe.
+Reference Netlib BLAS/LAPACK is not selected over NumPy's optimized BLAS.
 
 ```bash
 python -m pip install --upgrade pip
@@ -14,6 +22,18 @@ python -m pip install .
 Use `python -m pip install -e .` for an editable source checkout. Build-time
 Python dependencies are declared in `pyproject.toml`; the MPI implementation
 and compiler toolchain are system dependencies.
+
+Set `MPICC` (or `MPI4PY_BUILD_MPICC`) to override compiler detection.  For
+Intel MPI, the build recognizes the current C wrapper `mpiicx` and the classic
+`mpiicc`; if only C++ wrappers exist it can use `mpiicpx` or `mpiicpc` in C
+mode.  Automatic selection checks `mpi4py.MPI.get_vendor()` first, so an Intel
+wrapper is not accidentally mixed with an Open MPI or MPICH `mpi4py` build.
+
+On Debian/Ubuntu, an Open-MPI-compatible FFTW-MPI development installation is:
+
+```bash
+sudo apt install libopenmpi-dev libfftw3-dev libfftw3-mpi-dev
+```
 
 ## MPI plus OpenMP execution
 
@@ -41,6 +61,16 @@ Open MPI uses `--map-by ...:PE=N` to assign `N` processing elements to each
 rank. For Slurm, the corresponding resource request normally uses
 `--ntasks=<ranks>` and `--cpus-per-task=<threads>`, followed by the site's
 recommended `srun` binding options.
+
+## Periodic Pulay research control
+
+`mixing_pulay_frequency` in `&electrons` selects how often Pulay/Broyden
+extrapolation is applied. Its default value, `1`, is the conventional QE
+trajectory. A value `n > 1` stores history on every iteration, applies linear
+mixing between extrapolations, and performs Pulay extrapolation every `n`-th
+iteration. This is deliberately not selected automatically: the Si benchmarks
+used during implementation improved at 40 Ry with `n = 3` but regressed at
+200 Ry, so the robust default remains `1`.
 
 ## Memory model
 

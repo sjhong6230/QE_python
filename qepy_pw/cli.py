@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import io
 import sys
-from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
 if TYPE_CHECKING:
@@ -13,12 +11,58 @@ if TYPE_CHECKING:
     from .scf import ProgressCallback
 
 
-def build_parser():
-    import argparse
+class _Arguments:
+    __slots__ = ("input_file",)
 
-    parser = argparse.ArgumentParser(prog="pw.py", description="Python scalar-SCF port of QE pw.x")
-    parser.add_argument("-in", "-inp", "--input", dest="input_file")
-    return parser
+    def __init__(self, input_file: str | None) -> None:
+        self.input_file = input_file
+
+
+class _Parser:
+    """The complete pw.py CLI grammar without argparse's per-rank import."""
+
+    _usage = "usage: pw.py [-h] [-in INPUT_FILE]"
+
+    def parse_args(self, argv: list[str] | None = None) -> _Arguments:
+        tokens = list(sys.argv[1:] if argv is None else argv)
+        input_file: str | None = None
+        index = 0
+        while index < len(tokens):
+            token = tokens[index]
+            if token in {"-h", "--help"}:
+                print(
+                    self._usage
+                    + "\n\nPython scalar-SCF port of QE pw.x\n\n"
+                    + "options:\n"
+                    + "  -h, --help            show this help message and exit\n"
+                    + "  -in, -inp, --input INPUT_FILE"
+                )
+                raise SystemExit(0)
+            if token.startswith("--input="):
+                input_file = token.split("=", 1)[1]
+                index += 1
+                continue
+            if token in {"-in", "-inp", "--input"}:
+                if index + 1 >= len(tokens):
+                    print(
+                        self._usage
+                        + f"\npw.py: error: argument {token}: expected one argument",
+                        file=sys.stderr,
+                    )
+                    raise SystemExit(2)
+                input_file = tokens[index + 1]
+                index += 2
+                continue
+            print(
+                self._usage + f"\npw.py: error: unrecognized arguments: {token}",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        return _Arguments(input_file)
+
+
+def build_parser() -> _Parser:
+    return _Parser()
 
 
 def _read_distributed_input(
@@ -26,15 +70,32 @@ def _read_distributed_input(
     mpi: MPIContext,
     stdin: TextIO | None = None,
 ) -> PWInput:
-    """Parse one shared input without reading replicated MPI stdin streams."""
-    from .input import read_pw_input
+    """Parse and symmetry-reduce one shared input once on the root rank."""
+    payload: tuple[bool, object] | None = None
+    if mpi.is_root:
+        try:
+            import io
+            from pathlib import Path
 
-    if input_file:
-        return read_pw_input(Path(input_file))
-    stream = sys.stdin if stdin is None else stdin
-    input_text = stream.read() if mpi.is_root else None
-    input_text = mpi.broadcast(input_text)
-    return read_pw_input(io.StringIO(str(input_text)))
+            from .input import read_pw_input
+
+            if input_file:
+                parsed = read_pw_input(Path(input_file))
+            else:
+                stream = sys.stdin if stdin is None else stdin
+                parsed = read_pw_input(io.StringIO(stream.read()))
+            payload = (True, parsed)
+        except Exception as exc:
+            # Broadcast failures too, otherwise non-root ranks would remain
+            # blocked in bcast while rank zero exits through main().
+            payload = (False, exc)
+    payload = mpi.broadcast(payload)
+    assert isinstance(payload, tuple) and len(payload) == 2
+    succeeded, value = payload
+    if not succeeded:
+        assert isinstance(value, Exception)
+        raise value
+    return value
 
 
 def _root_progress_reporter() -> ProgressCallback:
@@ -49,7 +110,7 @@ def _root_progress_reporter() -> ProgressCallback:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    from .errors import QEInputError, UnsupportedFeatureError
+    from .errors import QEInputError, UnsupportedFeatureError, format_qe_error
     from .memory import trim_allocator
     from .mpi import MPIContext
 
@@ -89,8 +150,5 @@ def main(argv: list[str] | None = None) -> int:
     except (QEInputError, UnsupportedFeatureError, OSError) as exc:
         rank = mpi.rank if mpi is not None else 0
         if rank == 0:
-            print(
-                f"\n     Error in routine pw.py:\n     {exc}\n",
-                file=sys.stderr,
-            )
+            print(format_qe_error(exc), end="", file=sys.stderr)
         return 1

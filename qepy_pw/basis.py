@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from contextlib import nullcontext
 import ctypes
 import glob
-from importlib.util import find_spec
 from math import prod
 from pathlib import Path
 
@@ -21,9 +20,7 @@ from .timing import TimingRegistry
 _FFTW_ALIGNMENT = 64
 _FFT_THREAD_WORK_THRESHOLD = 1 << 18
 _BATCHED_FFT_THREAD_WORK_THRESHOLD = 1 << 15
-_FFTW_LIBRARY_HANDLE: object | None = None
-_FFTW_OPENMP_LIBRARY_HANDLE: object | None = None
-_OPENMP_LIBRARY_HANDLE: object | None = None
+_BLAS_LIBRARY_HANDLE: object | None = None
 _NATIVE_FFT_MODULE: object | None = None
 
 
@@ -49,38 +46,28 @@ def _aligned_complex_empty(size: int, alignment: int) -> np.ndarray:
 
 
 def _load_native_fft() -> object:
-    """Load bundled FFTW globally, then import the mandatory Cython module."""
-    global _FFTW_LIBRARY_HANDLE, _FFTW_OPENMP_LIBRARY_HANDLE
-    global _OPENMP_LIBRARY_HANDLE, _NATIVE_FFT_MODULE
+    """Import the extension with its build-selected FFTW/MPI provider."""
+    global _BLAS_LIBRARY_HANDLE, _NATIVE_FFT_MODULE
     if _NATIVE_FFT_MODULE is not None:
         return _NATIVE_FFT_MODULE
-    if _FFTW_LIBRARY_HANDLE is None:
-        spec = find_spec("pyfftw")
-        if spec is None or spec.origin is None:
-            raise ImportError("the mandatory pyfftw package is not installed")
-        library_dir = Path(spec.origin).resolve().parent.parent / "pyfftw.libs"
-        candidates = sorted(
-            glob.glob(str(library_dir / "libfftw3-*.so*"))
+    if _BLAS_LIBRARY_HANDLE is None:
+        # NumPy normally maps its private OpenBLAS with RTLD_LOCAL.  Promote
+        # that already-mapped object to the global namespace so the native
+        # extension can resolve ILP64 LAPACK/CBLAS symbols without linking a
+        # second BLAS implementation (which would add code pages and another
+        # worker pool to every MPI rank).
+        numpy_library_dir = Path(np.__file__).resolve().parent.parent / "numpy.libs"
+        blas_candidates = sorted(
+            glob.glob(str(numpy_library_dir / "lib*openblas*.so*"))
         )
-        openmp_candidates = sorted(
-            glob.glob(str(library_dir / "libfftw3_omp-*.so*"))
-        )
-        runtime_candidates = sorted(
-            glob.glob(str(library_dir / "libgomp-*.so*"))
-        )
-        if not candidates or not openmp_candidates or not runtime_candidates:
-            raise ImportError(
-                "cannot locate pyfftw's bundled FFTW/OpenMP runtime libraries"
+        if blas_candidates:
+            _BLAS_LIBRARY_HANDLE = ctypes.CDLL(
+                blas_candidates[-1], mode=ctypes.RTLD_GLOBAL
             )
-        _OPENMP_LIBRARY_HANDLE = ctypes.CDLL(
-            runtime_candidates[-1], mode=ctypes.RTLD_GLOBAL
-        )
-        _FFTW_LIBRARY_HANDLE = ctypes.CDLL(
-            candidates[-1], mode=ctypes.RTLD_GLOBAL
-        )
-        _FFTW_OPENMP_LIBRARY_HANDLE = ctypes.CDLL(
-            openmp_candidates[-1], mode=ctypes.RTLD_GLOBAL
-        )
+    # setup.py records either the system FFTW/MPI stack or pyFFTW's bundled
+    # fallback as DT_NEEDED dependencies. Let the dynamic loader select that
+    # single provider; preloading pyFFTW here would put two FFTW copies into a
+    # system-FFTW-MPI process and make plans/wisdom unsafe to exchange.
     from . import _native_fft
 
     _NATIVE_FFT_MODULE = _native_fft
@@ -1087,11 +1074,15 @@ class LocalPotentialWorkspace:
         vectors: np.ndarray,
         *,
         native_potential_layout: bool = False,
+        out: np.ndarray | None = None,
+        diagonal: np.ndarray | None = None,
     ) -> np.ndarray:
         return self._distributed_apply_native(
             real_potential,
             vectors,
             native_potential_layout=native_potential_layout,
+            out=out,
+            diagonal=diagonal,
         )
 
     def _distributed_apply_native(
@@ -1100,11 +1091,20 @@ class LocalPotentialWorkspace:
         vectors: np.ndarray,
         *,
         native_potential_layout: bool = False,
+        out: np.ndarray | None = None,
+        diagonal: np.ndarray | None = None,
     ) -> np.ndarray:
         """Run the fused Cython/MPI/FFTW local-potential kernel."""
         assert self._native_fft is not None
         assert self.transpose_plan is not None
         number_of_vectors = vectors.shape[1]
+        result = (
+            np.empty(vectors.shape, dtype=np.complex128)
+            if out is None
+            else np.asarray(out)
+        )
+        if result.shape != vectors.shape or result.dtype != np.complex128:
+            raise ValueError("local-potential output has the wrong shape or dtype")
         local_sticks = self.sticks_by_rank[self.mpi.rank]
         local_z = self.local_slab.stop - self.local_slab.start
         sticks = self._scratch(
@@ -1142,22 +1142,36 @@ class LocalPotentialWorkspace:
             forward[3][-1] + forward[2][-1]
         )
         reverse_send_size = int(reverse[1][-1] + reverse[0][-1])
-        reverse_send, inverse_receive = self.mpi.complex_exchange_buffers(
-            reverse_send_size, inverse_receive_size
-        )
+        if reverse_send_size == inverse_receive_size:
+            # The forward receive payload has been consumed by the time the
+            # reverse transpose is packed.  Reuse it in place, cutting one
+            # grow-only MPI buffer without changing either collective.
+            _unused, inverse_receive = self.mpi.complex_exchange_buffers(
+                0, inverse_receive_size
+            )
+            reverse_send = inverse_receive
+        else:
+            reverse_send, inverse_receive = self.mpi.complex_exchange_buffers(
+                reverse_send_size, inverse_receive_size
+            )
+        threaded_sticks = self.thread_count > 1
         z_plan = self._native_plan(
             sticks,
             (self.shape[2],),
-            len(local_sticks) * number_of_vectors,
+            1 if threaded_sticks else len(local_sticks) * number_of_vectors,
             len(local_sticks) * number_of_vectors,
             1,
+            parallel_bands=threaded_sticks,
+            preserve_values=False,
         )
+        threaded_planes = self.thread_count > 1
         xy_plan = self._native_plan(
             slab,
             (self.shape[0], self.shape[1]),
-            local_z,
+            1 if threaded_planes else local_z,
             1,
             self.shape[0] * self.shape[1],
+            parallel_bands=threaded_planes,
             planner_flag=(
                 "FFTW_MEASURE"
                 if self.thread_count > 1
@@ -1188,7 +1202,9 @@ class LocalPotentialWorkspace:
                 self.mpi.comm,
                 z_plan,
                 xy_plan,
+                result,
                 self.size,
+                diagonal,
             )
 
     def accumulate_density(
@@ -1287,12 +1303,15 @@ class LocalPotentialWorkspace:
             _send, receive = self.mpi.complex_exchange_buffers(
                 0, receive_size
             )
+            threaded_sticks = self.thread_count > 1
             z_plan = self._native_plan(
                 sticks,
                 (self.shape[2],),
-                len(local_sticks) * number_of_vectors,
+                1 if threaded_sticks else len(local_sticks) * number_of_vectors,
                 len(local_sticks) * number_of_vectors,
                 1,
+                parallel_bands=threaded_sticks,
+                preserve_values=False,
             )
             xy_plan = self._native_plan(
                 slab,
@@ -1338,6 +1357,8 @@ class LocalPotentialWorkspace:
         coefficients: np.ndarray,
         *,
         native_potential_layout: bool = False,
+        out: np.ndarray | None = None,
+        diagonal: np.ndarray | None = None,
     ) -> np.ndarray:
         """Apply a prepared real-space potential using reusable FFT storage."""
         vectors = np.asarray(coefficients)
@@ -1360,6 +1381,8 @@ class LocalPotentialWorkspace:
                 real_potential,
                 vectors,
                 native_potential_layout=native_potential_layout,
+                out=out,
+                diagonal=diagonal,
             )
             return result[:, 0] if was_vector else result
         # QE's serial vloc_psi transforms a small number of states at a time.
@@ -1371,10 +1394,13 @@ class LocalPotentialWorkspace:
             self.serial_fft_batch_size or number_of_vectors,
         )
         potential = np.ascontiguousarray(real_potential, dtype=np.float64)
-        result = np.empty(
-            vectors.shape,
-            dtype=np.result_type(vectors.dtype, np.complex128),
+        result = (
+            np.empty(vectors.shape, dtype=np.complex128)
+            if out is None
+            else np.asarray(out)
         )
+        if result.shape != vectors.shape or result.dtype != np.complex128:
+            raise ValueError("local-potential output has the wrong shape or dtype")
         timer = (
             self.timers.measure("fftw")
             if self.timers is not None
@@ -1402,6 +1428,7 @@ class LocalPotentialWorkspace:
                         grid_stride,
                         result,
                         start,
+                        diagonal,
                     )
                     continue
                 parallel_bands = self._parallel_band_fft(active)
@@ -1423,6 +1450,7 @@ class LocalPotentialWorkspace:
                     grid_stride,
                     result,
                     start,
+                    diagonal,
                 )
         return result[:, 0] if was_vector else result
 

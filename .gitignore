@@ -15,5 +15,8 @@ dist/
 qepy_pw/_native_fft.c
 qepy_pw/_native_fft*.so
 
+# Quantum ESPRESSO runtime/restart directories
+*.save/
+
 # Files attached to a local Codex task are not project sources.
 .codex-remote-attachments/

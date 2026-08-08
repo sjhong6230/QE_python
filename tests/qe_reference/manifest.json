@@ -13,6 +13,7 @@
     "homo_ev": {"absolute": 1e-4},
     "homo_lumo_ev": {"absolute": 1e-4},
     "bands_ev": {"absolute": 1e-4},
+    "diagonalization_iterations": {"absolute": 0.05},
     "num_kpoints": {"absolute": 0.0}
   },
   "pseudopotentials": {
@@ -43,6 +44,9 @@
     {"id": "scf_mixing_tf", "suite": "pw_scf", "input": "scf-mixing_TF.in", "pseudo": ["Si.pz-vbc.UPF"], "features": ["scf", "mixing_mode TF"]},
     {"id": "scf_mixing_local_tf", "suite": "pw_scf", "input": "scf-mixing_localTF.in", "pseudo": ["Si.pz-vbc.UPF"], "features": ["scf", "mixing_mode local-TF"]},
     {"id": "scf_cg", "suite": "pw_scf", "input": "scf-cg.in", "pseudo": ["Si.pz-vbc.UPF"], "features": ["scf", "diagonalization cg", "diago_thr_init"]},
+    {"id": "scf_paro", "suite": "pw_scf", "input": "scf-paro.in", "pseudo": ["Si.pz-vbc.UPF"], "features": ["scf", "diagonalization paro"]},
+    {"id": "scf_rmm_davidson", "suite": "pw_scf", "input": "scf-rmm-davidson.in", "pseudo": ["Si.pz-vbc.UPF"], "features": ["scf", "diagonalization rmm-davidson", "diago_rmm_ndim", "diago_gs_nblock"]},
+    {"id": "scf_rmm_paro", "suite": "pw_scf", "input": "scf-rmm-paro.in", "pseudo": ["Si.pz-vbc.UPF"], "features": ["scf", "diagonalization rmm-paro", "diago_rmm_conv", "diago_full_acc"]},
     {"id": "scf_allfrac", "suite": "pw_scf", "input": "scf-allfrac.in", "pseudo": ["Si.pz-vbc.UPF"], "features": ["scf", "use_all_frac"]},
     {"id": "scf_force_symmorphic", "suite": "pw_scf", "input": "scf-nofrac.in", "pseudo": ["Si.pz-vbc.UPF"], "features": ["scf", "force_symmorphic"]},
     {"id": "dft_revpbe", "suite": "pw_dft", "input": "dft2.in", "pseudo": ["Si.pz-vbc.UPF"], "features": ["scf", "input_dft revPBE"]},

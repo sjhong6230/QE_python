@@ -9,13 +9,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-import re
-import xml.etree.ElementTree as ET
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from .errors import QEInputError, UnsupportedFeatureError
 from .special import erf, spherical_harmonic, spherical_jn
+
+if TYPE_CHECKING:
+    import xml.etree.ElementTree as ET
+
+
+_RADIAL_TABLE_BLOCK = 128
 
 
 def _complex_spherical_harmonic(
@@ -132,8 +137,8 @@ class LocalPotential:
         # though the retained QE table is only one dimensional.  Integrate in
         # bounded q blocks so initialization does not create an artificial RSS
         # high-water mark.
-        for begin in range(0, table_size, 128):
-            end = min(begin + 128, table_size)
+        for begin in range(0, table_size, _RADIAL_TABLE_BLOCK):
+            end = min(begin + _RADIAL_TABLE_BLOCK, table_size)
             q_block = table_q[begin:end]
             qr = np.multiply.outer(q_block, r)
             sinc = np.ones_like(qr)
@@ -145,8 +150,9 @@ class LocalPotential:
             )
             if begin == 0:
                 sinc[0] = r
+            sinc *= short_radial[None, :]
             table[begin:end] = prefactor * _qe_simpson(
-                sinc * short_radial[None, :], rab, axis=1
+                sinc, rab, axis=1
             )
         self._local_potential_table = table
         self._local_potential_table_qmax = maximum_q
@@ -293,15 +299,19 @@ class LocalPotential:
                 )
                 r = self.r[:count]
                 beta = projector.beta[:count]
-                bessel = spherical_jn(
-                    projector.angular_momentum,
-                    np.multiply.outer(table_q, r),
-                )
-                table[:, column] = prefactor * _qe_simpson(
-                    bessel * (beta * r)[None, :],
-                    self.rab[:count],
-                    axis=1,
-                )
+                radial = beta * r
+                for begin in range(0, table_size, _RADIAL_TABLE_BLOCK):
+                    end = min(begin + _RADIAL_TABLE_BLOCK, table_size)
+                    bessel = spherical_jn(
+                        projector.angular_momentum,
+                        np.multiply.outer(table_q[begin:end], r),
+                    )
+                    bessel *= radial[None, :]
+                    table[begin:end, column] = prefactor * _qe_simpson(
+                        bessel,
+                        self.rab[:count],
+                        axis=1,
+                    )
             self._projector_table = table
             self._projector_table_qmax = maximum_q
             self._projector_table_volume = float(volume)
@@ -367,17 +377,21 @@ class LocalPotential:
         maximum_q = float(np.max(flat_q))
         table_size = int(maximum_q / dq + 4)
         table_q = np.arange(table_size, dtype=float) * dq
-        bessel = spherical_jn(
-            0, np.multiply.outer(table_q, radial_grid)
-        )
-        table = (
-            _qe_simpson(
-                bessel * radial_charge[None, :],
-                rab,
-                axis=1,
+        table = np.empty(table_size, dtype=float)
+        for begin in range(0, table_size, _RADIAL_TABLE_BLOCK):
+            end = min(begin + _RADIAL_TABLE_BLOCK, table_size)
+            bessel = spherical_jn(
+                0, np.multiply.outer(table_q[begin:end], radial_grid)
             )
-            / volume
-        )
+            bessel *= radial_charge[None, :]
+            table[begin:end] = (
+                _qe_simpson(
+                    bessel,
+                    rab,
+                    axis=1,
+                )
+                / volume
+            )
         scaled = flat_q / dq
         lower = np.floor(scaled).astype(int)
         fraction = scaled - lower
@@ -443,23 +457,23 @@ class LocalPotential:
             dq = 0.01
             table_size = int(maximum_q / dq + 4)
             table_q = np.arange(table_size, dtype=float) * dq
-            bessel = spherical_jn(
-                0, np.multiply.outer(table_q, self.r[:count])
-            )
-            table = (
-                4.0
-                * np.pi
-                / volume
-                * _qe_simpson(
-                    bessel
-                    * (
-                        self.core_density[:count]
-                        * self.r[:count] ** 2
-                    )[None, :],
+            table = np.empty(table_size, dtype=float)
+            radial_core = self.core_density[:count] * self.r[:count] ** 2
+            prefactor = 4.0 * np.pi / volume
+            for begin in range(0, table_size, _RADIAL_TABLE_BLOCK):
+                end = min(begin + _RADIAL_TABLE_BLOCK, table_size)
+                bessel = spherical_jn(
+                    0,
+                    np.multiply.outer(
+                        table_q[begin:end], self.r[:count]
+                    ),
+                )
+                bessel *= radial_core[None, :]
+                table[begin:end] = prefactor * _qe_simpson(
+                    bessel,
                     self.rab[:count],
                     axis=1,
                 )
-            )
             self._core_density_table = table
             self._core_density_table_qmax = maximum_q
             self._core_density_table_volume = float(volume)
@@ -652,21 +666,23 @@ class LocalPotential:
             table_q = np.arange(table_size, dtype=float) * dq
             tables = []
             for wavefunction in selected:
-                bessel = spherical_jn(
-                    wavefunction.angular_momentum,
-                    np.multiply.outer(table_q, radial_grid),
-                )
-                tables.append(
-                    prefactor
-                    * _qe_simpson(
-                        bessel
-                        * (
-                            wavefunction.chi[:count] * radial_grid
-                        )[None, :],
+                table = np.empty(table_size, dtype=float)
+                radial_wfc = wavefunction.chi[:count] * radial_grid
+                for begin in range(0, table_size, _RADIAL_TABLE_BLOCK):
+                    end = min(begin + _RADIAL_TABLE_BLOCK, table_size)
+                    bessel = spherical_jn(
+                        wavefunction.angular_momentum,
+                        np.multiply.outer(
+                            table_q[begin:end], radial_grid
+                        ),
+                    )
+                    bessel *= radial_wfc[None, :]
+                    table[begin:end] = prefactor * _qe_simpson(
+                        bessel,
                         rab,
                         axis=1,
                     )
-                )
+                tables.append(table)
             self._atomic_wfc_table = tuple(tables)
             self._atomic_wfc_table_qmax = maximum_q
             self._atomic_wfc_table_volume = float(volume)
@@ -718,6 +734,14 @@ def _qe_real_spherical_harmonics(
     # projector channels and avoid dispatching SciPy's general complex
     # spherical-harmonic ufunc for every k point and SCF iteration. At q=0,
     # match the former theta=phi=0 convention by choosing the +z direction.
+    # The formulas executed by the fused row kernel remain explicit here
+    # (x,y,z denote the normalized reciprocal vector):
+    #   l=0: [1/sqrt(4*pi)]
+    #   l=1: sqrt(3/(4*pi)) * [z, -x, -y]
+    #   l=2: [sqrt(5/(16*pi))*(3z^2-1),
+    #         -sqrt(15/(4*pi))*xz, -sqrt(15/(4*pi))*yz,
+    #          sqrt(15/(16*pi))*(x^2-y^2),
+    #          sqrt(15/(4*pi))*xy]
     if angular_momentum <= 2:
         from .basis import _load_native_fft
 
@@ -911,18 +935,25 @@ def _qe_simpson(values: np.ndarray, rab: np.ndarray, axis: int = -1) -> np.ndarr
         weights[-1] = 1.25
     weighted = rab * weights / 3.0
     normalized_axis = axis % values.ndim
-    broadcast_shape = [1] * values.ndim
-    broadcast_shape[normalized_axis] = size
-    return np.sum(values * weighted.reshape(broadcast_shape), axis=normalized_axis)
+    # Contract the radial axis directly.  The former broadcast multiply
+    # materialized another nq-by-mesh array beside the Bessel block; BLAS's
+    # matrix-vector path writes only the nq result and is faster for tables.
+    radial_last = np.moveaxis(values, normalized_axis, -1)
+    return np.tensordot(radial_last, weighted, axes=([-1], [0]))
 
 
 def _numbers(element: ET.Element | None) -> np.ndarray:
     if element is None or not element.text:
         return np.array([], dtype=float)
-    return np.fromstring(re.sub(r"[dD]", "E", element.text), sep=" ")
+    return np.fromstring(
+        element.text.replace("D", "E").replace("d", "E"), sep=" "
+    )
 
 
 def read_upf(path: str | Path) -> LocalPotential:
+    import re
+    import xml.etree.ElementTree as ET
+
     path = Path(path)
     try:
         text = path.read_text(encoding="utf-8")

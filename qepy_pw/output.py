@@ -58,12 +58,12 @@ def _format_symmetry(out: io.StringIO, pw: PWInput) -> None:
     has_inversion = any(np.array_equal(op.matrix, -np.eye(3, dtype=int)) for op in operations)
     if len(operations) == 1:
         print("\n     No symmetry found", file=out)
-        return
-    inversion = ", with inversion," if has_inversion else ","
-    suffix = (
-        f" ({fractional:d} have fractional translation)" if fractional else ""
-    )
-    print(f"\n     {len(operations):d} Sym. Ops.{inversion} found{suffix}", file=out)
+    else:
+        inversion = ", with inversion," if has_inversion else ","
+        suffix = (
+            f" ({fractional:d} have fractional translation)" if fractional else ""
+        )
+        print(f"\n     {len(operations):d} Sym. Ops.{inversion} found{suffix}", file=out)
     if str(pw.control.get("verbosity", "low")).lower() != "high":
         return
     print("\n\n                                    s                        frac. trans.", file=out)
@@ -96,6 +96,46 @@ def _format_symmetry(out: io.StringIO, pw: PWInput) -> None:
             print(f"{prefix}{values[0]:11.7f}{values[1]:11.7f}{values[2]:11.7f} ){tail}", file=out)
         print(file=out)
 
+    from .point_group import point_group_character_table
+
+    table = point_group_character_table(pw, operations)
+    print(
+        f"     point group {table.schoenflies} ({table.international})",
+        file=out,
+    )
+    print(f"     there are {len(table.classes):d} classes", file=out)
+    print("     the character table:\n", file=out)
+    print("       " + "".join(f"{item.label:<6s}" for item in table.classes), file=out)
+    for name, characters in table.irreps:
+        print(
+            f"{name:<7s}" + "".join(
+                f"{value.real:6.2f}" for value in characters
+            ),
+            file=out,
+        )
+    if any(
+        abs(value.imag) > 1.0e-8
+        for _name, row in table.irreps
+        for value in row
+    ):
+        print("     imaginary part", file=out)
+        for name, characters in table.irreps:
+            print(
+                f"{name:<7s}" + "".join(
+                    f"{value.imag:6.2f}" for value in characters
+                ),
+                file=out,
+            )
+    print(
+        "\n     the symmetry operations in each class and the name "
+        "of the first element:\n",
+        file=out,
+    )
+    for item in table.classes:
+        indices = "".join(f"{index:5d}" for index in item.operation_indices)
+        print(f"     {item.label:<6s}{indices}", file=out)
+        print(f"          {item.description:<55s}", file=out)
+
 
 def format_header(pw: PWInput) -> str:
     out = io.StringIO()
@@ -103,7 +143,30 @@ def format_header(pw: PWInput) -> str:
     print(f"     Program PWSCF-PY v.{__version__} starts on {now:%d%b%Y at %H:%M:%S}", file=out)
     print("\n     Python reference port of the scalar SCF path in Quantum ESPRESSO pw.x", file=out)
     print(f"     Reading input from {pw.source}\n", file=out)
-    pseudos = {s.label: read_upf(pw.pseudo_dir / s.pseudo_file) for s in pw.species}
+    from .errors import QEWarning, format_qe_warning
+
+    for diagnostic in pw.warnings:
+        print(format_qe_warning(diagnostic), end="", file=out)
+    if pw.warnings:
+        print(file=out)
+    pseudos = {
+        species.label: read_upf(pw.pseudo_dir / species.pseudo_file)
+        for species in pw.species
+    }
+    ecutwfc = float(pw.system["ecutwfc"])
+    ecutrho = float(pw.system.get("ecutrho", 4.0 * ecutwfc))
+    if (
+        ecutrho > 4.0 * ecutwfc
+        and all(pseudo.core_density is None for pseudo in pseudos.values())
+    ):
+        print(
+            format_qe_warning(
+                QEWarning("setup", "no reason to have ecutrho>4*ecutwfc")
+            ),
+            end="",
+            file=out,
+        )
+        print(file=out)
     nelec = sum(pseudos[a.label].z_valence for a in pw.atoms) - float(pw.system.get("tot_charge", 0.0))
     nbnd = int(
         pw.system.get(
@@ -148,6 +211,15 @@ def format_header(pw: PWInput) -> str:
         f"{str(pw.electrons.get('mixing_mode', 'plain')):<9s} mixing",
         file=out,
     )
+    pulay_frequency = int(
+        pw.electrons.get("mixing_pulay_frequency", 1)
+    )
+    if pulay_frequency > 1:
+        print(
+            "     periodic Pulay interval  = "
+            f"{pulay_frequency:12d}",
+            file=out,
+        )
     resolved_xc = canonical_xc_name(pw.system.get("_resolved_xc", ""))
     if resolved_xc is None and "input_dft" in pw.system:
         resolved_xc = canonical_xc_name(pw.system["input_dft"])
@@ -497,6 +569,30 @@ def _format_timing(result: SCFResult, name: str) -> str:
     )
 
 
+def _format_qe_duration(seconds: float, label: str) -> str:
+    """Format one side of QE's primary CPU/WALL clock.
+
+    QE's first clock retains seconds below one hour, but deliberately omits
+    seconds once hours or days are present.  Routine-level clocks continue to
+    use plain seconds through :func:`_format_timing`.
+    """
+    elapsed = max(0.0, float(seconds))
+    days = int(elapsed // 86400.0)
+    remainder = elapsed - 86400.0 * days
+    hours = int(remainder // 3600.0)
+    remainder -= 3600.0 * hours
+    minutes = int(remainder // 60.0)
+    remainder -= 60.0 * minutes
+
+    if days:
+        return f" {days:2d}d{hours:2d}h{minutes:2d}m {label}"
+    if hours:
+        return f"    {hours:2d}h{minutes:2d}m {label}"
+    if minutes:
+        return f" {minutes:2d}m{remainder:5.2f}s {label}"
+    return f"    {remainder:5.2f}s {label}"
+
+
 def format_footer(pw: PWInput, result: SCFResult) -> str:
     out = io.StringIO()
     if result.converged:
@@ -557,11 +653,29 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
         highest_occupied = max(
             values[occupied - 1] for values in result.eigenvalues_ha
         )
-        print(
-            f"\n     highest occupied level (ev): "
-            f"{highest_occupied * EV_PER_HARTREE:10.4f}",
-            file=out,
+        # For fixed occupations QE reports the fundamental band-edge pair
+        # whenever the calculation includes at least one empty state.  The
+        # HOMO is the largest occupied eigenvalue over all k points, whereas
+        # the LUMO is the smallest first-empty eigenvalue.
+        has_empty_states = all(
+            len(values) > occupied for values in result.eigenvalues_ha
         )
+        if has_empty_states:
+            lowest_unoccupied = min(
+                values[occupied] for values in result.eigenvalues_ha
+            )
+            print(
+                "\n     highest occupied, lowest unoccupied level (ev):"
+                f"{highest_occupied * EV_PER_HARTREE:11.4f}"
+                f"{lowest_unoccupied * EV_PER_HARTREE:11.4f}",
+                file=out,
+            )
+        else:
+            print(
+                f"\n     highest occupied level (ev): "
+                f"{highest_occupied * EV_PER_HARTREE:10.4f}",
+                file=out,
+            )
     marker = "!" if result.converged else " "
     print(f"\n{marker}    total energy              = {result.total_energy_ha * 2:18.10f} Ry", file=out)
     if result.iterations:
@@ -748,8 +862,9 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
         if result.timings.get(name) is not None
     )
     print(
-        f"\n     PWSCF        : {total_cpu:9.2f}s CPU "
-        f"{result.wall_seconds:9.2f}s WALL",
+        "\n     PWSCF        : "
+        f"{_format_qe_duration(total_cpu, 'CPU')} "
+        f"{_format_qe_duration(result.wall_seconds, 'WALL')}",
         file=out,
     )
     print("\n   JOB DONE." if result.converged else "\n   JOB FAILED.", file=out)

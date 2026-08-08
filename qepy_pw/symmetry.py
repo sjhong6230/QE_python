@@ -9,7 +9,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from fractions import Fraction
 import math
-import itertools
 from typing import TYPE_CHECKING
 import warnings
 
@@ -281,8 +280,6 @@ class ReciprocalDensitySymmetrizer:
             self._set_empty_exchange()
             self._star_offsets = np.zeros(1, dtype=np.int32)
             self._star_members = np.empty(0, dtype=np.uint16)
-            self._star_weights = np.empty(0, dtype=np.complex128)
-            self._star_fill_factors = np.empty(0, dtype=np.complex128)
             return
 
         if mpi.size == 1:
@@ -295,8 +292,10 @@ class ReciprocalDensitySymmetrizer:
             (
                 self._star_offsets,
                 self._star_members,
-                self._star_weights,
-                self._star_fill_factors,
+                self._star_weight_table,
+                self._star_weight_indices,
+                self._star_fill_table,
+                self._star_fill_indices,
             ) = self._build_star_metadata(
                 indices, distributed=False
             )
@@ -368,8 +367,10 @@ class ReciprocalDensitySymmetrizer:
         (
             self._star_offsets,
             self._star_members,
-            self._star_weights,
-            self._star_fill_factors,
+            self._star_weight_table,
+            self._star_weight_indices,
+            self._star_fill_table,
+            self._star_fill_indices,
         ) = self._build_star_metadata(
             indices[received_global_rows], distributed=True
         )
@@ -394,10 +395,21 @@ class ReciprocalDensitySymmetrizer:
         self._packed_return = self._packed_send
         self._packed_size = 0
         self._shell_size = 0
+        self._star_weight_table = np.empty(0, dtype=np.complex128)
+        self._star_weight_indices = np.empty(0, dtype=np.uint8)
+        self._star_fill_table = np.empty(0, dtype=np.complex128)
+        self._star_fill_indices = np.empty(0, dtype=np.uint8)
 
     def _build_star_metadata(
         self, local_indices: np.ndarray, *, distributed: bool
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+    ]:
         """Build compact star tables without retaining per-star duplicates."""
         local_indices = np.asarray(local_indices, dtype=np.int32)
         number_of_rows = len(local_indices)
@@ -484,7 +496,35 @@ class ReciprocalDensitySymmetrizer:
         # prevents the worst case N_G+1 offset table being retained when each
         # physical star contains several vectors.
         offsets.resize(number_of_stars + 1, refcheck=False)
-        return offsets, members, weights_array, fills_array
+        # Space-group phases and their star averages repeat heavily. Preserve
+        # every complex128 value exactly once and retain only a narrow lookup
+        # per G row. This is lossless (unlike complex64 metadata), removes two
+        # complex vectors from the persistent symmetry plan, and improves the
+        # native projector's cache footprint.
+        weight_table, weight_inverse = np.unique(
+            weights_array, return_inverse=True
+        )
+        fill_table, fill_inverse = np.unique(
+            fills_array, return_inverse=True
+        )
+
+        def compact_indices(values: np.ndarray, count: int) -> np.ndarray:
+            if count <= np.iinfo(np.uint8).max + 1:
+                dtype = np.uint8
+            elif count <= np.iinfo(np.uint16).max + 1:
+                dtype = np.uint16
+            else:
+                dtype = np.uint32
+            return np.asarray(values, dtype=dtype)
+
+        return (
+            offsets,
+            members,
+            np.ascontiguousarray(weight_table, dtype=np.complex128),
+            compact_indices(weight_inverse, len(weight_table)),
+            np.ascontiguousarray(fill_table, dtype=np.complex128),
+            compact_indices(fill_inverse, len(fill_table)),
+        )
 
     @staticmethod
     def _displacements(counts: np.ndarray) -> np.ndarray:
@@ -506,8 +546,10 @@ class ReciprocalDensitySymmetrizer:
             + self._shell_coefficients.nbytes
             + self._star_offsets.nbytes
             + self._star_members.nbytes
-            + self._star_weights.nbytes
-            + self._star_fill_factors.nbytes
+            + self._star_weight_table.nbytes
+            + self._star_weight_indices.nbytes
+            + self._star_fill_table.nbytes
+            + self._star_fill_indices.nbytes
         )
 
     def _project_stars(self, coefficients: np.ndarray) -> None:
@@ -518,8 +560,10 @@ class ReciprocalDensitySymmetrizer:
             coefficients,
             self._star_offsets,
             self._star_members,
-            self._star_weights,
-            self._star_fill_factors,
+            self._star_weight_table,
+            self._star_weight_indices,
+            self._star_fill_table,
+            self._star_fill_indices,
         )
 
     def apply(self, density: np.ndarray) -> np.ndarray:
@@ -698,6 +742,78 @@ def _spglib_space_group(
     return tuple(operations) if operations else None
 
 
+def _local_space_group(
+    lattice: np.ndarray,
+    fractional_positions: np.ndarray,
+    labels: list[str],
+    tolerance: float,
+) -> tuple[SymmetryOperation, ...]:
+    """Find ordinary crystallographic operations without a heavy runtime.
+
+    The candidate integer matrices are small and geometry-independent.
+    Screening all of them in vectorized NumPy is both faster than the former
+    19,683-iteration Python loop and lets normal Bravais cells avoid loading
+    spglib's extension and database separately in every MPI rank.
+    """
+    metric = lattice @ lattice.T
+    scale = max(1.0, float(np.max(np.abs(metric))))
+    digits = np.indices((3,) * 9, dtype=np.int8).reshape(9, -1).T - 1
+    matrices = digits.reshape(-1, 3, 3)
+    determinants = (
+        matrices[:, 0, 0]
+        * (matrices[:, 1, 1] * matrices[:, 2, 2]
+           - matrices[:, 1, 2] * matrices[:, 2, 1])
+        - matrices[:, 0, 1]
+        * (matrices[:, 1, 0] * matrices[:, 2, 2]
+           - matrices[:, 1, 2] * matrices[:, 2, 0])
+        + matrices[:, 0, 2]
+        * (matrices[:, 1, 0] * matrices[:, 2, 1]
+           - matrices[:, 1, 1] * matrices[:, 2, 0])
+    )
+    matrices = matrices[np.abs(determinants) == 1]
+    transformed_metrics = np.einsum(
+        "aik,kl,ajl->aij", matrices, metric, matrices, optimize=True
+    )
+    metric_match = np.all(
+        np.abs(transformed_metrics - metric[None, :, :])
+        <= tolerance * scale,
+        axis=(1, 2),
+    )
+    matrices = matrices[metric_match]
+
+    operations: list[SymmetryOperation] = []
+    first_label = labels[0]
+    candidate_targets = fractional_positions[
+        np.array([label == first_label for label in labels])
+    ]
+    for matrix in matrices:
+        matrix = np.asarray(matrix, dtype=int)
+        rotated = fractional_positions @ matrix
+        for target in candidate_targets:
+            normalized_translation = _qe_fractional_translation(
+                target - rotated[0], tolerance
+            )
+            if normalized_translation is None:
+                continue
+            if _periodic_match(
+                rotated + normalized_translation,
+                labels,
+                fractional_positions,
+                tolerance,
+            ):
+                operations.append(
+                    SymmetryOperation(
+                        matrix.copy(), normalized_translation.copy()
+                    )
+                )
+                break
+    if not operations:
+        operations.append(
+            SymmetryOperation(np.eye(3, dtype=int), np.zeros(3))
+        )
+    return tuple(operations)
+
+
 def find_space_group(
     lattice: np.ndarray,
     fractional_positions: np.ndarray,
@@ -716,54 +832,19 @@ def find_space_group(
     fractional_positions = np.asarray(fractional_positions, dtype=float)
     if len(fractional_positions) != len(labels) or not labels:
         raise ValueError("fractional positions and nonempty labels must match")
+    local_operations = _local_space_group(
+        lattice, fractional_positions, labels, tolerance
+    )
+    if len(local_operations) > 1:
+        return local_operations
     spglib_operations = _spglib_space_group(
         lattice, fractional_positions, labels, tolerance
     )
-    if spglib_operations is not None:
-        return spglib_operations
-
-    metric = lattice @ lattice.T
-    scale = max(1.0, float(np.max(np.abs(metric))))
-    operations: list[SymmetryOperation] = []
-    first_label = labels[0]
-    candidate_targets = fractional_positions[
-        np.array([label == first_label for label in labels])
-    ]
-    for entries in itertools.product((-1, 0, 1), repeat=9):
-        matrix = np.asarray(entries, dtype=int).reshape(3, 3)
-        determinant = round(float(np.linalg.det(matrix)))
-        if abs(determinant) != 1:
-            continue
-        if not np.allclose(
-            matrix @ metric @ matrix.T,
-            metric,
-            rtol=0.0,
-            atol=tolerance * scale,
-        ):
-            continue
-        rotated = fractional_positions @ matrix
-        for target in candidate_targets:
-            translation = target - rotated[0]
-            normalized_translation = _qe_fractional_translation(
-                translation, tolerance
-            )
-            if normalized_translation is None:
-                continue
-            transformed = rotated + normalized_translation
-            if _periodic_match(
-                transformed, labels, fractional_positions, tolerance
-            ):
-                operations.append(
-                    SymmetryOperation(
-                        matrix.copy(), normalized_translation.copy()
-                    )
-                )
-                break
-    if not operations:
-        operations.append(
-            SymmetryOperation(np.eye(3, dtype=int), np.zeros(3))
-        )
-    return tuple(operations)
+    return (
+        spglib_operations
+        if spglib_operations is not None
+        else local_operations
+    )
 
 
 def _kpoint_key(point: np.ndarray, decimals: int = 10) -> tuple[float, ...]:
@@ -782,11 +863,38 @@ def reduce_kpoints(
     """Reduce a complete fractional reciprocal mesh into symmetry orbits."""
     coordinates = np.asarray(coordinates, dtype=float)
     weights = np.asarray(weights, dtype=float)
-    lookup = {_kpoint_key(point): index for index, point in enumerate(coordinates)}
-    operations = mesh_compatible_operations(coordinates, operations)
-    time_reversal = time_reversal and all(
-        _kpoint_key(-point) in lookup for point in coordinates
+    def keys(points: np.ndarray) -> list[tuple[float, ...]]:
+        reduced = np.asarray(points, dtype=float)
+        reduced = reduced - np.floor(reduced)
+        reduced[np.isclose(reduced, 1.0, atol=1.0e-10)] = 0.0
+        return [tuple(row) for row in np.round(reduced, 10)]
+
+    coordinate_keys = keys(coordinates)
+    lookup = {key: index for index, key in enumerate(coordinate_keys)}
+    reciprocal_matrices = tuple(
+        np.linalg.inv(operation.matrix).T for operation in operations
     )
+    negative_keys = keys(-coordinates) if time_reversal else []
+    time_reversal = time_reversal and all(
+        key in lookup for key in negative_keys
+    )
+    # Build every symmetry/time-reversal map in vectorized blocks.  The old
+    # inner loop called floor/isclose/round on a three-element NumPy array for
+    # each (k,symmetry,sign) tuple; on a 12^3 mesh that Python dispatch cost
+    # alone was several seconds in every MPI rank before SCF timing began.
+    orbit_maps: list[np.ndarray] = []
+    signs = (1.0, -1.0) if time_reversal else (1.0,)
+    for reciprocal_matrix in reciprocal_matrices:
+        transformed = coordinates @ reciprocal_matrix
+        for sign in signs:
+            mapped_keys = keys(sign * transformed)
+            orbit_map = np.fromiter(
+                (lookup.get(key, -1) for key in mapped_keys),
+                dtype=np.int32,
+                count=len(coordinates),
+            )
+            if np.all(orbit_map >= 0):
+                orbit_maps.append(orbit_map)
     assigned: set[int] = set()
     representatives: list[np.ndarray] = []
     reduced_weights: list[float] = []
@@ -795,13 +903,10 @@ def reduce_kpoints(
         if index in assigned:
             continue
         orbit: set[int] = set()
-        for operation in operations:
-            reciprocal = point @ np.linalg.inv(operation.matrix).T
-            signs = (1.0, -1.0) if time_reversal else (1.0,)
-            for sign in signs:
-                mapped = lookup.get(_kpoint_key(sign * reciprocal))
-                if mapped is not None:
-                    orbit.add(mapped)
+        for orbit_map in orbit_maps:
+            mapped = int(orbit_map[index])
+            if mapped >= 0:
+                orbit.add(mapped)
         if not orbit:
             orbit.add(index)
         assigned.update(orbit)
@@ -824,14 +929,18 @@ def mesh_compatible_operations(
 ) -> tuple[SymmetryOperation, ...]:
     """Keep only crystal operations that map the complete sampled mesh to itself."""
     coordinates = np.asarray(coordinates, dtype=float)
-    keys = {_kpoint_key(point) for point in coordinates}
+    reduced = coordinates - np.floor(coordinates)
+    reduced[np.isclose(reduced, 1.0, atol=1.0e-10)] = 0.0
+    keys = {tuple(row) for row in np.round(reduced, 10)}
     compatible = []
     for operation in operations:
         inverse_transpose = np.linalg.inv(operation.matrix).T
-        if all(
-            _kpoint_key(point @ inverse_transpose) in keys
-            for point in coordinates
-        ):
+        transformed = coordinates @ inverse_transpose
+        transformed -= np.floor(transformed)
+        transformed[
+            np.isclose(transformed, 1.0, atol=1.0e-10)
+        ] = 0.0
+        if all(tuple(row) in keys for row in np.round(transformed, 10)):
             compatible.append(operation)
     return tuple(compatible)
 

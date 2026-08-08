@@ -96,4 +96,11 @@ python -m pytest -q
 The official QE inputs and pseudopotentials, together with Python-generated
 output references, are stored in `tests/qe_reference`.
 
+## Documentation
+
+The documentation index is [docs/README.md](docs/README.md). It links the
+input reference, implemented equations, differences from QE, installation and
+execution guide, validation/performance methodology, architecture, and
+QE-compatible diagnostics.
+
 See [PORTING.md](PORTING.md) for the compact runtime and memory notes.

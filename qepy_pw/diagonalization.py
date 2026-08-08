@@ -14,6 +14,7 @@ from .timing import TimingRegistry
 
 
 BlockOperator = Callable[[np.ndarray], np.ndarray]
+BlockOperatorInto = Callable[[np.ndarray, np.ndarray], np.ndarray]
 MaterializedProjectorTerm = tuple[np.ndarray, np.ndarray]
 
 
@@ -40,6 +41,43 @@ ProjectorTerm = (
     | FactorizedProjectorTerm
     | PackedProjectorTerm
 )
+
+
+def _form_residual(
+    applied: np.ndarray,
+    vectors: np.ndarray,
+    eigenvalues: np.ndarray,
+) -> np.ndarray:
+    """Return Hpsi-epsilon*psi with only its final band block allocated."""
+    residual = np.array(applied, dtype=np.complex128, order="F", copy=True)
+    _load_native_fft().subtract_band_energies(
+        residual,
+        np.asarray(vectors, dtype=np.complex128),
+        np.ascontiguousarray(eigenvalues, dtype=np.float64),
+    )
+    return residual
+
+
+def _column_expectations(
+    left: np.ndarray,
+    right: np.ndarray,
+    mpi: MPIContext,
+) -> np.ndarray:
+    """Global columnwise <left|right> without an Npw-by-Nband temporary."""
+    local = _load_native_fft().column_inner_products(
+        np.asarray(left, dtype=np.complex128),
+        np.asarray(right, dtype=np.complex128),
+    )
+    return mpi.sum_array(local)
+
+
+def _matmul_f(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    """BLAS product written directly into a column-major solver block."""
+    result = np.empty(
+        (left.shape[0], right.shape[1]), dtype=np.complex128, order="F"
+    )
+    np.matmul(left, right, out=result)
+    return result
 
 
 def _lowest_generalized_eigh(
@@ -77,7 +115,7 @@ class DavidsonResult:
     eigenvalues: np.ndarray
     eigenvectors: np.ndarray
     residual_norms: np.ndarray
-    iterations: int
+    iterations: float
     converged: bool
     number_unconverged: int = 0
     hamiltonian_applications: int = 0
@@ -196,25 +234,44 @@ class PlaneWaveHamiltonian:
                 return self._apply(coefficients)
         return self._apply(coefficients)
 
-    def _apply(self, coefficients: np.ndarray) -> np.ndarray:
+    def apply_into(
+        self, coefficients: np.ndarray, out: np.ndarray
+    ) -> np.ndarray:
+        """Apply H directly into solver-owned storage."""
+        if self.timers is not None:
+            with self.timers.measure("h_psi"):
+                return self._apply(coefficients, out=out)
+        return self._apply(coefficients, out=out)
+
+    def _apply(
+        self, coefficients: np.ndarray, out: np.ndarray | None = None
+    ) -> np.ndarray:
         vectors = np.asarray(coefficients)
         was_vector = vectors.ndim == 1
         if was_vector:
             vectors = vectors[:, None]
-        result = self.local_kinetic[:, None] * vectors
+        target = out
+        if target is not None and was_vector and np.asarray(target).ndim == 1:
+            target = np.asarray(target)[:, None]
         if self.timers is None:
-            result += self.local_workspace.apply(
+            result = self.local_workspace.apply(
                 self.real_potential,
                 vectors,
                 native_potential_layout=self.native_potential_layout,
+                out=target,
+                diagonal=self.local_kinetic,
             )
         else:
             with self.timers.measure("vloc_psi"):
-                result += self.local_workspace.apply(
+                result = self.local_workspace.apply(
                     self.real_potential,
                     vectors,
                     native_potential_layout=self.native_potential_layout,
+                    out=target,
+                    diagonal=self.local_kinetic,
                 )
+        # The final FFT gather has already accumulated T_G*psi_G while both
+        # source and destination rows were hot in the native kernel.
         descriptors: list[
             tuple[np.ndarray, np.ndarray, np.ndarray | None]
         ] = []
@@ -226,7 +283,7 @@ class PlaneWaveHamiltonian:
             # input and the nonlocal contribution.  In particular, avoid
             # materializing beta.conj(), whose size grows with the number of
             # atoms/projectors and was previously hidden inside BLAS wrappers.
-            nonlocal_buffer = np.empty_like(vectors)
+            nonlocal_buffer: np.ndarray | None = None
             calbec_timer = (
                 self.timers.measure("h_psi:calbec")
                 if self.timers is not None
@@ -237,6 +294,8 @@ class PlaneWaveHamiltonian:
                     if isinstance(term, FactorizedProjectorTerm):
                         for atom in range(term.phases.shape[1]):
                             phase = term.phases[:, atom]
+                            if nonlocal_buffer is None:
+                                nonlocal_buffer = np.empty_like(vectors)
                             np.conjugate(vectors, out=nonlocal_buffer)
                             np.multiply(
                                 nonlocal_buffer,
@@ -254,9 +313,15 @@ class PlaneWaveHamiltonian:
                             beta, coupling = term.beta, term.coupling
                         else:
                             beta, coupling = term
-                        np.conjugate(vectors, out=nonlocal_buffer)
-                        overlap = beta.T @ nonlocal_buffer
-                        np.conjugate(overlap, out=overlap)
+                        overlap = _load_native_fft().projector_overlaps(
+                            beta, vectors
+                        )
+                        if overlap is None:
+                            if nonlocal_buffer is None:
+                                nonlocal_buffer = np.empty_like(vectors)
+                            np.conjugate(vectors, out=nonlocal_buffer)
+                            overlap = beta.T @ nonlocal_buffer
+                            np.conjugate(overlap, out=overlap)
                         overlap_blocks.append(overlap)
                         descriptors.append((beta, coupling, None))
                 counts = [block.shape[0] for block in overlap_blocks]
@@ -281,6 +346,21 @@ class PlaneWaveHamiltonian:
                     beta, coupling, phase = descriptor
                     overlaps = all_overlaps[offset : offset + count]
                     coupled = coupling @ overlaps
+                    if result.flags.f_contiguous:
+                        coupled = np.asfortranarray(coupled)
+                    else:
+                        coupled = np.ascontiguousarray(coupled)
+                    added_directly = (
+                        phase is None
+                        and _load_native_fft().add_projector_product(
+                            result, beta, coupled
+                        )
+                    )
+                    if added_directly:
+                        offset += count
+                        continue
+                    if nonlocal_buffer is None:
+                        nonlocal_buffer = np.empty_like(vectors)
                     np.matmul(beta, coupled, out=nonlocal_buffer)
                     if phase is not None:
                         nonlocal_buffer *= phase[:, None]
@@ -375,15 +455,21 @@ def _orthonormalize(
         if norm == 0.0:
             return np.empty((block.shape[0], 0), dtype=complex)
         return block / norm
-    left, singular_values, _ = np.linalg.svd(block, full_matrices=False)
-    if not len(singular_values) or singular_values[0] == 0.0:
+    gram = block.conj().T @ block
+    gram = 0.5 * (gram + gram.conj().T)
+    squared, rotation = np.linalg.eigh(gram)
+    order = np.argsort(squared)[::-1]
+    squared = np.maximum(np.real(squared[order]), 0.0)
+    if not len(squared) or squared[0] == 0.0:
         return np.empty((block.shape[0], 0), dtype=complex)
     rank = int(
         np.count_nonzero(
-            singular_values > threshold * singular_values[0]
+            squared > threshold**2 * squared[0]
         )
     )
-    return left[:, :rank]
+    transform = rotation[:, order[:rank]]
+    transform /= np.sqrt(squared[:rank])[None, :]
+    return block @ transform
 
 
 def _qe_precondition(
@@ -397,6 +483,13 @@ def _qe_precondition(
     # not a harmless common rescaling: it produces different correction
     # vectors and, at the deliberately loose first-iteration threshold,
     # different Ritz values.
+    #
+    # The physical/numerical definition remains visible here:
+    #   x_Gn = 2 * (H_GG - epsilon_n)                         [Ry]
+    #   d_Gn = 1/2 * [1 + x_Gn + sqrt(1 + (x_Gn - 1)^2)]
+    #   delta_psi_Gn = 2 * residual_Gn / d_Gn
+    # Cython only fuses this elementwise matrix traversal and parallelizes
+    # its plane-wave rows; it does not choose or alter the preconditioner.
     return _load_native_fft().qe_precondition(
         np.asarray(residuals, dtype=np.complex128),
         np.ascontiguousarray(eigenvalues, dtype=np.float64),
@@ -446,10 +539,12 @@ def davidson(
     initial_is_ritz: bool = False,
     initial_is_orthonormal: bool = False,
     initial_eigenvalues: np.ndarray | None = None,
+    initial_applied: np.ndarray | None = None,
     mpi: MPIContext | None = None,
     global_dimension: int | None = None,
     global_row_indices: np.ndarray | None = None,
     timers: TimingRegistry | None = None,
+    operator_into: BlockOperatorInto | None = None,
 ) -> DavidsonResult:
     """Compute the lowest eigenpairs with restarted block Davidson iteration."""
     diagonal = np.asarray(diagonal, dtype=float)
@@ -540,9 +635,21 @@ def davidson(
     applied_storage = np.empty_like(basis_storage)
     basis_storage[:, :active_columns] = basis
     basis = basis_storage[:, :active_columns]
-    applied_storage[:, :active_columns] = operator(basis)
+    if initial_applied is None:
+        _apply_into(
+            operator,
+            operator_into,
+            basis,
+            applied_storage[:, :active_columns],
+        )
+        hamiltonian_applications = active_columns
+    else:
+        supplied_applied = np.asarray(initial_applied, dtype=np.complex128)
+        if supplied_applied.shape != basis.shape:
+            raise ValueError("initial_applied must match the initial Ritz block")
+        applied_storage[:, :active_columns] = supplied_applied
+        hamiltonian_applications = 0
     applied_basis = applied_storage[:, :active_columns]
-    hamiltonian_applications = active_columns
     projected_storage = np.zeros(
         (maximum_subspace, maximum_subspace), dtype=complex
     )
@@ -589,9 +696,7 @@ def davidson(
 
     update_projected(0)
 
-    def ritz_pairs() -> tuple[
-        np.ndarray, np.ndarray, np.ndarray, np.ndarray
-    ]:
+    def ritz_pairs() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         with (
             timers.measure("cdiaghg")
             if timers is not None
@@ -607,18 +712,26 @@ def davidson(
             if timers is not None
             else nullcontext()
         ):
-            vectors = basis @ coefficients
-            applied = applied_basis @ coefficients
-            residual = applied - vectors * roots[None, :]
-        return roots, vectors, applied, residual
+            vectors = _matmul_f(basis, coefficients)
+            # Form H|psi>-epsilon|psi> directly in its final owner.  The
+            # former separate H|psi> Ritz matrix was only needed at a rare
+            # Davidson restart and raised the large-Npw peak by one band
+            # block on every rank.
+            residual = _matmul_f(applied_basis, coefficients)
+            _load_native_fft().subtract_band_energies(
+                residual,
+                vectors,
+                np.ascontiguousarray(roots, dtype=np.float64),
+            )
+        return roots, vectors, residual
 
     if initial_is_ritz:
         # QE cegterg(lrot=.true.) trusts rotate_wfc: it does not perform a
         # second initial reduced diagonalization, but starts from the rotated
         # vectors and diagonal projected energies with vc=I.
         if initial_eigenvalues is None:
-            projected_diagonal = mpi.sum_array(
-                np.sum(basis.conj() * applied_basis, axis=0)
+            projected_diagonal = _column_expectations(
+                basis, applied_basis, mpi
             )
             values = np.real(projected_diagonal[:number_of_roots])
         else:
@@ -626,12 +739,11 @@ def davidson(
                 initial_eigenvalues[:number_of_roots], dtype=float
             )
         ritz_vectors = basis[:, :number_of_roots]
-        applied_ritz = applied_basis[:, :number_of_roots]
-        residuals = (
-            applied_ritz - ritz_vectors * values[None, :]
+        residuals = _form_residual(
+            applied_basis[:, :number_of_roots], ritz_vectors, values
         )
     else:
-        values, ritz_vectors, applied_ritz, residuals = ritz_pairs()
+        values, ritz_vectors, residuals = ritz_pairs()
     track_residual_norms = (
         residual_factor is not None or residual_energy_scale is not None
     )
@@ -679,14 +791,21 @@ def davidson(
         basis_storage[:, old_columns:active_columns] = corrections
         basis = basis_storage[:, :active_columns]
         corrections = basis_storage[:, old_columns:active_columns]
-        applied_corrections = operator(corrections)
-        applied_storage[:, old_columns:active_columns] = (
-            applied_corrections
+        # The correction is now owned by basis_storage.  The preceding Ritz
+        # pair is no longer used, so release both band blocks before Hpsi and
+        # before constructing the replacement pair.  This prevents old and
+        # new Ritz/residual blocks from overlapping at the Davidson peak.
+        del ritz_vectors, residuals
+        _apply_into(
+            operator,
+            operator_into,
+            corrections,
+            applied_storage[:, old_columns:active_columns],
         )
         applied_basis = applied_storage[:, :active_columns]
         hamiltonian_applications += corrections.shape[1]
         update_projected(old_columns)
-        values, ritz_vectors, applied_ritz, residuals = ritz_pairs()
+        values, ritz_vectors, residuals = ritz_pairs()
         if track_residual_norms:
             residual_norms = reduced_residual_norms(residuals)
         converged = (
@@ -730,10 +849,15 @@ def davidson(
                 active_columns = number_of_roots
                 basis_storage[:, :active_columns] = ritz_vectors
                 basis = basis_storage[:, :active_columns]
-                # The Ritz vectors and their H images use the same reduced-
-                # space rotation. Carry both through the restart as QE does;
-                # reapplying H here only repeats an expensive FFT block.
-                applied_storage[:, :active_columns] = applied_ritz
+                # Reconstruct H|psi> = residual + epsilon|psi> directly in
+                # its destination.  This preserves QE's no-extra-H restart
+                # while avoiding a permanently live H|psi> Ritz matrix.
+                np.multiply(
+                    ritz_vectors,
+                    values[None, :],
+                    out=applied_storage[:, :active_columns],
+                )
+                applied_storage[:, :active_columns] += residuals
                 applied_basis = applied_storage[:, :active_columns]
                 projected_storage[:active_columns, :active_columns] = 0.0
                 projected_storage[
@@ -792,6 +916,19 @@ def _global_inner(
     )
 
 
+def _apply_into(
+    operator: BlockOperator,
+    operator_into: BlockOperatorInto | None,
+    vectors: np.ndarray,
+    destination: np.ndarray,
+) -> np.ndarray:
+    """Evaluate H vectors in solver-owned storage when supported."""
+    if operator_into is not None:
+        return operator_into(vectors, destination)
+    destination[...] = operator(vectors)
+    return destination
+
+
 def _initial_iterative_subspace(
     operator: BlockOperator,
     number_of_roots: int,
@@ -799,6 +936,10 @@ def _initial_iterative_subspace(
     mpi: MPIContext,
     *,
     initial_is_orthonormal: bool,
+    operator_into: BlockOperatorInto | None = None,
+    initial_applied: np.ndarray | None = None,
+    initial_eigenvalues: np.ndarray | None = None,
+    initial_is_ritz: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     trial = np.asarray(initial_vectors, dtype=complex)
     if trial.ndim != 2 or trial.shape[1] < number_of_roots:
@@ -806,21 +947,45 @@ def _initial_iterative_subspace(
             "initial_vectors must contain at least number_of_roots columns"
         )
     vectors = (
-        trial[:, :number_of_roots].copy()
+        np.array(
+            trial[:, :number_of_roots],
+            dtype=np.complex128,
+            order="F" if initial_is_ritz else "K",
+            copy=True,
+        )
         if initial_is_orthonormal
         else _orthonormalize(trial, mpi=mpi)[:, :number_of_roots]
     )
     if vectors.shape[1] < number_of_roots:
         raise ValueError("initial vectors are linearly dependent")
-    applied = operator(vectors)
+    if initial_is_ritz:
+        if initial_applied is None or initial_eigenvalues is None:
+            raise ValueError(
+                "initial Ritz vectors require H-vectors and eigenvalues"
+            )
+        applied = np.array(
+            initial_applied, dtype=np.complex128, order="F", copy=True
+        )
+        if applied.shape != vectors.shape:
+            raise ValueError("initial_applied must match initial vectors")
+        return (
+            vectors,
+            np.asarray(
+                initial_eigenvalues[:number_of_roots], dtype=float
+            ).copy(),
+            applied,
+            0,
+        )
+    applied = np.empty_like(vectors, order="F")
+    _apply_into(operator, operator_into, vectors, applied)
     projected = mpi.sum_array(vectors.conj().T @ applied)
     projected = 0.5 * (projected + projected.conj().T)
     values, rotation = np.linalg.eigh(projected)
     rotation = rotation[:, :number_of_roots]
     return (
-        vectors @ rotation,
+        _matmul_f(vectors, rotation),
         np.real(values[:number_of_roots]),
-        applied @ rotation,
+        _matmul_f(applied, rotation),
         number_of_roots,
     )
 
@@ -837,8 +1002,19 @@ def conjugate_gradient(
     full_accuracy: bool = False,
     initial_is_orthonormal: bool = False,
     mpi: MPIContext | None = None,
+    operator_into: BlockOperatorInto | None = None,
+    initial_applied: np.ndarray | None = None,
+    initial_eigenvalues: np.ndarray | None = None,
+    initial_is_ritz: bool = False,
 ) -> DavidsonResult:
-    """QE-style preconditioned band-by-band conjugate-gradient solver."""
+    """QE ``ccgdiagg`` band-by-band conjugate-gradient solver.
+
+    ``diagonal`` is the rank-local kinetic energy in Hartree.  QE builds its
+    CG preconditioner from ``g2kin`` in Rydberg units and then performs an
+    analytic two-vector line minimisation.  The orbital and H-orbital are
+    views of their persistent band blocks, so only the five genuine work
+    vectors are retained outside the band loop.
+    """
     if tolerance <= 0.0:
         raise ValueError("diagonalization tolerance must be positive")
     if max_iterations < 1:
@@ -850,6 +1026,10 @@ def conjugate_gradient(
         initial_vectors,
         mpi,
         initial_is_orthonormal=initial_is_orthonormal,
+        operator_into=operator_into,
+        initial_applied=initial_applied,
+        initial_eigenvalues=initial_eigenvalues,
+        initial_is_ritz=initial_is_ritz,
     )
     root_tolerances = _iterative_root_tolerances(
         number_of_roots,
@@ -857,11 +1037,20 @@ def conjugate_gradient(
         occupied_roots,
         full_accuracy,
     )
+    kinetic_ry = 2.0 * np.asarray(diagonal, dtype=float)
+    precondition = (
+        1.0 + kinetic_ry + np.sqrt(1.0 + (kinetic_ry - 1.0) ** 2)
+    )
+    gradient = np.empty(vectors.shape[0], dtype=np.complex128)
+    conjugate = np.empty_like(gradient)
+    h_conjugate = np.empty_like(gradient)
+    previous_metric_gradient = np.empty_like(gradient)
+    projected_psi = np.empty_like(gradient)
     unconverged = 0
     iteration_sum = 0
     for band in range(number_of_roots):
-        psi = vectors[:, band].copy()
-        hpsi = applied[:, band].copy()
+        psi = vectors[:, band]
+        hpsi = applied[:, band]
         if band:
             lower = vectors[:, :band]
             coefficients = mpi.sum_array(lower.conj().T @ psi)
@@ -873,58 +1062,119 @@ def conjugate_gradient(
             psi /= norm
             hpsi /= norm
         energy = float(np.real(_global_inner(psi, hpsi, mpi)))
-        previous_direction: np.ndarray | None = None
         converged = False
+        previous_gg = 0.0
+        previous_cg_norm = 0.0
+        previous_sine = 0.0
         for iteration in range(1, max_iterations + 1):
-            residual = hpsi - energy * psi
-            correction = _qe_precondition(
-                residual[:, None], np.array([energy]), diagonal
-            )[:, 0]
-            candidates = (
-                correction[:, None]
-                if previous_direction is None
-                else np.column_stack((correction, previous_direction))
+            # QE applies P to H|psi> and |psi> separately, then removes the
+            # component parallel to the current orbital in the P^2 metric.
+            np.divide(hpsi, precondition, out=gradient)
+            np.divide(psi, precondition, out=projected_psi)
+            moments = mpi.sum_array(
+                np.asarray(
+                    [np.vdot(psi, gradient), np.vdot(psi, projected_psi)],
+                    dtype=np.complex128,
+                )
             )
-            against = np.column_stack((vectors[:, :band], psi))
-            candidates = _orthonormalize(
-                candidates, against=against, mpi=mpi
+            projected_energy = float(np.real(moments[0] / moments[1]))
+            gradient -= projected_energy * projected_psi
+            if band:
+                coefficients = mpi.sum_array(
+                    vectors[:, :band].conj().T @ gradient
+                )
+                gradient -= vectors[:, :band] @ coefficients
+
+            if iteration > 1:
+                cross = float(
+                    np.real(_global_inner(
+                        gradient, previous_metric_gradient, mpi
+                    ))
+                )
+            np.multiply(gradient, precondition, out=previous_metric_gradient)
+            gg = float(
+                np.real(_global_inner(
+                    gradient, previous_metric_gradient, mpi
+                ))
             )
-            if not candidates.shape[1]:
+            if not np.isfinite(gg) or gg <= 1.0e-30:
                 break
-            h_candidates = operator(candidates)
-            applications += candidates.shape[1]
-            small_basis = np.column_stack((psi, candidates))
-            h_small_basis = np.column_stack((hpsi, h_candidates))
-            h_small = mpi.sum_array(
-                small_basis.conj().T @ h_small_basis
+            if iteration == 1:
+                conjugate[...] = gradient
+            else:
+                gamma = (gg - cross) / max(previous_gg, 1.0e-300)
+                # After the previous line rotation the old conjugate vector
+                # is no longer exactly perpendicular to psi.  QE removes the
+                # known analytic component without another global reduction.
+                conjugate *= gamma
+                conjugate += gradient
+                conjugate -= (
+                    gamma * previous_cg_norm * previous_sine
+                ) * psi
+            previous_gg = gg
+
+            _apply_into(
+                operator, operator_into, conjugate, h_conjugate
             )
-            s_small = mpi.sum_array(
-                small_basis.conj().T @ small_basis
+            applications += 1
+            cg_squared = float(
+                np.real(_global_inner(conjugate, conjugate, mpi))
             )
-            roots, coefficients = _lowest_generalized_eigh(
-                h_small, s_small, 1
+            if cg_squared <= 1.0e-30:
+                break
+            cg_norm = np.sqrt(cg_squared)
+            line_terms = mpi.sum_array(
+                np.asarray(
+                    [
+                        np.vdot(psi, h_conjugate),
+                        np.vdot(conjugate, h_conjugate),
+                    ],
+                    dtype=np.complex128,
+                )
             )
+            a0 = 2.0 * float(np.real(line_terms[0])) / cg_norm
+            b0 = float(np.real(line_terms[1])) / cg_squared
+            denominator = energy - b0
+            theta = 0.5 * np.arctan(
+                a0 / denominator
+                if denominator != 0.0
+                else np.copysign(np.inf, a0)
+            )
+            cosine = float(np.cos(theta))
+            sine = float(np.sin(theta))
+            cos2 = cosine * cosine - sine * sine
+            sin2 = 2.0 * cosine * sine
+            roots = np.asarray(
+                [
+                    0.5 * ((energy - b0) * cos2 + a0 * sin2 + energy + b0),
+                    0.5 * (-(energy - b0) * cos2 - a0 * sin2 + energy + b0),
+                ]
+            )
+            if roots[1] < roots[0]:
+                theta += 0.5 * np.pi
+                cosine = float(np.cos(theta))
+                sine = float(np.sin(theta))
             old_energy = energy
-            coefficient = coefficients[:, 0]
-            previous_direction = candidates @ coefficient[1:]
-            psi = small_basis @ coefficient
-            hpsi = h_small_basis @ coefficient
-            energy = float(roots[0])
+            energy = float(np.min(roots))
+            psi *= cosine
+            psi += (sine / cg_norm) * conjugate
+            hpsi *= cosine
+            hpsi += (sine / cg_norm) * h_conjugate
+            previous_cg_norm = cg_norm
+            previous_sine = sine
             if abs(energy - old_energy) < root_tolerances[band]:
                 converged = True
-                iteration_sum += iteration
                 break
         if not converged:
             unconverged += 1
-            iteration_sum += max_iterations
-        vectors[:, band] = psi
-        applied[:, band] = hpsi
+        # QE includes the initial H|psi> evaluation in avg_iter.
+        iteration_sum += iteration + 1
         values[band] = energy
     order = np.argsort(values)
     values = values[order]
     vectors = vectors[:, order]
     applied = applied[:, order]
-    residuals = applied - vectors * values[None, :]
+    residuals = _form_residual(applied, vectors, values)
     return DavidsonResult(
         values,
         vectors,
@@ -934,6 +1184,145 @@ def conjugate_gradient(
         unconverged,
         applications,
     )
+
+
+def _paro_bpcg(
+    operator: BlockOperator,
+    diagonal: np.ndarray,
+    reference_vectors: np.ndarray,
+    initial_vectors: np.ndarray,
+    initial_applied: np.ndarray,
+    eigenvalues: np.ndarray,
+    tolerance: float,
+    mpi: MPIContext,
+    *,
+    max_iterations: int = 5,
+    operator_into: BlockOperatorInto | None = None,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Solve QE ``bpcg_k`` corrections for norm-conserving ``S=I``."""
+    count = initial_vectors.shape[1]
+    corrections = np.zeros_like(initial_vectors, order="F")
+    h_corrections = np.zeros_like(initial_vectors, order="F")
+    if count == 0:
+        return corrections, h_corrections, 0
+
+    rhs = initial_vectors * eigenvalues[None, :] - initial_applied
+    preconditioned = _qe_precondition(rhs, eigenvalues, diagonal)
+    projection = mpi.sum_array(reference_vectors.conj().T @ preconditioned)
+    preconditioned -= reference_vectors @ projection
+    g0 = np.real(_column_expectations(preconditioned, rhs, mpi))
+    thresholds = np.maximum(0.01 * tolerance, 0.01 * g0)
+    directions = np.array(preconditioned, order="F", copy=True)
+    previous_function = np.zeros(count, dtype=float)
+    active = np.arange(count, dtype=int)
+    applications = 0
+
+    for cg_iteration in range(1, max_iterations + 1):
+        if not len(active):
+            break
+        active_directions = directions[:, active]
+        h_directions = np.empty_like(active_directions, order="F")
+        _apply_into(
+            operator, operator_into, active_directions, h_directions
+        )
+        applications += len(active)
+        active_energies = eigenvalues[active]
+        gamma = np.real(
+            _column_expectations(active_directions, h_directions, mpi)
+        ) - active_energies * np.real(
+            _column_expectations(active_directions, active_directions, mpi)
+        )
+        safe_gamma = np.where(
+            np.abs(gamma) > 1.0e-30,
+            gamma,
+            np.copysign(1.0e-30, gamma + (gamma == 0.0)),
+        )
+        alpha = g0[active] / safe_gamma
+        corrections[:, active] += active_directions * alpha[None, :]
+        h_corrections[:, active] += h_directions * alpha[None, :]
+
+        gradient = (
+            rhs[:, active]
+            + corrections[:, active] * active_energies[None, :]
+            - h_corrections[:, active]
+        )
+        old_preconditioned = preconditioned[:, active]
+        g2 = np.real(
+            _column_expectations(old_preconditioned, gradient, mpi)
+        )
+        new_preconditioned = _qe_precondition(
+            gradient, active_energies, diagonal
+        )
+        projection = mpi.sum_array(
+            reference_vectors.conj().T @ new_preconditioned
+        )
+        new_preconditioned -= reference_vectors @ projection
+        g1 = np.real(
+            _column_expectations(new_preconditioned, gradient, mpi)
+        )
+
+        correction_norm = np.real(
+            _column_expectations(
+                corrections[:, active], corrections[:, active], mpi
+            )
+        )
+        correction_h = np.real(
+            _column_expectations(
+                corrections[:, active], h_corrections[:, active], mpi
+            )
+        )
+        correction_rhs = np.real(
+            _column_expectations(corrections[:, active], rhs[:, active], mpi)
+        )
+        function_value = 0.5 * (
+            correction_h - active_energies * correction_norm
+        ) - correction_rhs
+        function_increased = function_value > previous_function[active]
+        rollback_step = (
+            function_increased & (previous_function[active] < 0.0)
+        )
+        if np.any(rollback_step):
+            failed = active[rollback_step]
+            corrections[:, failed] -= (
+                directions[:, failed] * alpha[rollback_step][None, :]
+            )
+            h_corrections[:, failed] -= (
+                h_directions[:, rollback_step]
+                * alpha[rollback_step][None, :]
+            )
+
+        finished = (
+            (np.abs(g1) < thresholds[active])
+            | function_increased
+            | (cg_iteration == max_iterations)
+        )
+        continuing_mask = ~finished
+        if not np.any(continuing_mask):
+            break
+        continuing = active[continuing_mask]
+        denominator = np.where(
+            np.abs(g0[continuing]) > 1.0e-30,
+            g0[continuing],
+            np.copysign(
+                1.0e-30,
+                g0[continuing] + (g0[continuing] == 0.0),
+            ),
+        )
+        beta = (
+            g1[continuing_mask] - g2[continuing_mask]
+        ) / denominator
+        directions[:, continuing] = (
+            new_preconditioned[:, continuing_mask]
+            + directions[:, continuing] * beta[None, :]
+        )
+        preconditioned[:, continuing] = (
+            new_preconditioned[:, continuing_mask]
+        )
+        g0[continuing] = g1[continuing_mask]
+        previous_function[continuing] = function_value[continuing_mask]
+        active = continuing
+
+    return corrections, h_corrections, applications
 
 
 def parallel_orbital(
@@ -948,66 +1337,132 @@ def parallel_orbital(
     full_accuracy: bool = False,
     initial_is_orthonormal: bool = False,
     mpi: MPIContext | None = None,
+    operator_into: BlockOperatorInto | None = None,
+    initial_applied: np.ndarray | None = None,
+    initial_eigenvalues: np.ndarray | None = None,
+    initial_is_ritz: bool = False,
 ) -> DavidsonResult:
-    """Parallel orbital-updating iteration with a bounded 2N Ritz space."""
+    """QE ``paro_k_new`` solver for the norm-conserving ``S=I`` case."""
     if tolerance <= 0.0 or max_iterations < 1:
         raise ValueError("invalid ParO diagonalization controls")
     mpi = mpi if mpi is not None else MPIContext()
+    # paro_k_new always recomputes H|psi> and calls rotate_HSpsi, including
+    # after wfcinit has supplied an already-rotated Ritz block.
+    del initial_applied, initial_eigenvalues, initial_is_ritz
     vectors, values, applied, applications = _initial_iterative_subspace(
         operator,
         number_of_roots,
         initial_vectors,
         mpi,
         initial_is_orthonormal=initial_is_orthonormal,
+        operator_into=operator_into,
+        initial_applied=None,
+        initial_eigenvalues=None,
+        initial_is_ritz=False,
     )
-    root_tolerances = _iterative_root_tolerances(
-        number_of_roots, tolerance, occupied_roots, full_accuracy
+    # QE's btype argument is unused by paro_k_new: all trusted roots use ethr.
+    del occupied_roots, full_accuracy
+    root_tolerances = np.full(number_of_roots, tolerance, dtype=float)
+    maximum_subspace = number_of_roots + max(
+        (number_of_roots + 1) // 2, 4
     )
-    unconverged = np.ones(number_of_roots, dtype=bool)
-    residuals = applied - vectors * values[None, :]
-    for iteration in range(1, max_iterations + 1):
-        corrections = _qe_precondition(
-            residuals[:, unconverged],
-            values[unconverged],
-            diagonal,
+    maximum_subspace = min(
+        vectors.shape[0] * mpi.size, maximum_subspace
+    )
+    basis_storage = np.empty(
+        (vectors.shape[0], maximum_subspace),
+        dtype=np.complex128,
+        order="F",
+    )
+    applied_storage = np.empty_like(basis_storage)
+    basis_storage[:, :number_of_roots] = vectors
+    applied_storage[:, :number_of_roots] = applied
+    converged_roots = np.zeros(number_of_roots, dtype=bool)
+
+    for _iteration in range(1, max_iterations + 1):
+        converged_count = int(np.count_nonzero(converged_roots))
+        active_count = min(
+            (maximum_subspace - converged_count) // 2,
+            maximum_subspace - number_of_roots,
         )
-        corrections = _orthonormalize(
-            corrections, against=vectors, mpi=mpi
+        base_count = max(converged_count + active_count, number_of_roots)
+        trusted_count = min(
+            converged_count + active_count, number_of_roots
         )
-        if not corrections.shape[1]:
+        if active_count <= 0:
             break
-        applied_corrections = operator(corrections)
-        applications += corrections.shape[1]
-        basis = np.column_stack((vectors, corrections))
-        h_basis = np.column_stack((applied, applied_corrections))
+
+        trusted_unconverged = np.flatnonzero(
+            ~converged_roots[:trusted_count]
+        )
+        candidate_columns = list(map(int, trusted_unconverged))
+        candidate_energies = list(values[trusted_unconverged])
+        if len(candidate_columns) < active_count:
+            if not len(trusted_unconverged):
+                break
+            last_energy = float(values[trusted_unconverged[-1]])
+            for column in range(number_of_roots, base_count):
+                candidate_columns.append(column)
+                candidate_energies.append(last_energy)
+                if len(candidate_columns) == active_count:
+                    break
+        candidate_columns = candidate_columns[:active_count]
+        candidate_energies_array = np.asarray(
+            candidate_energies[:active_count], dtype=float
+        )
+
+        corrections, h_corrections, correction_applications = _paro_bpcg(
+            operator,
+            diagonal,
+            basis_storage[:, :number_of_roots],
+            basis_storage[:, candidate_columns],
+            applied_storage[:, candidate_columns],
+            candidate_energies_array,
+            tolerance,
+            mpi,
+            operator_into=operator_into,
+        )
+        applications += correction_applications
+        dimension = base_count + active_count
+        basis_storage[:, base_count:dimension] = corrections
+        applied_storage[:, base_count:dimension] = h_corrections
+        basis = basis_storage[:, :dimension]
+        h_basis = applied_storage[:, :dimension]
         h_small = mpi.sum_array(basis.conj().T @ h_basis)
         s_small = mpi.sum_array(basis.conj().T @ basis)
         new_values, coefficients = _lowest_generalized_eigh(
-            h_small, s_small, number_of_roots
+            h_small, s_small, dimension
         )
-        old_values = values
-        vectors = basis @ coefficients
-        applied = h_basis @ coefficients
-        values = new_values
-        residuals = applied - vectors * values[None, :]
-        unconverged = np.abs(values - old_values) >= root_tolerances
-        if not np.any(unconverged):
-            return DavidsonResult(
-                values,
-                vectors,
-                _column_norms(residuals, mpi),
-                iteration,
-                True,
-                0,
-                applications,
-            )
+        rotated_basis = _matmul_f(basis, coefficients)
+        rotated_applied = _matmul_f(h_basis, coefficients)
+        basis_storage[:, :dimension] = rotated_basis
+        applied_storage[:, :dimension] = rotated_applied
+
+        old_values = values.copy()
+        values = new_values[:number_of_roots].copy()
+        converged_roots.fill(False)
+        converged_roots[:trusted_count] = (
+            np.abs(values[:trusted_count] - old_values[:trusted_count])
+            < root_tolerances[:trusted_count]
+        )
+        if np.all(converged_roots):
+            break
+
+    vectors = np.array(
+        basis_storage[:, :number_of_roots], order="F", copy=True
+    )
+    applied = np.array(
+        applied_storage[:, :number_of_roots], order="F", copy=True
+    )
+    residuals = _form_residual(applied, vectors, values)
+    number_unconverged = int(np.count_nonzero(~converged_roots))
     return DavidsonResult(
         values,
         vectors,
         _column_norms(residuals, mpi),
-        max_iterations,
-        False,
-        int(np.count_nonzero(unconverged)),
+        applications / number_of_roots,
+        number_unconverged == 0,
+        number_unconverged,
         applications,
     )
 
@@ -1015,19 +1470,59 @@ def parallel_orbital(
 def _blocked_orthonormalize(
     vectors: np.ndarray, block_size: int, mpi: MPIContext
 ) -> np.ndarray:
-    blocks: list[np.ndarray] = []
+    output = np.empty_like(vectors)
+    active = 0
     for start in range(0, vectors.shape[1], block_size):
-        against = np.column_stack(blocks) if blocks else None
         block = _orthonormalize(
             vectors[:, start : start + block_size],
-            against=against,
+            against=output[:, :active] if active else None,
             mpi=mpi,
         )
         if block.shape[1]:
-            blocks.append(block)
-    return np.column_stack(blocks) if blocks else np.empty(
-        (vectors.shape[0], 0), dtype=complex
-    )
+            output[:, active : active + block.shape[1]] = block
+            active += block.shape[1]
+    return output[:, :active]
+
+
+def _blocked_orthonormalize_pair(
+    vectors: np.ndarray,
+    applied: np.ndarray,
+    block_size: int,
+    mpi: MPIContext,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Blocked Gram--Schmidt while carrying ``H|psi>`` through rotations."""
+    output = np.empty_like(vectors)
+    h_output = np.empty_like(applied)
+    active = 0
+    for start in range(0, vectors.shape[1], block_size):
+        stop = min(start + block_size, vectors.shape[1])
+        width = stop - start
+        block = vectors[:, start:stop].copy()
+        h_block = applied[:, start:stop].copy()
+        if active:
+            for _ in range(2):
+                projection = mpi.sum_array(
+                    output[:, :active].conj().T @ block
+                )
+                block -= output[:, :active] @ projection
+                h_block -= h_output[:, :active] @ projection
+        gram = mpi.sum_array(block.conj().T @ block)
+        gram = 0.5 * (gram + gram.conj().T)
+        squared, rotation = np.linalg.eigh(gram)
+        order = np.argsort(squared)[::-1]
+        squared = np.maximum(np.real(squared[order]), 0.0)
+        if not len(squared) or squared[0] <= 0.0:
+            continue
+        keep = squared > 1.0e-24 * squared[0]
+        transform = rotation[:, order][:, keep]
+        transform /= np.sqrt(squared[keep])[None, :]
+        rank = transform.shape[1]
+        output[:, active : active + rank] = block @ transform
+        h_output[:, active : active + rank] = h_block @ transform
+        active += rank
+        if active >= vectors.shape[1]:
+            break
+    return output[:, :active], h_output[:, :active]
 
 
 def rmm_diis(
@@ -1045,8 +1540,12 @@ def rmm_diis(
     full_accuracy: bool = False,
     initial_is_orthonormal: bool = False,
     mpi: MPIContext | None = None,
+    operator_into: BlockOperatorInto | None = None,
+    initial_applied: np.ndarray | None = None,
+    initial_eigenvalues: np.ndarray | None = None,
+    initial_is_ritz: bool = False,
 ) -> DavidsonResult:
-    """Residual-minimization method with per-band DIIS histories."""
+    """QE ``crmmdiagg`` residual minimisation with bounded DIIS history."""
     if history_dimension < 2:
         raise ValueError("diago_rmm_ndim must be at least 2")
     if gram_schmidt_block < 1:
@@ -1058,88 +1557,200 @@ def rmm_diis(
         initial_vectors,
         mpi,
         initial_is_orthonormal=initial_is_orthonormal,
+        operator_into=operator_into,
+        initial_applied=initial_applied,
+        initial_eigenvalues=initial_eigenvalues,
+        initial_is_ritz=initial_is_ritz,
     )
     tolerances = _iterative_root_tolerances(
         number_of_roots, tolerance, occupied_roots, full_accuracy
     )
-    vector_history: list[list[np.ndarray]] = [
-        [] for _ in range(number_of_roots)
-    ]
-    residual_history: list[list[np.ndarray]] = [
-        [] for _ in range(number_of_roots)
-    ]
-    residuals = applied - vectors * values[None, :]
+    local_dimension = vectors.shape[0]
+    vector_history = np.empty(
+        (local_dimension, number_of_roots, history_dimension),
+        dtype=np.complex128,
+        order="F",
+    )
+    applied_history = np.empty_like(vector_history)
+    energy_history = np.empty(
+        (number_of_roots, history_dimension), dtype=float
+    )
+    residuals = _form_residual(applied, vectors, values)
     unconverged = np.ones(number_of_roots, dtype=bool)
-    limit = max_iterations if converge else 1
-    for iteration in range(1, limit + 1):
-        trial = vectors.copy()
-        for band in range(number_of_roots):
-            vector_history[band].append(vectors[:, band].copy())
-            residual_history[band].append(residuals[:, band].copy())
-            if len(vector_history[band]) > history_dimension:
-                vector_history[band].pop(0)
-                residual_history[band].pop(0)
-            count = len(vector_history[band])
-            if count > 1:
-                phi = np.column_stack(vector_history[band])
-                res = np.column_stack(residual_history[band])
-                residual_gram = mpi.sum_array(res.conj().T @ res)
-                overlap = mpi.sum_array(phi.conj().T @ phi)
-                _, coefficients = _lowest_generalized_eigh(
-                    residual_gram, overlap, 1
-                )
-                trial[:, band] = phi @ coefficients[:, 0]
-        trial = _blocked_orthonormalize(
-            trial, gram_schmidt_block, mpi
-        )
-        if trial.shape[1] < number_of_roots:
+    kinetic_ry = 2.0 * np.asarray(diagonal, dtype=float)
+    accumulated_iterations = 0
+    completed = 0
+    for idiis in range(history_dimension):
+        completed = idiis + 1
+        active = np.flatnonzero(unconverged)
+        accumulated_iterations += len(active)
+        if not len(active):
             break
-        trial = trial[:, :number_of_roots]
-        h_trial = operator(trial)
-        applications += number_of_roots
-        h_small = mpi.sum_array(trial.conj().T @ h_trial)
-        h_small = 0.5 * (h_small + h_small.conj().T)
-        new_values, rotation = np.linalg.eigh(h_small)
-        old_values = values
-        values = np.real(new_values[:number_of_roots])
-        rotation = rotation[:, :number_of_roots]
-        vectors = trial @ rotation
-        applied = h_trial @ rotation
-        residuals = applied - vectors * values[None, :]
-        corrections = _qe_precondition(residuals, values, diagonal)
-        corrections = _orthonormalize(
-            corrections, against=vectors, mpi=mpi
+        vector_history[:, active, idiis] = vectors[:, active]
+        applied_history[:, active, idiis] = applied[:, active]
+        energy_history[active, idiis] = values[active]
+
+        # Minimise the residual norm independently in each band's DIIS
+        # history.  Only tiny (ndiis x ndiis) matrices are materialised.
+        for band in active:
+            count = idiis + 1
+            phi = vector_history[:, band, :count]
+            hphi = applied_history[:, band, :count]
+            history_energies = energy_history[band, :count]
+            if count == 1:
+                norm = np.sqrt(max(
+                    float(np.real(_global_inner(phi[:, 0], phi[:, 0], mpi))),
+                    1.0e-300,
+                ))
+                vectors[:, band] = phi[:, 0] / norm
+                applied[:, band] = hphi[:, 0] / norm
+                np.multiply(
+                    phi[:, 0], history_energies[0],
+                    out=residuals[:, band],
+                )
+                np.subtract(
+                    hphi[:, 0], residuals[:, band],
+                    out=residuals[:, band],
+                )
+                residuals[:, band] /= norm
+            else:
+                # R_i=Hphi_i-e_i phi_i.  Form R^H R from three tiny Gram
+                # matrices instead of materializing Npw-by-ndiis residual
+                # history for every band.  One packed reduction also replaces
+                # the former separate residual/overlap collectives.
+                hh_local = hphi.conj().T @ hphi
+                hp_local = hphi.conj().T @ phi
+                pp_local = phi.conj().T @ phi
+                packed = mpi.sum_array(
+                    np.concatenate(
+                        (hh_local.ravel(), hp_local.ravel(), pp_local.ravel())
+                    )
+                )
+                block_size = count * count
+                hh = packed[:block_size].reshape(count, count)
+                hp = packed[block_size : 2 * block_size].reshape(count, count)
+                overlap = packed[2 * block_size :].reshape(count, count)
+                residual_gram = hh.copy()
+                residual_gram -= hp * history_energies[None, :]
+                residual_gram -= (
+                    history_energies[:, None] * hp.conj().T
+                )
+                residual_gram += (
+                    history_energies[:, None]
+                    * overlap
+                    * history_energies[None, :]
+                )
+                try:
+                    _, coefficients = _lowest_generalized_eigh(
+                        residual_gram, overlap, 1
+                    )
+                    coefficient = coefficients[:, 0]
+                except (np.linalg.LinAlgError, ValueError):
+                    coefficient = np.zeros(count, dtype=np.complex128)
+                    coefficient[-1] = 1.0
+                vectors[:, band] = phi @ coefficient
+                applied[:, band] = hphi @ coefficient
+                np.multiply(
+                    history_energies,
+                    coefficient,
+                    out=coefficient,
+                )
+                residuals[:, band] = (
+                    applied[:, band] - phi @ coefficient
+                )
+
+        # Kresse--Furthmueller kinetic preconditioner and QE's bounded
+        # quadratic line search (SREF=.5, SMIN=.05, SMAX=1).
+        kinetic_expectation = np.real(
+            mpi.sum_array(
+                _load_native_fft().column_diagonal_expectations(
+                    vectors, kinetic_ry
+                )
+            )[active]
         )
-        if corrections.shape[1]:
-            h_corrections = operator(corrections)
-            applications += corrections.shape[1]
-            basis = np.column_stack((vectors, corrections))
-            h_basis = np.column_stack((applied, h_corrections))
-            h_small = mpi.sum_array(basis.conj().T @ h_basis)
-            s_small = mpi.sum_array(basis.conj().T @ basis)
-            values, coefficients = _lowest_generalized_eigh(
-                h_small, s_small, number_of_roots
-            )
-            vectors = basis @ coefficients
-            applied = h_basis @ coefficients
-            residuals = applied - vectors * values[None, :]
-        unconverged = np.abs(values - old_values) >= tolerances
-        if not np.any(unconverged):
-            return DavidsonResult(
-                values,
-                vectors,
-                _column_norms(residuals, mpi),
-                iteration,
-                True,
-                0,
-                applications,
-            )
+        kinetic_expectation = np.maximum(kinetic_expectation, 1.0e-14)
+        # Kresse--Furthmueller diagonal, evaluated directly into correction:
+        # x=G^2/(1.5<Ekin>), K=-4/(3<Ekin>) *
+        # (27+18x+12x^2+8x^3)/(27+18x+12x^2+8x^3+16x^4).
+        # The native elementwise loop avoids x, x^2, and kdiag matrices.
+        correction = _load_native_fft().rmm_kinetic_precondition(
+            residuals,
+            kinetic_ry,
+            np.ascontiguousarray(kinetic_expectation, dtype=np.float64),
+            np.ascontiguousarray(active, dtype=np.int64),
+        )
+        h_correction = np.empty_like(correction, order="F")
+        _apply_into(
+            operator, operator_into, correction, h_correction
+        )
+        applications += len(active)
+        for local_band, band in enumerate(active):
+            psi = vectors[:, band]
+            hpsi = applied[:, band]
+            kpsi = correction[:, local_band]
+            hkpsi = h_correction[:, local_band]
+            elements = mpi.sum_array(np.asarray([
+                np.vdot(psi, hpsi),
+                np.vdot(kpsi, hpsi),
+                np.vdot(kpsi, hkpsi),
+                np.vdot(psi, psi),
+                np.vdot(kpsi, psi),
+                np.vdot(kpsi, kpsi),
+            ], dtype=np.complex128))
+            php, khp, khk, psp, ksp, ksk = np.real(elements)
+            norm_ref = psp + 2.0 * ksp * 0.5 + ksk * 0.25
+            energy0 = php / psp
+            energy1 = (php + khp + 0.25 * khk) / norm_ref
+            slope = 2.0 * (khp * psp - php * ksp) / (psp * psp)
+            curvature = (energy1 - energy0 - 0.5 * slope) / 0.25
+            if abs(curvature) > 1.0e-16:
+                step = -0.5 * slope / curvature
+            else:
+                step = 1.0 if slope < 0.0 else 0.05
+            step = float(np.clip(step, 0.05, 1.0))
+            norm = np.sqrt(psp + 2.0 * ksp * step + ksk * step * step)
+            first = 1.0 / norm
+            second = step / norm
+            psi *= first
+            psi += second * kpsi
+            hpsi *= first
+            hpsi += second * hkpsi
+
+        old_values = values.copy()
+        values = np.real(_column_expectations(vectors, applied, mpi))
+        residuals = _form_residual(applied, vectors, values)
+        newly_converged = np.abs(values - old_values) < tolerances
+        unconverged &= ~newly_converged
+
+    vectors, applied = _blocked_orthonormalize_pair(
+        vectors, applied, gram_schmidt_block, mpi
+    )
+    if vectors.shape[1] < number_of_roots:
+        return DavidsonResult(
+            values,
+            vectors,
+            _column_norms(residuals[:, : vectors.shape[1]], mpi),
+            accumulated_iterations / max(number_of_roots, 1),
+            False,
+            number_of_roots - vectors.shape[1],
+            applications,
+        )
+    vectors = vectors[:, :number_of_roots]
+    applied = applied[:, :number_of_roots]
+    h_small = mpi.sum_array(vectors.conj().T @ applied)
+    h_small = 0.5 * (h_small + h_small.conj().T)
+    values, rotation = np.linalg.eigh(h_small)
+    values = np.real(values[:number_of_roots])
+    rotation = rotation[:, :number_of_roots]
+    vectors = _matmul_f(vectors, rotation)
+    applied = _matmul_f(applied, rotation)
+    residuals = _form_residual(applied, vectors, values)
     return DavidsonResult(
         values,
         vectors,
         _column_norms(residuals, mpi),
-        limit,
-        not converge,
+        accumulated_iterations / max(number_of_roots, 1),
+        (not converge) or not np.any(unconverged),
         0 if not converge else int(np.count_nonzero(unconverged)),
         applications,
     )

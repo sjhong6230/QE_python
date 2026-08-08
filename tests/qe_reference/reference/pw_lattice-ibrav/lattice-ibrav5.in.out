@@ -133,7 +133,7 @@
      occupation numbers
        1.0000    0.0000    0.0000    0.0000
 
-     highest occupied level (ev):   -10.2428
+     highest occupied, lowest unoccupied level (ev):   -10.2428    -0.3500
 
 !    total energy              =      -2.2530680930 Ry
      estimated scf accuracy    <       0.0000000092 Ry
