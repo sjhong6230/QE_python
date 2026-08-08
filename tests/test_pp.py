@@ -4,9 +4,17 @@ import numpy as np
 import h5py
 from pathlib import Path
 import shutil
+import pytest
 
+from qepy_pw.errors import QEInputError
+from qepy_pw.constants import EV_PER_HARTREE
 from qepy_pw.pp.band_data import BandData, read_band_file, write_band_file, write_gnuplot
-from qepy_pw.pp.bands import reorder_by_overlap, run_bands, write_irrep_file
+from qepy_pw.pp.bands import (
+    reorder_by_overlap,
+    run_bands,
+    write_band_grid_2d,
+    write_irrep_file,
+)
 from qepy_pw.pp.plotband import high_symmetry_indices, parse_plotband_input
 from qepy_pw.pp.p_matrix import momentum_matrices, write_p_avg
 
@@ -37,6 +45,64 @@ def test_overlap_ordering_tracks_crossed_states() -> None:
     wavefunctions = [(miller, identity), (miller, identity[:, ::-1])]
     ordered = reorder_by_overlap(data, wavefunctions)
     np.testing.assert_allclose(ordered.energies_ev[1], [0.8, 0.2])
+
+
+def test_no_overlap_true_preserves_eigenvalue_order_without_wavefunctions(
+    tmp_path, monkeypatch
+) -> None:
+    namespace = "http://www.quantum-espresso.org/ns/qes/qes-1.0"
+    save = tmp_path / "plain.save"
+    save.mkdir()
+    (save / "data-file-schema.xml").write_text(
+        f"""<espresso xmlns="{namespace}"><output><band_structure>
+        <ks_energies><k_point>0 0 0</k_point><eigenvalues>0 1</eigenvalues></ks_energies>
+        <ks_energies><k_point>0.5 0 0</k_point><eigenvalues>0.2 0.8</eigenvalues></ks_energies>
+        </band_structure></output></espresso>""",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    filband, _gnu = run_bands(
+        {
+            "prefix": "plain", "outdir": str(tmp_path),
+            "filband": "plain.bands", "lsym": False,
+            "no_overlap": True,
+        }
+    )
+    restored = read_band_file(filband)
+    np.testing.assert_allclose(
+        restored.energies_ev[1],
+        np.round(np.array([0.2, 0.8]) * EV_PER_HARTREE, 4),
+    )
+
+
+def test_plot_2d_writes_one_rectangular_grid_file_per_band(
+    tmp_path,
+) -> None:
+    origin = np.array([0.1, 0.2, 0.0])
+    dkx = np.array([0.25, 0.0, 0.0])
+    dky = np.array([0.0, 0.5, 0.0])
+    points = np.vstack(
+        [origin + i * dkx + j * dky for i in range(2) for j in range(3)]
+    )
+    energies = np.arange(12, dtype=float).reshape(6, 2)
+    outputs = write_band_grid_2d(
+        tmp_path / "grid.bands", BandData(points, energies)
+    )
+    assert [path.name for path in outputs] == ["grid.bands.1", "grid.bands.2"]
+    first = np.loadtxt(outputs[0])
+    np.testing.assert_allclose(first[:, 0], [0, 0, 0, 0.25, 0.25, 0.25])
+    np.testing.assert_allclose(first[:, 1], [0, 0.5, 1.0, 0, 0.5, 1.0])
+    np.testing.assert_allclose(first[:, 2], energies[:, 0])
+
+
+def test_plot_2d_rejects_nonrectangular_kpoint_order(tmp_path) -> None:
+    points = np.array(
+        [[0, 0, 0], [0, 1, 0], [1, 0, 0], [1.1, 1, 0]], dtype=float
+    )
+    with pytest.raises(QEInputError, match="rectangular grid"):
+        write_band_grid_2d(
+            tmp_path / "bad", BandData(points, np.zeros((4, 1)))
+        )
 
 
 def test_irrep_file_uses_qe_plot_rap_header(tmp_path) -> None:

@@ -37,8 +37,14 @@ The plane-wave `k+G` contribution and both analytic q derivatives of the
 separable nonlocal projectors are included. Projector contractions are kept
 in low-rank form rather than materializing a dense plane-wave operator.
 
-The noncollinear `lsigma`, LSDA `spin_component`, and two-dimensional grid
-`plot_2d` paths are rejected explicitly.
+With `plot_2d=.true.`, the saved k points must be ordered as a rectangular
+grid `k(i,j) = k0 + i*dkx + j*dky`, with the second index varying fastest.
+One `filband.#` file per band is written with `kx_distance`, `ky_distance`,
+and energy in eV, matching QE's `punch_band_2d` convention. As in QE, this
+mode bypasses symmetry classification, overlap ordering, and `lp` output.
+
+The noncollinear `lsigma` and LSDA `spin_component` paths remain explicitly
+unsupported.
 
 ## `plotband.py`
 

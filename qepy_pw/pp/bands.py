@@ -194,7 +194,62 @@ def write_irrep_file(
     return output
 
 
-def run_bands(options: dict[str, object]) -> tuple[Path, Path]:
+def write_band_grid_2d(
+    filband: str | Path,
+    data: BandData,
+    tolerance: float = 1.0e-8,
+) -> list[Path]:
+    """Write QE ``plot_2d`` files, one ``kx ky energy`` grid per band."""
+    if data.nks < 4:
+        raise QEInputError("plot_2d requires at least a 2 by 2 k-point grid")
+    origin = data.kpoints[0]
+    dky = data.kpoints[1] - origin
+    if np.linalg.norm(dky) <= tolerance:
+        raise QEInputError("plot_2d has coincident first two k points")
+    n2 = None
+    dkx = None
+    for index in range(2, data.nks):
+        expected = origin + index * dky
+        if not np.allclose(data.kpoints[index], expected, rtol=0.0, atol=tolerance):
+            n2 = index
+            dkx = data.kpoints[index] - origin
+            break
+    if n2 is None or dkx is None or np.linalg.norm(dkx) <= tolerance:
+        raise QEInputError("plot_2d k points span only one direction")
+    if data.nks % n2:
+        raise QEInputError("plot_2d k-point count is not a rectangular grid")
+    n1 = data.nks // n2
+    for i1 in range(n1):
+        for i2 in range(n2):
+            index = i1 * n2 + i2
+            expected = origin + i1 * dkx + i2 * dky
+            if not np.allclose(
+                data.kpoints[index], expected, rtol=0.0, atol=tolerance
+            ):
+                raise QEInputError(
+                    f"plot_2d k point {index + 1} is inconsistent with "
+                    "the inferred rectangular grid"
+                )
+    length_x = float(np.linalg.norm(dkx))
+    length_y = float(np.linalg.norm(dky))
+    base = Path(filband)
+    outputs = []
+    for band in range(data.nbnd):
+        output = Path(f"{base}.{band + 1}")
+        with output.open("w", encoding="utf-8", newline="\n") as stream:
+            for i1 in range(n1):
+                for i2 in range(n2):
+                    index = i1 * n2 + i2
+                    stream.write(
+                        f"{length_x * i1:16.6f}"
+                        f"{length_y * i2:16.6f}"
+                        f"{data.energies_ev[index, band]:16.6f}\n"
+                    )
+        outputs.append(output)
+    return outputs
+
+
+def run_bands(options: dict[str, object]) -> tuple[Path, Path | None]:
     unknown = set(options) - _SUPPORTED_KEYS
     if unknown:
         raise QEInputError(f"unknown &BANDS variable {sorted(unknown)[0]!r}")
@@ -202,13 +257,14 @@ def run_bands(options: dict[str, object]) -> tuple[Path, Path]:
         raise UnsupportedFeatureError("spin_component requires an LSDA calculation")
     if any(bool(options.get(f"lsigma({i})", False)) for i in range(1, 5)):
         raise UnsupportedFeatureError("spin-matrix post-processing is not implemented")
-    if bool(options.get("plot_2d", False)):
-        raise UnsupportedFeatureError("plot_2d band grids are not implemented")
     prefix = str(options.get("prefix", "pwscf"))
     outdir = str(options["outdir"]) if "outdir" in options else None
     directory = resolve_save_directory(prefix, outdir)
     data = read_saved_bands(prefix, outdir)
     filband = Path(str(options.get("filband", "bands.out")))
+    if bool(options.get("plot_2d", False)):
+        write_band_grid_2d(filband, data)
+        return filband, None
     wavefunctions = None
     lsym = bool(options.get("lsym", True))
     lp = bool(options.get("lp", False))
@@ -248,8 +304,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         text = Path(args.input_file).read_text(encoding="utf-8") if args.input_file else sys.stdin.read()
         filband, gnuplot = run_bands(parse_namelist(text, "bands"))
-        print(f"     Bands written to file {filband}")
-        print(f"     Plottable bands (eV) written to file {gnuplot}")
+        if gnuplot is None:
+            print(f"     Two-dimensional bands written to files {filband}.#")
+        else:
+            print(f"     Bands written to file {filband}")
+            print(f"     Plottable bands (eV) written to file {gnuplot}")
         return 0
     except (QEInputError, UnsupportedFeatureError, OSError, ValueError) as exc:
         print(format_qe_error(exc), end="", file=sys.stderr)
