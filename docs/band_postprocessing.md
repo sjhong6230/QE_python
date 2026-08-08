@@ -25,8 +25,20 @@ integer classes are written using QE's `&plot_rap` format. With
 `lsym=.false., no_overlap=.false.`, adjacent bands are instead connected by a
 maximum-weight one-to-one assignment of wavefunction overlaps.
 
-The noncollinear `lsigma`, LSDA `spin_component`, velocity-matrix `lp`, and
-two-dimensional grid `plot_2d` paths are rejected explicitly.
+With `lp=.true.`, `bands.py` also writes QE's `&p_mat`/`filp` format. For the
+implemented scalar norm-conserving Hamiltonian, this is the squared
+conduction--valence matrix element of the velocity times electron mass,
+
+```text
+m v = p + i [V_nl, r].
+```
+
+The plane-wave `k+G` contribution and both analytic q derivatives of the
+separable nonlocal projectors are included. Projector contractions are kept
+in low-rank form rather than materializing a dense plane-wave operator.
+
+The noncollinear `lsigma`, LSDA `spin_component`, and two-dimensional grid
+`plot_2d` paths are rejected explicitly.
 
 ## `plotband.py`
 

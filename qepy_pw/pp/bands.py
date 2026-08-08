@@ -21,6 +21,7 @@ from .band_data import (
     write_gnuplot,
 )
 from .namelist import parse_namelist
+from .p_matrix import compute_and_write_p_avg
 
 
 _SUPPORTED_KEYS = {
@@ -199,8 +200,8 @@ def run_bands(options: dict[str, object]) -> tuple[Path, Path]:
         raise QEInputError(f"unknown &BANDS variable {sorted(unknown)[0]!r}")
     if int(options.get("spin_component", 1)) != 1:
         raise UnsupportedFeatureError("spin_component requires an LSDA calculation")
-    if bool(options.get("lp", False)) or any(bool(options.get(f"lsigma({i})", False)) for i in range(1, 5)):
-        raise UnsupportedFeatureError("momentum and spin-matrix post-processing is not implemented")
+    if any(bool(options.get(f"lsigma({i})", False)) for i in range(1, 5)):
+        raise UnsupportedFeatureError("spin-matrix post-processing is not implemented")
     if bool(options.get("plot_2d", False)):
         raise UnsupportedFeatureError("plot_2d band grids are not implemented")
     prefix = str(options.get("prefix", "pwscf"))
@@ -210,8 +211,19 @@ def run_bands(options: dict[str, object]) -> tuple[Path, Path]:
     filband = Path(str(options.get("filband", "bands.out")))
     wavefunctions = None
     lsym = bool(options.get("lsym", True))
-    if lsym or not bool(options.get("no_overlap", True)):
+    lp = bool(options.get("lp", False))
+    if lsym or lp or not bool(options.get("no_overlap", True)):
         wavefunctions = _read_wavefunctions(directory, data.nks)
+    if lp:
+        assert wavefunctions is not None
+        compute_and_write_p_avg(
+            str(options.get("filp", "p_avg.dat")),
+            data,
+            wavefunctions,
+            directory,
+            int(options.get("firstk", 0)),
+            int(options.get("lastk", 10_000_000)),
+        )
     if not lsym and not bool(options.get("no_overlap", True)):
         assert wavefunctions is not None
         data = reorder_by_overlap(data, wavefunctions)
