@@ -10,7 +10,7 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 
-from ..constants import EV_PER_HARTREE
+from ..constants import BOHR_PER_ANGSTROM, EV_PER_HARTREE
 from ..errors import QEInputError, UnsupportedFeatureError, format_qe_error
 from ..occupations import smearing_order, wgauss
 from ..pw.save import QES_NAMESPACE
@@ -27,6 +27,7 @@ _ALLOWED = {
     "lsym", "diag_basis", "pawproj", "filpdos", "filproj",
     "lwrite_overlaps", "lbinary_data", "kresolveddos", "tdosinboxes",
     "io_choice", "smoothing",
+    "n_proj_boxes", "plotboxes",
 }
 
 
@@ -50,6 +51,16 @@ class ProjectionData:
     orbitals: tuple[Orbital, ...]
     overlaps: tuple[np.ndarray, ...]
     fermi_ev: float | None
+
+
+@dataclass(frozen=True)
+class BoxData:
+    energies_ev: np.ndarray
+    weights: np.ndarray
+    occupations: np.ndarray
+    box_weights: np.ndarray
+    shape: tuple[int, int, int]
+    masks: tuple[np.ndarray, ...]
 
 
 def _xml_vector(element: ET.Element | None, name: str, ns: dict[str, str]) -> np.ndarray:
@@ -190,10 +201,14 @@ def symmetrize_projection_weights(
     lattice: np.ndarray,
     atoms,
     operations: tuple[SymmetryOperation, ...],
+    *,
+    diag_basis: bool = False,
+    kpoint_weights: np.ndarray | None = None,
+    occupations: np.ndarray | None = None,
 ) -> np.ndarray:
     """Rotate and average the full orbital projection density matrices."""
     values = np.asarray(amplitudes, dtype=np.complex128)
-    if len(operations) <= 1:
+    if len(operations) <= 1 and not diag_basis:
         return np.abs(values) ** 2
     inverse_lattice = np.linalg.inv(lattice)
     fractional_atoms = tuple(
@@ -205,6 +220,7 @@ def symmetrize_projection_weights(
         (orbital.atom, orbital.wfc, orbital.l, orbital.m): index
         for index, orbital in enumerate(orbitals)
     }
+    transforms = []
     for operation in operations:
         cartesian = inverse_lattice @ operation.matrix @ lattice
         atom_map = _atom_mapping(fractional_atoms, operation)
@@ -219,13 +235,41 @@ def symmetrize_projection_weights(
             for target_m in range(2 * orbital.l + 1):
                 target = lookup[(target_atom, orbital.wfc, orbital.l, target_m)]
                 transform[target, source] = representation[orbital.m, target_m]
+        transforms.append(transform)
+    rotations = None
+    if diag_basis:
+        if kpoint_weights is None or occupations is None:
+            raise ValueError("diag_basis requires k-point weights and occupations")
+        density = np.zeros((len(orbitals), len(orbitals)), dtype=np.complex128)
+        for transform in transforms:
+            rotated = np.einsum("...o,po->...p", values, transform)
+            density += np.einsum(
+                "k,kb,kbi,kbj->ij",
+                kpoint_weights,
+                occupations,
+                rotated.conj(),
+                rotated,
+            ) / len(transforms)
+        rotations = {}
+        for _orbital, columns in _groups(orbitals):
+            block = density[columns, columns]
+            _eigenvalues, eigenvectors = np.linalg.eigh(
+                0.5 * (block + block.conj().T)
+            )
+            rotations[(columns.start, columns.stop)] = eigenvectors
+    for transform in transforms:
         rotated = np.einsum("...o,po->...p", values, transform)
+        if rotations is not None:
+            for key, eigenvectors in rotations.items():
+                columns = slice(*key)
+                rotated[..., columns] = rotated[..., columns] @ eigenvectors
         averaged += np.abs(rotated) ** 2
     return averaged / len(operations)
 
 
 def compute_projections(
-    prefix: str = "pwscf", outdir: str | None = None, *, symmetrize: bool = True
+    prefix: str = "pwscf", outdir: str | None = None, *, symmetrize: bool = True,
+    diag_basis: bool = False,
 ) -> ProjectionData:
     import h5py
 
@@ -270,11 +314,19 @@ def compute_projections(
     assert orbitals is not None
     amplitudes_array = np.asarray(all_amplitudes)
     lattice, _reciprocal, atoms, _species, operations = geometry
+    projection_operations = (
+        operations
+        if symmetrize
+        else (SymmetryOperation(np.eye(3, dtype=int), np.zeros(3)),)
+    )
     projections = (
         symmetrize_projection_weights(
-            amplitudes_array, orbitals, lattice, atoms, operations
+            amplitudes_array, orbitals, lattice, atoms, projection_operations,
+            diag_basis=diag_basis,
+            kpoint_weights=saved.weights,
+            occupations=occupations,
         )
-        if symmetrize
+        if symmetrize or diag_basis
         else np.abs(amplitudes_array) ** 2
     )
     return ProjectionData(saved.eigenvalues_ev, saved.weights, projections, amplitudes_array, occupations, orbitals, tuple(overlaps), saved.fermi_ev)
@@ -288,6 +340,130 @@ def _dos_kernel(energies: np.ndarray, grid: np.ndarray, width: float, ngauss: in
     x = (grid[:, None, None] - energies[None, :, :]) / width
     step = 1.0e-5
     return (wgauss(x + step, ngauss) - wgauss(x - step, ngauss)) / (2.0 * step * width)
+
+
+def _indexed_box(options: dict[str, object], stem: str, box: int, shape) -> tuple[np.ndarray, ...]:
+    indices = []
+    for axis, size in enumerate(shape, start=1):
+        low = int(options.get(f"irmin({axis},{box})", 1))
+        high = int(options.get(f"irmax({axis},{box})", 0))
+        low = (low - 1) % size
+        high = size - 1 if high == 0 else (high - 1) % size
+        if high >= low:
+            values = np.arange(low, high + 1)
+        else:
+            values = np.concatenate((np.arange(0, high + 1), np.arange(low, size)))
+        indices.append(values)
+    return tuple(indices)
+
+
+def _box_projections(prefix: str, outdir: str | None, options: dict[str, object]) -> BoxData:
+    import h5py
+
+    directory = resolve_save_directory(prefix, outdir)
+    saved = read_saved_dos(prefix, outdir)
+    root = ET.parse(directory / "data-file-schema.xml").getroot()
+    ns = {"qes": QES_NAMESPACE}
+    fft = root.find("qes:output/qes:basis_set/qes:fft_grid", ns)
+    if fft is None:
+        raise QEInputError("box LDOS requires a saved FFT grid")
+    shape = tuple(int(fft.attrib[f"nr{i}"]) for i in range(1, 4))
+    records = root.findall("qes:output/qes:band_structure/qes:ks_energies", ns)
+    occupations = np.vstack([
+        np.fromstring(record.findtext("qes:occupations", default="", namespaces=ns), sep=" ")
+        for record in records
+    ])
+    count = int(options.get("n_proj_boxes", 1))
+    if count < 1:
+        raise QEInputError("n_proj_boxes must be positive")
+    boxes = [_indexed_box(options, "ir", box, shape) for box in range(1, count + 1)]
+    masks = []
+    for axes in boxes:
+        mask = np.zeros(shape, dtype=bool)
+        mask[np.ix_(*axes)] = True
+        masks.append(mask)
+    projections = []
+    points = int(np.prod(shape))
+    for ik in range(1, len(saved.weights) + 1):
+        path = directory / f"wfc{ik}.hdf5"
+        with h5py.File(path, "r") as h5:
+            miller = np.asarray(h5["MillerIndices"][:], dtype=np.int32)
+            coefficients = np.asarray(h5["evc"][:], dtype=np.complex128)
+        reciprocal_grid = np.zeros(shape, dtype=np.complex128)
+        band_weights = np.empty((coefficients.shape[0], count), dtype=float)
+        slots = tuple((miller[:, axis] % shape[axis]) for axis in range(3))
+        for band, values in enumerate(coefficients):
+            reciprocal_grid.fill(0.0)
+            reciprocal_grid[slots] = values
+            probability = np.abs(np.fft.ifftn(reciprocal_grid) * np.sqrt(points)) ** 2
+            for box, mask in enumerate(masks):
+                band_weights[band, box] = float(np.sum(probability[mask]))
+        projections.append(band_weights)
+    result = np.asarray(projections)
+    if np.any(result < -1.0e-12) or np.any(result > 1.0 + 1.0e-8):
+        raise QEInputError("real-space box projections violate wavefunction normalization")
+    return BoxData(saved.eigenvalues_ev, saved.weights, occupations, result, shape, tuple(masks))
+
+
+def _write_box_xsf(path: Path, mask: np.ndarray, lattice: np.ndarray) -> None:
+    with path.open("w", encoding="utf-8", newline="\n") as stream:
+        stream.write("CRYSTAL\nPRIMVEC\n")
+        for vector in lattice:
+            stream.write(" ".join(f"{value:16.9f}" for value in vector) + "\n")
+        stream.write("PRIMCOORD\n0 1\nBEGIN_BLOCK_DATAGRID_3D\nbox\nBEGIN_DATAGRID_3D_box\n")
+        stream.write(f"{mask.shape[0]} {mask.shape[1]} {mask.shape[2]}\n0 0 0\n")
+        for vector in lattice:
+            stream.write(" ".join(f"{value:16.9f}" for value in vector) + "\n")
+        flat = mask.astype(int).ravel(order="F")
+        for start in range(0, len(flat), 12):
+            stream.write(" ".join(map(str, flat[start:start + 12])) + "\n")
+        stream.write("END_DATAGRID_3D\nEND_BLOCK_DATAGRID_3D\n")
+
+
+def _run_boxes(options: dict[str, object], prefix: str, outdir: str | None) -> tuple[BoxData, list[Path]]:
+    data = _box_projections(prefix, outdir, options)
+    saved = read_saved_dos(prefix, outdir)
+    delta = float(options.get("deltae", 0.01))
+    if delta <= 0:
+        raise QEInputError("DeltaE must be positive")
+    degauss_ry = float(options.get("degauss", saved.degauss_ry))
+    if degauss_ry <= 0:
+        degauss_ry = delta / (0.5 * EV_PER_HARTREE)
+    width = 0.5 * degauss_ry * EV_PER_HARTREE
+    ngauss = int(options.get("ngauss", smearing_order(saved.smearing) if saved.degauss_ry > 0 else 0))
+    emin = float(options.get("emin", np.min(data.energies_ev) - 3.0 * width))
+    emax = float(options.get("emax", np.max(data.energies_ev) + 3.0 * width))
+    grid = emin + np.arange(int(np.floor((emax - emin) / delta + 1.000001))) * delta
+    kernel = _dos_kernel(data.energies_ev, grid, width, ngauss)
+    kresolved = bool(options.get("kresolveddos", False))
+    weights = np.ones_like(data.weights) if kresolved else data.weights
+    box_dos = 2.0 * np.einsum("ekb,k,kbx->ex", kernel, weights, data.box_weights)
+    output = Path(f"{options.get('filpdos', prefix)}.ldos_boxes")
+    with output.open("w", encoding="utf-8", newline="\n") as stream:
+        stream.write(("# ik E (eV)" if kresolved else "# E (eV)") + "".join(f" LDOS_box{box}" for box in range(1, box_dos.shape[1] + 1)) + "\n")
+        if kresolved:
+            for ik in range(len(data.weights)):
+                values_k = 2.0 * np.einsum("eb,bx->ex", kernel[:, ik], data.box_weights[ik])
+                for energy, values in zip(grid, values_k):
+                    stream.write(f"{ik + 1:6d} {energy:12.6f}" + "".join(f" {value:14.6e}" for value in values) + "\n")
+        else:
+            for energy, values in zip(grid, box_dos):
+                stream.write(f"{energy:12.6f}" + "".join(f" {value:14.6e}" for value in values) + "\n")
+    paths = [output]
+    if bool(options.get("plotboxes", False)):
+        lattice, _reciprocal, _atoms, _species, _operations = _saved_geometry(resolve_save_directory(prefix, outdir))
+        for box, mask in enumerate(data.masks, start=1):
+            path = Path(f"box#{box}.xsf")
+            _write_box_xsf(path, mask, lattice / BOHR_PER_ANGSTROM)
+            paths.append(path)
+    if "filproj" in options and str(options["filproj"]).strip():
+        path = Path(str(options["filproj"]))
+        with path.open("w", encoding="utf-8", newline="\n") as stream:
+            for ik, bands in enumerate(data.box_weights, start=1):
+                for band, values in enumerate(bands, start=1):
+                    stream.write(f"k = {ik:5d} band = {band:5d}" + "".join(f" box#{box + 1} = {value:.10e}" for box, value in enumerate(values)) + "\n")
+        paths.append(path)
+    return data, paths
 
 
 def _write_atomic_proj(path: Path, data: ProjectionData, include_overlaps: bool) -> None:
@@ -320,11 +496,14 @@ def _groups(orbitals: tuple[Orbital, ...]):
     return result
 
 
-def run_projwfc(options: dict[str, object]) -> tuple[ProjectionData, list[Path]]:
-    unknown = set(options) - _ALLOWED
+def run_projwfc(options: dict[str, object]) -> tuple[ProjectionData | BoxData, list[Path]]:
+    unknown = {
+        key for key in options
+        if key not in _ALLOWED and not key.startswith("irmin(") and not key.startswith("irmax(")
+    }
     if unknown:
         raise QEInputError(f"unknown &PROJWFC variable {sorted(unknown)[0]!r}")
-    for key in ("diag_basis", "pawproj", "lbinary_data", "tdosinboxes"):
+    for key in ("pawproj", "lbinary_data"):
         if bool(options.get(key, False)):
             raise UnsupportedFeatureError(f"projwfc {key}=.true. is not ported")
     if not bool(options.get("lsym", True)) and not bool(options.get("kresolveddos", False)):
@@ -334,8 +513,11 @@ def run_projwfc(options: dict[str, object]) -> tuple[ProjectionData, list[Path]]
     saved = read_saved_dos(prefix, outdir)
     if saved.occupations_kind.lower().startswith("tetra") and "degauss" not in options:
         raise UnsupportedFeatureError("projected tetrahedron DOS is not yet ported; specify degauss for smearing")
+    if bool(options.get("tdosinboxes", False)):
+        return _run_boxes(options, prefix, outdir)
     data = compute_projections(
-        prefix, outdir, symmetrize=bool(options.get("lsym", True))
+        prefix, outdir, symmetrize=bool(options.get("lsym", True)),
+        diag_basis=bool(options.get("diag_basis", False)),
     )
     delta = float(options.get("deltae", 0.01))
     if delta <= 0:
@@ -411,6 +593,14 @@ def main(argv=None) -> int:
     try:
         text = Path(args.input_file).read_text(encoding="utf-8") if args.input_file else sys.stdin.read()
         data, paths = run_projwfc(parse_namelist(text, "projwfc"))
+        if isinstance(data, BoxData):
+            charges = np.einsum(
+                "k,kb,kbx->x", data.weights, data.occupations, data.box_weights
+            )
+            for box, charge in enumerate(charges, start=1):
+                print(f"     box # {box:4d}: integrated occupied weight = {charge:11.6f}")
+            print("     PROJWFC box files written: " + ", ".join(str(path) for path in paths))
+            return 0
         charges = np.einsum("k,kb,kbo->o", data.weights, data.occupations, data.projections)
         for index, (orbital, charge) in enumerate(zip(data.orbitals, charges), start=1):
             print(f"     state # {index:4d}: atom {orbital.atom:4d} ({orbital.symbol}), wfc {orbital.wfc} (l={orbital.l} m={orbital.m + 1}) charge = {charge:9.5f}")

@@ -38,10 +38,29 @@ The real-harmonic order follows QE: `pz, px, py` for p orbitals and
 `dz2, dzx, dzy, dx2-y2, dxy` for d orbitals. `kresolveddos=.true.` prepends
 the k-point index and uses unit k-point weights.
 
+`diag_basis=.true.` constructs the occupation density matrix independently
+for every atom and radial `(n,l)` shell after Löwdin orthogonalization and
+crystal-symmetry expansion. Its Hermitian eigenvectors define the local
+orbital components used for charges and PDOS; their labels are consequently
+component numbers rather than global `px`, `dxy`, and similar directions.
+
+`lwrite_overlaps=.true.` writes the complete complex pre-orthogonalization
+matrix `S_ij(k)=<phi_i(k)|phi_j(k)>` for every k point into
+`atomic_proj.xml`. This is distinct from the identity overlap of the final
+Löwdin basis and is useful for diagnosing nearly linearly dependent atomic
+trial orbitals.
+
+With `tdosinboxes=.true.`, atomic projection is replaced by real-space box
+LDOS. `irmin(i,n)` and `irmax(i,n)` are inclusive, one-based FFT-grid bounds;
+zero `irmax` means the last grid point and reversed bounds wrap periodically.
+The result is written to `filpdos.ldos_boxes`. `kresolveddos` produces one
+block per k point, `filproj` records every state’s integrated box weights,
+and `plotboxes=.true.` writes `box#N.xsf` indicator grids.
+
 Supported broadening modes are Gaussian, first-order Methfessel–Paxton,
 Marzari–Vanderbilt cold smearing, and Fermi–Dirac. PAW, ultrasoft,
-spin-polarized/noncollinear projection, local occupation-axis rotation,
-real-space boxes, and projected tetrahedron integration are not yet ported.
+spin-polarized/noncollinear projection, and projected tetrahedron integration
+are not yet ported.
 For tetrahedron-generated NSCF data, specify `degauss` to request the supported
 smearing path. Set `lsym=.false., kresolveddos=.true.` to retain unsymmetrized
 per-k-point orbital projections.

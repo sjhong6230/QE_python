@@ -18,13 +18,13 @@ def parse_namelist(text: str, expected: str) -> dict[str, object]:
         raise QEInputError(f"namelist &{expected.upper()} not found")
     body = re.sub(r"[!#].*$", "", match.group(1), flags=re.MULTILINE)
     assignments = re.findall(
-        r"([A-Za-z_]\w*(?:\(\d+\))?)\s*=\s*("
+        r"([A-Za-z_]\w*(?:\(\d+(?:\s*,\s*\d+)*\))?)\s*=\s*("
         r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|[^,\n]+)",
         body,
     )
     result: dict[str, object] = {}
     for raw_key, raw_value in assignments:
-        key = raw_key.lower()
+        key = re.sub(r"\s+", "", raw_key.lower())
         value = raw_value.strip()
         lowered = value.lower()
         if lowered in {".true.", "true", ".t."}:
