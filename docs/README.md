@@ -1,9 +1,9 @@
 # qepy-pw documentation
 
-This directory documents the implemented scalar, nonmagnetic self-consistent
-field (SCF) subset of Quantum ESPRESSO `pw.x`. The documentation describes the
-behavior of the current source tree, not the complete feature set of upstream
-Quantum ESPRESSO.
+This directory documents the implemented scalar, nonmagnetic SCF, NSCF, and
+band-structure subset of Quantum ESPRESSO `pw.x`, plus the associated
+`bands.x` and `plotband.x` post-processing path. The documentation describes
+the current source tree, not the complete feature set of upstream QE.
 
 ## Reading guide
 
@@ -16,6 +16,7 @@ Quantum ESPRESSO.
 | [Validation and performance](validation_and_performance.md) | Regression tests, numerical tolerances, timing interpretation, memory accounting, and benchmarking practice |
 | [Architecture](architecture.md) | Package decomposition, SCF data flow, Cython boundary, distributed FFT design, ownership, and memory lifetime |
 | [QE-compatible diagnostics](qe_diagnostics.md) | Implemented QE-style error and warning conditions and their compatibility boundary |
+| [Band post-processing](band_postprocessing.md) | `bands.py`, scalar irrep classification, overlap ordering, and `plotband.py` formats |
 
 ## Scope at a glance
 
@@ -57,7 +58,6 @@ vectors include the factor `2π`.
 
 The current package version is `0.6.14`. The source code and automated tests
 are authoritative when a document and implementation disagree. In
-particular, consult `qepy_pw/input.py` for the parser boundary,
-`qepy_pw/scf.py` for the SCF path, and `tests/qe_reference/manifest.json` for
-the numerical regression contract.
-
+particular, consult `qepy_pw/pw/input.py` for the parser boundary,
+`qepy_pw/pw/scf.py` for the SCF path, `qepy_pw/pp` for band post-processing,
+and `tests/qe_reference/manifest.json` for the numerical regression contract.

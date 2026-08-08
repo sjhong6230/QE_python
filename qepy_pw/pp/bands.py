@@ -1,0 +1,248 @@
+"""Scalar implementation of the Quantum ESPRESSO ``bands.x`` workflow."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import sys
+import xml.etree.ElementTree as ET
+
+import numpy as np
+from scipy.optimize import linear_sum_assignment
+
+from ..errors import QEInputError, UnsupportedFeatureError, format_qe_error
+from ..pw.save import QES_NAMESPACE
+from ..symmetry import find_space_group
+from .band_data import (
+    BandData,
+    read_saved_bands,
+    resolve_save_directory,
+    write_band_file,
+    write_gnuplot,
+)
+from .namelist import parse_namelist
+
+
+_SUPPORTED_KEYS = {
+    "prefix", "outdir", "filband", "spin_component", "lsym",
+    "no_overlap", "plot_2d", "firstk", "lastk", "lp", "filp",
+    "lsigma(1)", "lsigma(2)", "lsigma(3)", "lsigma(4)",
+}
+
+
+def _read_wavefunctions(directory: Path, nks: int) -> list[tuple[np.ndarray, np.ndarray]]:
+    import h5py
+
+    result = []
+    for index in range(1, nks + 1):
+        path = directory / f"wfc{index}.hdf5"
+        try:
+            with h5py.File(path, "r") as h5:
+                miller = np.asarray(h5["MillerIndices"][:], dtype=np.int32)
+                coefficients = np.asarray(h5["evc"][:], dtype=np.complex128).T
+        except (OSError, KeyError, ValueError) as exc:
+            raise QEInputError(f"cannot read wavefunctions {path}: {exc}") from exc
+        result.append((miller, coefficients))
+    return result
+
+
+def reorder_by_overlap(
+    data: BandData,
+    wavefunctions: list[tuple[np.ndarray, np.ndarray]],
+) -> BandData:
+    """Follow bands by maximum one-to-one wavefunction overlap."""
+    energies = data.energies_ev.copy()
+    ordered = [wavefunctions[0]]
+    for kpoint in range(1, data.nks):
+        previous_miller, previous = ordered[-1]
+        current_miller, current = wavefunctions[kpoint]
+        previous_lookup = {tuple(row): i for i, row in enumerate(previous_miller)}
+        pairs = [
+            (previous_lookup[tuple(row)], current_index)
+            for current_index, row in enumerate(current_miller)
+            if tuple(row) in previous_lookup
+        ]
+        if not pairs:
+            raise QEInputError(f"adjacent k points {kpoint} and {kpoint + 1} share no plane waves")
+        left, right = np.asarray(pairs, dtype=int).T
+        overlap = previous[left].conj().T @ current[right]
+        rows, columns = linear_sum_assignment(-np.abs(overlap) ** 2)
+        permutation = np.empty(data.nbnd, dtype=int)
+        permutation[rows] = columns
+        energies[kpoint] = energies[kpoint, permutation]
+        ordered.append((current_miller, current[:, permutation]))
+    wavefunctions[:] = ordered
+    return BandData(data.kpoints, energies)
+
+
+def _saved_structure(directory: Path) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    root = ET.parse(directory / "data-file-schema.xml").getroot()
+    ns = {"qes": QES_NAMESPACE}
+    lattice = np.vstack([
+        np.fromstring(root.findtext(
+            f"qes:output/qes:atomic_structure/qes:cell/qes:a{i}",
+            namespaces=ns,
+        ) or "", sep=" ")
+        for i in range(1, 4)
+    ])
+    atoms = root.findall(
+        "qes:output/qes:atomic_structure/qes:atomic_positions/qes:atom", ns
+    )
+    positions = np.vstack([np.fromstring(atom.text or "", sep=" ") for atom in atoms])
+    labels = [atom.attrib.get("name", "") for atom in atoms]
+    return lattice, positions @ np.linalg.inv(lattice), labels
+
+
+def _little_group(kpoint: np.ndarray, operations) -> list:
+    little = []
+    for operation in operations:
+        rotated = kpoint @ np.linalg.inv(operation.matrix).T
+        if np.allclose(rotated - kpoint, np.rint(rotated - kpoint), atol=1.0e-7):
+            little.append(operation)
+    return little
+
+
+def _symmetry_matrix(kpoint, miller, coefficients, operation) -> np.ndarray:
+    transformed = (kpoint + miller) @ np.linalg.inv(operation.matrix).T
+    target = np.rint(transformed - kpoint).astype(np.int32)
+    if not np.allclose(transformed - kpoint, target, atol=1.0e-7):
+        raise QEInputError("little-group operation does not preserve the plane-wave basis")
+    lookup = {tuple(row): index for index, row in enumerate(miller)}
+    try:
+        destination = np.asarray([lookup[tuple(row)] for row in target], dtype=int)
+    except KeyError as exc:
+        raise QEInputError("symmetry-transformed plane wave is absent from saved basis") from exc
+    phase = np.exp(-2j * np.pi * (transformed @ operation.translation))
+    transformed_coefficients = np.empty_like(coefficients)
+    transformed_coefficients[destination] = phase[:, None] * coefficients
+    return coefficients.conj().T @ transformed_coefficients
+
+
+def classify_irreps(
+    data: BandData,
+    wavefunctions: list[tuple[np.ndarray, np.ndarray]],
+    directory: Path,
+    firstk: int = 0,
+    lastk: int = 10_000_000,
+    degeneracy_tolerance_ev: float = 1.0e-5,
+) -> np.ndarray:
+    """Classify scalar bands by numerical little-group characters.
+
+    The returned positive integers are deterministic representation classes
+    suitable for QE's ``filband.rap`` channel.  Degenerate subspaces are kept
+    together, so multidimensional irreps receive one class number.
+    """
+    lattice, fractional, labels = _saved_structure(directory)
+    operations = find_space_group(lattice, fractional, labels)
+    classes = np.zeros((data.nks, data.nbnd), dtype=int)
+    fingerprints: dict[tuple, int] = {}
+    for ik, (point, energies, (miller, coefficients)) in enumerate(
+        zip(data.kpoints, data.energies_ev, wavefunctions), start=1
+    ):
+        if ik < max(1, firstk) or ik > lastk:
+            continue
+        little = _little_group(point, operations)
+        matrices = [
+            _symmetry_matrix(point, miller, coefficients, operation)
+            for operation in little
+        ]
+        start = 0
+        while start < data.nbnd:
+            stop = start + 1
+            while stop < data.nbnd and abs(energies[stop] - energies[start]) <= degeneracy_tolerance_ev:
+                stop += 1
+            dimension = stop - start
+            characters = [np.trace(matrix[start:stop, start:stop]) / dimension for matrix in matrices]
+            fingerprint = (
+                len(little), dimension,
+                tuple((round(value.real, 6), round(value.imag, 6)) for value in characters),
+            )
+            number = fingerprints.setdefault(fingerprint, len(fingerprints) + 1)
+            classes[ik - 1, start:stop] = number
+            start = stop
+    return classes
+
+
+def write_irrep_file(
+    path: str | Path,
+    data: BandData,
+    irreps: np.ndarray,
+    firstk: int = 0,
+    lastk: int = 10_000_000,
+) -> Path:
+    """Write QE's integer ``&plot_rap`` companion format."""
+    output = Path(path)
+    with output.open("w", encoding="utf-8", newline="\n") as stream:
+        stream.write(
+            f" &plot_rap nbnd_rap={data.nbnd:4d}, nks_rap={data.nks:6d} /\n"
+        )
+        for index, (point, labels) in enumerate(
+            zip(data.kpoints, irreps), start=1
+        ):
+            analyzed = max(1, firstk) <= index <= lastk
+            stream.write(
+                "          "
+                + "".join(f"{value:10.6f}" for value in point)
+                + ("    T\n" if analyzed else "    F\n")
+            )
+            for start in range(0, data.nbnd, 10):
+                stream.write(
+                    "".join(f"{int(value):8d}" for value in labels[start:start + 10])
+                    + "\n"
+                )
+    return output
+
+
+def run_bands(options: dict[str, object]) -> tuple[Path, Path]:
+    unknown = set(options) - _SUPPORTED_KEYS
+    if unknown:
+        raise QEInputError(f"unknown &BANDS variable {sorted(unknown)[0]!r}")
+    if int(options.get("spin_component", 1)) != 1:
+        raise UnsupportedFeatureError("spin_component requires an LSDA calculation")
+    if bool(options.get("lp", False)) or any(bool(options.get(f"lsigma({i})", False)) for i in range(1, 5)):
+        raise UnsupportedFeatureError("momentum and spin-matrix post-processing is not implemented")
+    if bool(options.get("plot_2d", False)):
+        raise UnsupportedFeatureError("plot_2d band grids are not implemented")
+    prefix = str(options.get("prefix", "pwscf"))
+    outdir = str(options["outdir"]) if "outdir" in options else None
+    directory = resolve_save_directory(prefix, outdir)
+    data = read_saved_bands(prefix, outdir)
+    filband = Path(str(options.get("filband", "bands.out")))
+    wavefunctions = None
+    lsym = bool(options.get("lsym", True))
+    if lsym or not bool(options.get("no_overlap", True)):
+        wavefunctions = _read_wavefunctions(directory, data.nks)
+    if not lsym and not bool(options.get("no_overlap", True)):
+        assert wavefunctions is not None
+        data = reorder_by_overlap(data, wavefunctions)
+    write_band_file(filband, data)
+    write_gnuplot(f"{filband}.gnu", data)
+    if lsym:
+        assert wavefunctions is not None
+        firstk = int(options.get("firstk", 0))
+        lastk = int(options.get("lastk", 10_000_000))
+        irreps = classify_irreps(
+            data, wavefunctions, directory,
+            firstk, lastk,
+        )
+        write_irrep_file(f"{filband}.rap", data, irreps, firstk, lastk)
+    return filband, Path(f"{filband}.gnu")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="bands.py")
+    parser.add_argument("-i", "-in", "--input", dest="input_file")
+    args = parser.parse_args(argv)
+    try:
+        text = Path(args.input_file).read_text(encoding="utf-8") if args.input_file else sys.stdin.read()
+        filband, gnuplot = run_bands(parse_namelist(text, "bands"))
+        print(f"     Bands written to file {filband}")
+        print(f"     Plottable bands (eV) written to file {gnuplot}")
+        return 0
+    except (QEInputError, UnsupportedFeatureError, OSError, ValueError) as exc:
+        print(format_qe_error(exc), end="", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -13,9 +13,9 @@ from typing import TYPE_CHECKING, Any
 from .version import __version__
 
 if TYPE_CHECKING:
-    from .input import PWInput, read_pw_input
-    from .save import resolve_save_directory, write_qe_save
-    from .scf import SCFResult, run_scf
+    from .pw.input import PWInput, read_pw_input
+    from .pw.save import resolve_save_directory, write_qe_save
+    from .pw.scf import SCFResult, run_scf
 
 __all__ = [
     "PWInput",
@@ -28,12 +28,12 @@ __all__ = [
 
 
 _LAZY_EXPORTS = {
-    "PWInput": (".input", "PWInput"),
-    "read_pw_input": (".input", "read_pw_input"),
-    "SCFResult": (".scf", "SCFResult"),
-    "run_scf": (".scf", "run_scf"),
-    "resolve_save_directory": (".save", "resolve_save_directory"),
-    "write_qe_save": (".save", "write_qe_save"),
+    "PWInput": (".pw.input", "PWInput"),
+    "read_pw_input": (".pw.input", "read_pw_input"),
+    "SCFResult": (".pw.scf", "SCFResult"),
+    "run_scf": (".pw.scf", "run_scf"),
+    "resolve_save_directory": (".pw.save", "resolve_save_directory"),
+    "write_qe_save": (".pw.save", "write_qe_save"),
 }
 
 
