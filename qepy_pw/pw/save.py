@@ -352,6 +352,30 @@ def _output_xml(root: ET.Element, pw: PWInput, result: SCFResult) -> None:
         _text(bands, "fermi_energy", result.fermi_energy_ha)
     _text(bands, "nks", len(pw.kpoints))
     _text(bands, "occupations_kind", pw.system.get("occupations", "fixed"))
+    _text(bands, "smearing", pw.system.get("smearing", "gaussian"))
+    _text(bands, "degauss", float(pw.system.get("degauss", 0.0)))
+    if pw.kpoint_grid is not None:
+        ET.SubElement(
+            bands,
+            _qes("monkhorst_pack"),
+            {
+                **{
+                    f"nk{axis}": str(int(value))
+                    for axis, value in enumerate(pw.kpoint_grid, start=1)
+                },
+                **{
+                    f"k{axis}": str(int(value))
+                    for axis, value in enumerate(
+                        pw.kpoint_shift or (0, 0, 0), start=1
+                    )
+                },
+            },
+        )
+        _text(
+            bands,
+            "full_to_irreducible",
+            " ".join(str(int(value)) for value in pw.full_to_irreducible),
+        )
     for index, (point, eigenvalues) in enumerate(
         zip(pw.kpoints, result.eigenvalues_ha)
     ):

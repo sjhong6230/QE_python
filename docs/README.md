@@ -17,6 +17,7 @@ the current source tree, not the complete feature set of upstream QE.
 | [Architecture](architecture.md) | Package decomposition, SCF data flow, Cython boundary, distributed FFT design, ownership, and memory lifetime |
 | [QE-compatible diagnostics](qe_diagnostics.md) | Implemented QE-style error and warning conditions and their compatibility boundary |
 | [Band post-processing](band_postprocessing.md) | `bands.py`, scalar irrep classification, overlap ordering, and `plotband.py` formats |
+| [DOS post-processing](dos_postprocessing.md) | `dos.py` smearing and tetrahedron integration, input, and output formats |
 
 ## Scope at a glance
 
