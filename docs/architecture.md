@@ -41,6 +41,7 @@ latency-sensitive inner work.
 | `pp/bands.py` | `bands.x`-style eigenvalue extraction, overlap ordering, scalar little-group irrep classification, and `.rap`/`.gnu` output. |
 | `pp/plotband.py` | `plotband.x`-style path conversion and PostScript generation. |
 | `pp/dos.py` | `dos.x`-style Gaussian or tetrahedron total-DOS integration. |
+| `pp/projwfc.py` | `projwfc.x`-style Löwdin atomic-orbital projections, populations, and PDOS. |
 | `pp/band_data.py` | Shared QE XML, `&plot`, and gnuplot band-data formats. |
 | `errors.py` | Structured QE-style errors and warnings. |
 | `memory.py`, `timing.py`, `threads.py` | Runtime instrumentation and hybrid controls. |
