@@ -14,6 +14,14 @@ The projection basis is the symmetric Löwdin basis
 produce orbital weights, occupations produce Löwdin charges, and their
 unrepresented fraction gives the spilling parameter.
 
+With the default `lsym=.true.`, the complete complex orbital projection
+density is transformed by every saved crystal symmetry operation. The code
+maps symmetry-equivalent atoms and applies the real-spherical-harmonic
+representation matrix for each angular momentum before averaging. Thus
+directional components such as `px/py/pz` and the five d components obey the
+point-group constraints even when only irreducible k points were calculated.
+The transformation preserves the sum over atoms and m components.
+
 ```text
 &PROJWFC
  prefix='silicon', outdir='./tmp',
@@ -35,5 +43,5 @@ Marzari–Vanderbilt cold smearing, and Fermi–Dirac. PAW, ultrasoft,
 spin-polarized/noncollinear projection, local occupation-axis rotation,
 real-space boxes, and projected tetrahedron integration are not yet ported.
 For tetrahedron-generated NSCF data, specify `degauss` to request the supported
-smearing path. Symmetry-equivalent irreducible k-point weights are respected,
-but explicit rotation/averaging of individual m components is not performed.
+smearing path. Set `lsym=.false., kresolveddos=.true.` to retain unsymmetrized
+per-k-point orbital projections.

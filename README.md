@@ -53,7 +53,7 @@ An automatic-grid NSCF calculation can be integrated into a total DOS with:
 dos.py -i dos.in
 ```
 
-For Löwdin charges and orbital-projected DOS from saved wavefunctions:
+For symmetry-averaged Löwdin charges and orbital-projected DOS from saved wavefunctions:
 
 ```bash
 projwfc.py -i projwfc.in

@@ -14,7 +14,8 @@ from ..constants import EV_PER_HARTREE
 from ..errors import QEInputError, UnsupportedFeatureError, format_qe_error
 from ..occupations import smearing_order, wgauss
 from ..pw.save import QES_NAMESPACE
-from ..upf import read_upf
+from ..symmetry import SymmetryOperation
+from ..upf import _qe_real_spherical_harmonics, read_upf
 from .band_data import resolve_save_directory
 from .dos import read_saved_dos
 from .namelist import parse_namelist
@@ -44,6 +45,7 @@ class ProjectionData:
     energies_ev: np.ndarray
     weights: np.ndarray
     projections: np.ndarray  # (nks, nbnd, nwfc), squared amplitudes
+    amplitudes: np.ndarray  # (nks, nbnd, nwfc), complex overlaps
     occupations: np.ndarray
     orbitals: tuple[Orbital, ...]
     overlaps: tuple[np.ndarray, ...]
@@ -84,7 +86,16 @@ def _saved_geometry(directory: Path):
             atoms.append((element.attrib.get("name", ""), _xml_vector(element, "atom position", ns)))
     if not atoms or any(symbol not in species_files for symbol, _ in atoms):
         raise QEInputError("saved atomic species or positions are incomplete")
-    return lattice, reciprocal, atoms, species_files
+    operations = []
+    for entry in output.findall("qes:band_structure/qes:symmetry_operations/qes:symmetry", ns):
+        rotation = np.fromstring(entry.findtext("qes:rotation", default="", namespaces=ns), sep=" ", dtype=int)
+        translation = np.fromstring(entry.findtext("qes:fractional_translation", default="", namespaces=ns), sep=" ")
+        if rotation.size != 9 or translation.shape != (3,):
+            raise QEInputError("saved symmetry operation is malformed")
+        operations.append(SymmetryOperation(rotation.reshape(3, 3), translation))
+    if not operations:
+        operations.append(SymmetryOperation(np.eye(3, dtype=int), np.zeros(3)))
+    return lattice, reciprocal, atoms, species_files, tuple(operations)
 
 
 def _orbital_basis(
@@ -94,7 +105,7 @@ def _orbital_basis(
     geometry=None,
     pseudo_cache: dict | None = None,
 ):
-    lattice, reciprocal, atoms, species_files = geometry or _saved_geometry(directory)
+    lattice, reciprocal, atoms, species_files, _operations = geometry or _saved_geometry(directory)
     volume = abs(float(np.linalg.det(lattice)))
     gk = np.asarray(miller, dtype=float) @ reciprocal + np.asarray(kpoint)
     blocks, descriptors = [], []
@@ -136,7 +147,86 @@ def _lowdin_basis(atomic: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return atomic @ inverse_sqrt, overlap
 
 
-def compute_projections(prefix: str = "pwscf", outdir: str | None = None) -> ProjectionData:
+def _real_harmonic_rotation(l: int, cartesian_rotation: np.ndarray) -> np.ndarray:
+    """Return the orthogonal QE-real-harmonic representation of a rotation."""
+    size = 2 * l + 1
+    if l == 0:
+        return np.ones((1, 1))
+    # An overdetermined deterministic spherical sample avoids special-axis
+    # rank loss. Polar decomposition removes least-squares roundoff.
+    index = np.arange(max(24, 4 * size), dtype=float)
+    z = 1.0 - 2.0 * (index + 0.5) / len(index)
+    phi = index * (np.pi * (3.0 - np.sqrt(5.0)))
+    radius = np.sqrt(np.maximum(0.0, 1.0 - z * z))
+    vectors = np.column_stack((radius * np.cos(phi), radius * np.sin(phi), z))
+    source = _qe_real_spherical_harmonics(l, vectors)
+    target = _qe_real_spherical_harmonics(l, vectors @ cartesian_rotation)
+    representation = np.linalg.lstsq(source, target, rcond=None)[0]
+    left, _singular, right = np.linalg.svd(representation)
+    return left @ right
+
+
+def _atom_mapping(atoms, operation: SymmetryOperation) -> np.ndarray:
+    labels = [symbol for symbol, _position in atoms]
+    fractional = np.vstack([position for _symbol, position in atoms])
+    transformed = fractional @ operation.matrix + operation.translation
+    mapping = np.empty(len(atoms), dtype=np.int32)
+    for source, (position, label) in enumerate(zip(transformed, labels)):
+        matches = []
+        for target, (reference, reference_label) in enumerate(zip(fractional, labels)):
+            delta = position - reference
+            delta -= np.rint(delta)
+            if reference_label == label and np.linalg.norm(delta) < 1.0e-7:
+                matches.append(target)
+        if len(matches) != 1:
+            raise QEInputError("symmetry operation does not uniquely map atomic orbitals")
+        mapping[source] = matches[0]
+    return mapping
+
+
+def symmetrize_projection_weights(
+    amplitudes: np.ndarray,
+    orbitals: tuple[Orbital, ...],
+    lattice: np.ndarray,
+    atoms,
+    operations: tuple[SymmetryOperation, ...],
+) -> np.ndarray:
+    """Rotate and average the full orbital projection density matrices."""
+    values = np.asarray(amplitudes, dtype=np.complex128)
+    if len(operations) <= 1:
+        return np.abs(values) ** 2
+    inverse_lattice = np.linalg.inv(lattice)
+    fractional_atoms = tuple(
+        (symbol, np.asarray(position) @ inverse_lattice)
+        for symbol, position in atoms
+    )
+    averaged = np.zeros(values.shape, dtype=float)
+    lookup = {
+        (orbital.atom, orbital.wfc, orbital.l, orbital.m): index
+        for index, orbital in enumerate(orbitals)
+    }
+    for operation in operations:
+        cartesian = inverse_lattice @ operation.matrix @ lattice
+        atom_map = _atom_mapping(fractional_atoms, operation)
+        transform = np.zeros((len(orbitals), len(orbitals)), dtype=float)
+        representations = {}
+        for source, orbital in enumerate(orbitals):
+            representation = representations.get(orbital.l)
+            if representation is None:
+                representation = _real_harmonic_rotation(orbital.l, cartesian)
+                representations[orbital.l] = representation
+            target_atom = int(atom_map[orbital.atom - 1]) + 1
+            for target_m in range(2 * orbital.l + 1):
+                target = lookup[(target_atom, orbital.wfc, orbital.l, target_m)]
+                transform[target, source] = representation[orbital.m, target_m]
+        rotated = np.einsum("...o,po->...p", values, transform)
+        averaged += np.abs(rotated) ** 2
+    return averaged / len(operations)
+
+
+def compute_projections(
+    prefix: str = "pwscf", outdir: str | None = None, *, symmetrize: bool = True
+) -> ProjectionData:
     import h5py
 
     directory = resolve_save_directory(prefix, outdir)
@@ -153,7 +243,7 @@ def compute_projections(prefix: str = "pwscf", outdir: str | None = None) -> Pro
     ])
     if occupations.shape != saved.eigenvalues_ev.shape:
         raise QEInputError("saved occupations do not match the eigenvalues")
-    all_projection, overlaps = [], []
+    all_amplitudes, overlaps = [], []
     orbitals = None
     geometry = _saved_geometry(directory)
     pseudo_cache = {}
@@ -175,10 +265,19 @@ def compute_projections(prefix: str = "pwscf", outdir: str | None = None) -> Pro
             raise QEInputError("atomic orbital ordering changes between k points")
         orthogonal, overlap = _lowdin_basis(atomic)
         amplitudes = orthogonal.conj().T @ wavefunctions
-        all_projection.append(np.abs(amplitudes.T) ** 2)
+        all_amplitudes.append(amplitudes.T)
         overlaps.append(overlap)
     assert orbitals is not None
-    return ProjectionData(saved.eigenvalues_ev, saved.weights, np.asarray(all_projection), occupations, orbitals, tuple(overlaps), saved.fermi_ev)
+    amplitudes_array = np.asarray(all_amplitudes)
+    lattice, _reciprocal, atoms, _species, operations = geometry
+    projections = (
+        symmetrize_projection_weights(
+            amplitudes_array, orbitals, lattice, atoms, operations
+        )
+        if symmetrize
+        else np.abs(amplitudes_array) ** 2
+    )
+    return ProjectionData(saved.eigenvalues_ev, saved.weights, projections, amplitudes_array, occupations, orbitals, tuple(overlaps), saved.fermi_ev)
 
 
 def _dos_kernel(energies: np.ndarray, grid: np.ndarray, width: float, ngauss: int) -> np.ndarray:
@@ -235,7 +334,9 @@ def run_projwfc(options: dict[str, object]) -> tuple[ProjectionData, list[Path]]
     saved = read_saved_dos(prefix, outdir)
     if saved.occupations_kind.lower().startswith("tetra") and "degauss" not in options:
         raise UnsupportedFeatureError("projected tetrahedron DOS is not yet ported; specify degauss for smearing")
-    data = compute_projections(prefix, outdir)
+    data = compute_projections(
+        prefix, outdir, symmetrize=bool(options.get("lsym", True))
+    )
     delta = float(options.get("deltae", 0.01))
     if delta <= 0:
         raise QEInputError("DeltaE must be positive")

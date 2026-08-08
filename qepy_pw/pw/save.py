@@ -376,6 +376,16 @@ def _output_xml(root: ET.Element, pw: PWInput, result: SCFResult) -> None:
             "full_to_irreducible",
             " ".join(str(int(value)) for value in pw.full_to_irreducible),
         )
+    symmetries = ET.SubElement(bands, _qes("symmetry_operations"))
+    for operation in pw.symmetry_operations:
+        entry = ET.SubElement(symmetries, _qes("symmetry"))
+        _text(
+            entry,
+            "rotation",
+            " ".join(str(int(value)) for value in operation.matrix.ravel()),
+        )
+        _text(entry, "fractional_translation", _vector(operation.translation))
+    _text(symmetries, "time_reversal", not bool(pw.system.get("noinv", False)))
     for index, (point, eigenvalues) in enumerate(
         zip(pw.kpoints, result.eigenvalues_ha)
     ):

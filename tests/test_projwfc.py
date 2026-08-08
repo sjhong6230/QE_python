@@ -7,7 +7,14 @@ import numpy as np
 import pytest
 
 from qepy_pw.errors import QEInputError
-from qepy_pw.pp.projwfc import _dos_kernel, _lowdin_basis, run_projwfc
+from qepy_pw.pp.projwfc import (
+    Orbital,
+    _dos_kernel,
+    _lowdin_basis,
+    run_projwfc,
+    symmetrize_projection_weights,
+)
+from qepy_pw.symmetry import SymmetryOperation
 
 
 def test_lowdin_basis_is_orthonormal_and_preserves_span() -> None:
@@ -34,6 +41,21 @@ def test_projection_gaussian_kernel_normalizes_to_one_state() -> None:
 def test_projection_kernel_rejects_unknown_smearing() -> None:
     with pytest.raises(QEInputError, match="ngauss"):
         _dos_kernel(np.asarray([[0.0]]), np.asarray([0.0]), 0.1, 3)
+
+
+def test_cubic_rotation_average_equalizes_p_components() -> None:
+    orbitals = tuple(Orbital(1, "X", 1, 1, m, "2P") for m in range(3))
+    amplitudes = np.asarray([[[1.0 + 0.2j, 0.0, 0.0]]])
+    cyclic = np.asarray([[0, 1, 0], [0, 0, 1], [1, 0, 0]], dtype=int)
+    operations = tuple(
+        SymmetryOperation(np.linalg.matrix_power(cyclic, power), np.zeros(3))
+        for power in range(3)
+    )
+    weights = symmetrize_projection_weights(
+        amplitudes, orbitals, np.eye(3), (("X", np.zeros(3)),), operations
+    )
+    assert weights[0, 0] == pytest.approx(np.full(3, 1.04 / 3.0), abs=1.0e-12)
+    assert np.sum(weights) == pytest.approx(np.sum(np.abs(amplitudes) ** 2))
 
 
 def test_projwfc_end_to_end_on_saved_scalar_wavefunctions(
