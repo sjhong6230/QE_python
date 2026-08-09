@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import os
 
 
 _QE_RULE = "=" + "-" * 78 + "="
@@ -49,4 +50,48 @@ def format_qe_closing(*, success: bool = True, now: datetime | None = None) -> s
         f"{_QE_RULE}\n"
         f"   {status}\n"
         f"{_QE_RULE}\n"
+    )
+
+
+def _available_memory_mib() -> int | None:
+    try:
+        pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    return pages * page_size // (1024 * 1024)
+
+
+def format_qe_opening(
+    program: str,
+    version: str,
+    *,
+    now: datetime | None = None,
+    memory_mib: int | None = None,
+) -> str:
+    """Render QE's ``opening_message`` and serial environment header."""
+    cdate, ctime = qe_date_and_time(now)
+    available = _available_memory_mib() if memory_mib is None else memory_mib
+    memory_line = (
+        ""
+        if available is None
+        else (
+            f"\n     {available:d} MiB available memory on the printing compute "
+            "node when the environment starts"
+        )
+    )
+    return (
+        f"\n     Program {program} v.{version} starts on {cdate} at {ctime}\n"
+        "\n"
+        "     This program is part of the open-source Quantum ESPRESSO suite\n"
+        "     for quantum simulation of materials; please cite\n"
+        '         "P. Giannozzi et al., J. Phys.:Condens. Matter 21 395502 (2009);\n'
+        '         "P. Giannozzi et al., J. Phys.:Condens. Matter 29 465901 (2017);\n'
+        '         "P. Giannozzi et al., J. Chem. Phys. 152 154105 (2020);\n'
+        '          URL http://www.quantum-espresso.org", \n'
+        "     in publications or presentations arising from this work. More details at\n"
+        "     http://www.quantum-espresso.org/quote\n"
+        "\n"
+        "     Serial version"
+        f"{memory_line}\n\n"
     )

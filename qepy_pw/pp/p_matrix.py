@@ -9,9 +9,9 @@ import numpy as np
 
 from ..constants import EV_PER_HARTREE, TWO_PI
 from ..errors import QEInputError
-from ..pw.save import QES_NAMESPACE
 from ..upf import LocalPotential, read_upf
 from .band_data import BandData
+from .xml_data import findall, findtext
 
 
 def _saved_momentum_context(
@@ -29,21 +29,17 @@ def _saved_momentum_context(
         root = ET.parse(path).getroot()
     except (OSError, ET.ParseError) as exc:
         raise QEInputError(f"cannot read saved momentum metadata {path}: {exc}") from exc
-    ns = {"qes": QES_NAMESPACE}
     lattice = np.vstack([
         np.fromstring(
-            root.findtext(
-                f"qes:output/qes:atomic_structure/qes:cell/qes:a{i}",
-                namespaces=ns,
-            ) or "",
+            findtext(root, f"output/atomic_structure/cell/a{i}") or "",
             sep=" ",
         )
         for i in range(1, 4)
     ])
     if lattice.shape != (3, 3) or abs(np.linalg.det(lattice)) < 1.0e-14:
         raise QEInputError("saved momentum metadata contains an invalid lattice")
-    atom_elements = root.findall(
-        "qes:output/qes:atomic_structure/qes:atomic_positions/qes:atom", ns
+    atom_elements = findall(
+        root, "output/atomic_structure/atomic_positions/atom"
     )
     atoms = [
         (element.attrib.get("name", ""), np.fromstring(element.text or "", sep=" "))
@@ -51,13 +47,9 @@ def _saved_momentum_context(
     ]
     if any(not label or position.shape != (3,) for label, position in atoms):
         raise QEInputError("saved momentum metadata contains an invalid atom")
-    species_elements = root.findall(
-        "qes:output/qes:atomic_species/qes:species", ns
-    )
+    species_elements = findall(root, "output/atomic_species/species")
     pseudo_files = {
-        element.attrib.get("name", ""): element.findtext(
-            "qes:pseudo_file", namespaces=ns
-        )
+        element.attrib.get("name", ""): findtext(element, "pseudo_file")
         for element in species_elements
     }
     pseudos: dict[str, LocalPotential] = {}
@@ -66,13 +58,11 @@ def _saved_momentum_context(
         if not filename:
             raise QEInputError(f"saved momentum metadata has no UPF for species {label}")
         pseudos[label] = read_upf(directory / Path(filename).name)
-    records = root.findall(
-        "qes:output/qes:band_structure/qes:ks_energies", ns
-    )
+    records = findall(root, "output/band_structure/ks_energies")
     occupations = []
     for index, record in enumerate(records, start=1):
         values = np.fromstring(
-            record.findtext("qes:occupations", namespaces=ns) or "", sep=" "
+            findtext(record, "occupations") or "", sep=" "
         )
         if values.size == 0:
             raise QEInputError(f"saved occupations are missing at k point {index}")
@@ -80,9 +70,7 @@ def _saved_momentum_context(
     widths = {len(values) for values in occupations}
     if len(widths) != 1:
         raise QEInputError("saved k points have inconsistent occupation counts")
-    fermi_text = root.findtext(
-        "qes:output/qes:band_structure/qes:fermi_energy", namespaces=ns
-    )
+    fermi_text = findtext(root, "output/band_structure/fermi_energy")
     fermi_ev = (
         float(fermi_text) * EV_PER_HARTREE
         if fermi_text is not None
@@ -208,6 +196,7 @@ def compute_and_write_p_avg(
     directory: Path,
     firstk: int = 0,
     lastk: int = 10_000_000,
+    output_data: BandData | None = None,
 ) -> Path:
     lattice, atoms, pseudos, occupations, fermi_ev = _saved_momentum_context(
         directory
@@ -217,7 +206,7 @@ def compute_and_write_p_avg(
     matrices = momentum_matrices(data, wavefunctions, lattice, atoms, pseudos)
     return write_p_avg(
         path,
-        data,
+        data if output_data is None else output_data,
         matrices,
         occupations,
         firstk,

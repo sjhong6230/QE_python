@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import os
 from pathlib import Path
 import sys
 import time
@@ -13,8 +14,7 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 from ..errors import QEInputError, UnsupportedFeatureError, format_qe_error
-from ..qe_format import format_qe_closing, format_qe_duration, qe_date_and_time
-from ..pw.save import QES_NAMESPACE
+from ..qe_format import format_qe_closing, format_qe_duration, format_qe_opening
 from ..point_group import point_group_character_table
 from ..symmetry import SymmetryOperation, find_space_group
 from ..version import __version__
@@ -27,6 +27,7 @@ from .band_data import (
 )
 from .namelist import parse_namelist
 from .p_matrix import compute_and_write_p_avg
+from .xml_data import find, findall, findtext, upstream_qe_xml
 
 
 _SUPPORTED_KEYS = {
@@ -34,6 +35,37 @@ _SUPPORTED_KEYS = {
     "no_overlap", "plot_2d", "firstk", "lastk", "lp", "filp",
     "lsigma(1)", "lsigma(2)", "lsigma(3)", "lsigma(4)",
 }
+
+
+# QE's ``name_rap`` strings include legacy Koster/Bradley-Cracknell labels
+# for the little groups where more than one convention is commonly used.
+# The integer .rap value remains the one-based row of the character table.
+_QE_IRREP_DISPLAY_NAMES = {
+    "C_2v": ("A_1  D_1  S_1", "A_2  D_2  S_2", "B_1  D_3  S_3", "B_2  D_4  S_4"),
+    "C_3v": ("A_1  L_1", "A_2  L_2", "E    L_3"),
+    "C_4v": ("A_1  G_1 D_1", "A_2  G_2 D_1'", "B_1  G_3 D_2", "B_2  G_4 D_2'", "E    G_5 D_5"),
+    "D_4h": (
+        "A_1g X_1  M_1", "A_2g X_4  M_4", "B_1g X_2  M_2",
+        "B_2g X_3  M_3", "E_g  X_5  M_5", "A_1u X_1' M_1'",
+        "A_2u X_4' M_4'", "B_1u X_2' M_2'", "B_2u X_3' M_3'",
+        "E_u  X_5' M_5'",
+    ),
+    "D_2d": ("A_1  X_1  W_1", "A_2  X_4  W_2'", "B_1  X_2  W_1'", "B_2  X_3  W_2", "E    X_5  W_3"),
+    "D_3d": ("A_1g L_1", "A_2g L_2", "E_g  L_3", "A_1u L_1'", "A_2u L_2'", "E_u  L_3'"),
+    "S_4": ("A    W_1", "B    W_3", "E    W_4", "E*   W_2"),
+    "T_d": ("A_1  G_1  P_1", "A_2  G_2  P_2", "E    G_12 P_3", "T_1  G_25 P_5", "T_2  G_15 P_4"),
+    "O_h": (
+        "A_1g G_1   G_1+", "A_2g G_2   G_2+", "E_g  G_12  G_3+",
+        "T_1g G_15' G_4+", "T_2g G_25' G_5+", "A_1u G_1'  G_1-",
+        "A_2u G_2'  G_2-", "E_u  G_12' G_3-", "T_1u G_15  G_4-",
+        "T_2u G_25  G_5-",
+    ),
+}
+
+
+def _qe_irrep_display_name(table, irrep_index: int, name: str) -> str:
+    aliases = _QE_IRREP_DISPLAY_NAMES.get(table.schoenflies)
+    return aliases[irrep_index - 1] if aliases is not None else name
 
 
 def _read_wavefunctions(directory: Path, nks: int) -> list[tuple[np.ndarray, np.ndarray]]:
@@ -45,7 +77,15 @@ def _read_wavefunctions(directory: Path, nks: int) -> list[tuple[np.ndarray, np.
         try:
             with h5py.File(path, "r") as h5:
                 miller = np.asarray(h5["MillerIndices"][:], dtype=np.int32)
-                coefficients = np.asarray(h5["evc"][:], dtype=np.complex128).T
+                raw = np.asarray(h5["evc"][:])
+                if np.issubdtype(raw.dtype, np.floating):
+                    if raw.ndim != 2 or raw.shape[1] != 2 * len(miller):
+                        raise ValueError("invalid interleaved QE evc dataset")
+                    coefficients = (
+                        raw[:, 0::2] + 1j * raw[:, 1::2]
+                    ).astype(np.complex128, copy=False).T
+                else:
+                    coefficients = np.asarray(raw, dtype=np.complex128).T
         except (OSError, KeyError, ValueError) as exc:
             raise QEInputError(f"cannot read wavefunctions {path}: {exc}") from exc
         result.append((miller, coefficients))
@@ -85,37 +125,36 @@ def _saved_structure(
     directory: Path,
 ) -> tuple[np.ndarray, np.ndarray, list[str], tuple[SymmetryOperation, ...]]:
     root = ET.parse(directory / "data-file-schema.xml").getroot()
-    ns = {"qes": QES_NAMESPACE}
     lattice = np.vstack([
-        np.fromstring(root.findtext(
-            f"qes:output/qes:atomic_structure/qes:cell/qes:a{i}",
-            namespaces=ns,
+        np.fromstring(findtext(
+            root, f"output/atomic_structure/cell/a{i}"
         ) or "", sep=" ")
         for i in range(1, 4)
     ])
-    atoms = root.findall(
-        "qes:output/qes:atomic_structure/qes:atomic_positions/qes:atom", ns
-    )
+    atoms = findall(root, "output/atomic_structure/atomic_positions/atom")
     positions = np.vstack([np.fromstring(atom.text or "", sep=" ") for atom in atoms])
     labels = [atom.attrib.get("name", "") for atom in atoms]
     saved_operations = []
-    for entry in root.findall(
-        "qes:output/qes:band_structure/qes:symmetry_operations/qes:symmetry",
-        ns,
-    ):
+    symmetry_path = (
+        "output/symmetries/symmetry"
+        if upstream_qe_xml(root)
+        else "output/band_structure/symmetry_operations/symmetry"
+    )
+    for entry in findall(root, symmetry_path):
         rotation = np.fromstring(
-            entry.findtext("qes:rotation", default="", namespaces=ns), sep=" "
+            findtext(entry, "rotation", "") or "", sep=" "
         )
         translation = np.fromstring(
-            entry.findtext(
-                "qes:fractional_translation", default="", namespaces=ns
-            ),
+            findtext(entry, "fractional_translation", "") or "",
             sep=" ",
         )
         if rotation.size == 9 and translation.size == 3:
+            matrix = np.rint(rotation).astype(int).reshape(3, 3)
+            if upstream_qe_xml(root):
+                matrix = matrix.T
             saved_operations.append(
                 SymmetryOperation(
-                    np.rint(rotation).astype(int).reshape(3, 3), translation
+                    matrix, translation
                 )
             )
     fractional = positions @ np.linalg.inv(lattice)
@@ -128,14 +167,10 @@ def _saved_structure(
 def _qe_plot_data(directory: Path, data: BandData) -> BandData:
     """Convert saved crystal k coordinates to QE's 2pi/alat convention."""
     root = ET.parse(directory / "data-file-schema.xml").getroot()
-    ns = {"qes": QES_NAMESPACE}
-    structure = root.find("qes:output/qes:atomic_structure", ns)
+    structure = find(root, "output/atomic_structure")
     lattice = np.vstack([
         np.fromstring(
-            root.findtext(
-                f"qes:output/qes:atomic_structure/qes:cell/qes:a{i}",
-                default="", namespaces=ns,
-            ),
+            findtext(root, f"output/atomic_structure/cell/a{i}", "") or "",
             sep=" ",
         )
         for i in range(1, 4)
@@ -171,7 +206,11 @@ def _symmetry_matrix(kpoint, miller, coefficients, operation) -> np.ndarray:
         destination = np.asarray([lookup[tuple(row)] for row in target], dtype=int)
     except KeyError as exc:
         raise QEInputError("symmetry-transformed plane wave is absent from saved basis") from exc
-    phase = np.exp(-2j * np.pi * (transformed @ operation.translation))
+    # QE's rotate_all_psi applies the fractional-translation phase with this
+    # sign to the destination coefficient.  The opposite sign happens to be
+    # invisible for symmorphic little groups but corrupts Gamma-point irreps
+    # in crystals such as diamond, where half the operations exchange atoms.
+    phase = np.exp(2j * np.pi * (transformed @ operation.translation))
     transformed_coefficients = np.empty_like(coefficients)
     transformed_coefficients[destination] = phase[:, None] * coefficients
     return coefficients.conj().T @ transformed_coefficients
@@ -225,6 +264,7 @@ def classify_irreps(
     degeneracy_tolerance_ev: float = 1.0e-4,
     reports: list[str] | None = None,
     report_points: np.ndarray | None = None,
+    group_signatures: list[object | None] | None = None,
 ) -> np.ndarray:
     """Decompose degenerate band subspaces into QE little-group irreps."""
     lattice, _fractional, _labels, operations = _saved_structure(directory)
@@ -239,6 +279,13 @@ def classify_irreps(
         little = _little_group(point, operations)
         if not little:
             continue
+        table = point_group_character_table(dummy_pw, little)
+        group_signature = (
+            table.schoenflies,
+            tuple(item.label for item in table.classes),
+        )
+        if group_signatures is not None:
+            group_signatures[ik - 1] = group_signature
         shown_point = point if report_points is None else report_points[ik - 1]
         if reports is not None:
             reports.append(
@@ -262,7 +309,6 @@ def classify_irreps(
                     "\n " + "*" * 74 + "\n"
                 )
             continue
-        table = point_group_character_table(dummy_pw, little)
         matrices = [
             _symmetry_matrix(point, miller, coefficients, operation)
             for operation in little
@@ -273,10 +319,6 @@ def classify_irreps(
         ]
         class_sizes = np.asarray([len(items) for items in class_members])
         if reports is not None:
-            group_signature = (
-                table.schoenflies,
-                tuple(item.label for item in table.classes),
-            )
             if group_signature != last_group_signature:
                 reports.append("\n" + _format_group_info(table))
                 last_group_signature = group_signature
@@ -316,9 +358,12 @@ def classify_irreps(
                 dimension = int(np.rint(characters[0].real))
                 count = multiplicity * dimension
                 irrep_slots.extend([irrep_index] * count)
-                decomposition.append(
-                    (irrep_index, name, multiplicity, dimension)
-                )
+                decomposition.append((
+                    irrep_index,
+                    _qe_irrep_display_name(table, irrep_index, name),
+                    multiplicity,
+                    dimension,
+                ))
             if len(irrep_slots) != stop - start:
                 classes[ik - 1, start:stop] = 0
             else:
@@ -350,34 +395,60 @@ def write_irrep_file(
     irreps: np.ndarray,
     firstk: int = 0,
     lastk: int = 10_000_000,
+    group_signatures: list[object | None] | None = None,
 ) -> Path:
     """Write QE's integer ``&plot_rap`` companion format."""
     output = Path(path)
-    high_symmetry = np.zeros(data.nks, dtype=bool)
-    if data.nks:
-        high_symmetry[[0, data.nks - 1]] = True
-    if data.nks > 2:
-        steps = np.diff(data.kpoints, axis=0)
-        for index in range(1, data.nks - 1):
+    first = max(1, int(firstk))
+    last = min(data.nks, int(lastk))
+    if last < first:
+        raise QEInputError("empty k-point range for symmetry analysis")
+    points = data.kpoints[first - 1:last]
+    labels_by_point = irreps[first - 1:last]
+    signatures = (
+        list(group_signatures[first - 1:last])
+        if group_signatures is not None
+        else [None] * len(points)
+    )
+    high_symmetry = np.zeros(len(points), dtype=bool)
+    high_symmetry[[0, len(points) - 1]] = True
+    if len(points) > 2:
+        steps = np.diff(points, axis=0)
+        for index in range(1, len(points) - 1):
             left, right = steps[index - 1], steps[index]
             left_norm, right_norm = np.linalg.norm(left), np.linalg.norm(right)
-            if left_norm > 1.0e-8 and right_norm > 1.0e-8:
-                cosine = float(np.dot(left, right) / left_norm / right_norm)
-                high_symmetry[index] = abs(cosine - 1.0) > 1.0e-4
-            if np.dot(data.kpoints[index], data.kpoints[index]) < 1.0e-9:
+            if left_norm < 1.0e-6 or right_norm < 1.0e-6:
+                continue
+            cosine = float(np.dot(left, right) / left_norm / right_norm)
+            high_symmetry[index] = abs(cosine - 1.0) > 1.0e-4
+            if np.dot(points[index], points[index]) < 1.0e-9:
+                high_symmetry[index] = True
+
+    if len(points) > 1:
+        saved_step = float(np.linalg.norm(points[1] - points[0]))
+        for index in range(1, len(points)):
+            distance = float(np.linalg.norm(points[index] - points[index - 1]))
+            if distance < 1.0e-6:
+                high_symmetry[index] = high_symmetry[index - 1]
+            elif distance < 5.0 * saved_step:
+                if not high_symmetry[index - 1]:
+                    high_symmetry[index] = (
+                        signatures[index] != signatures[index - 1]
+                        or high_symmetry[index]
+                    )
+                if distance > 1.0e-3:
+                    saved_step = distance
+            else:
                 high_symmetry[index] = True
     with output.open("w", encoding="utf-8", newline="\n") as stream:
         stream.write(
-            f" &plot_rap nbnd_rap={data.nbnd:4d}, nks_rap={data.nks:4d} /\n"
+            f" &plot_rap nbnd_rap={data.nbnd:4d}, nks_rap={len(points):4d} /\n"
         )
-        for index, (point, labels) in enumerate(
-            zip(data.kpoints, irreps), start=1
-        ):
-            analyzed = max(1, firstk) <= index <= lastk
+        for index, (point, labels) in enumerate(zip(points, labels_by_point)):
             stream.write(
                 "          "
                 + "".join(f"{value:10.6f}" for value in point)
-                + ("    T\n" if analyzed and high_symmetry[index - 1] else "    F\n")
+                + ("    T\n" if high_symmetry[index] else "    F\n")
             )
             for start in range(0, data.nbnd, 10):
                 stream.write(
@@ -490,7 +561,11 @@ def run_bands(
     outdir = str(options["outdir"]) if "outdir" in options else None
     directory = resolve_save_directory(prefix, outdir)
     if stdout is not None:
-        print(f"\n     Reading data from directory:\n     {directory}\n", file=stdout)
+        print(
+            f"\n     Reading xml data from directory:\n\n"
+            f"     {directory}{os.sep}\n",
+            file=stdout,
+        )
     data = read_saved_bands(prefix, outdir)
     plot_data = _qe_plot_data(directory, data)
     filband = Path(str(options.get("filband", "bands.out")))
@@ -502,16 +577,6 @@ def run_bands(
     lp = bool(options.get("lp", False))
     if lsym or lp or not bool(options.get("no_overlap", True)):
         wavefunctions = _read_wavefunctions(directory, data.nks)
-    if lp:
-        assert wavefunctions is not None
-        compute_and_write_p_avg(
-            str(options.get("filp", "p_avg.dat")),
-            data,
-            wavefunctions,
-            directory,
-            int(options.get("firstk", 0)),
-            int(options.get("lastk", 10_000_000)),
-        )
     if not lsym and not bool(options.get("no_overlap", True)):
         assert wavefunctions is not None
         data = reorder_by_overlap(data, wavefunctions)
@@ -528,17 +593,31 @@ def run_bands(
         firstk = int(options.get("firstk", 0))
         lastk = int(options.get("lastk", 10_000_000))
         reports: list[str] = []
+        group_signatures: list[object | None] = [None] * data.nks
         irreps = classify_irreps(
             data, wavefunctions, directory,
             firstk, lastk,
             reports=reports,
             report_points=plot_data.kpoints,
+            group_signatures=group_signatures,
         )
         write_irrep_file(
-            f"{filband}.rap", plot_data, irreps, firstk, lastk
+            f"{filband}.rap", plot_data, irreps, firstk, lastk,
+            group_signatures,
         )
         if stdout is not None:
             print("".join(reports), end="", file=stdout)
+    if lp:
+        assert wavefunctions is not None
+        compute_and_write_p_avg(
+            str(options.get("filp", "p_avg.dat")),
+            data,
+            wavefunctions,
+            directory,
+            int(options.get("firstk", 0)),
+            int(options.get("lastk", 10_000_000)),
+            output_data=plot_data,
+        )
     return filband, Path(f"{filband}.gnu")
 
 
@@ -549,11 +628,7 @@ def main(argv: list[str] | None = None) -> int:
     started = time.perf_counter()
     cpu_started = time.process_time()
     try:
-        cdate, ctime = qe_date_and_time()
-        print(
-            f"\n     Program BANDS-PY v.{__version__} starts on "
-            f"{cdate} at {ctime}\n"
-        )
+        print(format_qe_opening("BANDS-PY", __version__), end="")
         text = Path(args.input_file).read_text(encoding="utf-8") if args.input_file else sys.stdin.read()
         run_bands(parse_namelist(text, "bands"), stdout=sys.stdout)
         elapsed = time.perf_counter() - started

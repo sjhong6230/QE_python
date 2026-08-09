@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import numpy as np
 import h5py
 import hashlib
@@ -9,8 +10,15 @@ import pytest
 
 from qepy_pw.errors import QEInputError
 from qepy_pw.constants import EV_PER_HARTREE
-from qepy_pw.pp.band_data import BandData, read_band_file, write_band_file, write_gnuplot
+from qepy_pw.pp.band_data import (
+    BandData,
+    read_band_file,
+    read_saved_bands,
+    write_band_file,
+    write_gnuplot,
+)
 from qepy_pw.pp.bands import (
+    _read_wavefunctions,
     classify_irreps,
     main as bands_main,
     reorder_by_overlap,
@@ -26,6 +34,7 @@ from qepy_pw.pw.save import write_qe_save
 from qepy_pw.scf import run_scf
 from qepy_pw.pp.plotband import high_symmetry_indices, parse_plotband_input
 from qepy_pw.pp.p_matrix import momentum_matrices, write_p_avg
+from qepy_pw.qe_format import format_qe_opening
 
 
 def _data() -> BandData:
@@ -124,6 +133,66 @@ def test_irrep_file_uses_qe_plot_rap_header(tmp_path) -> None:
     assert "    T" in text
 
 
+def test_irrep_file_applies_first_and_last_k_range(tmp_path) -> None:
+    path = write_irrep_file(
+        tmp_path / "bands.out.rap",
+        _data(),
+        np.ones((3, 2), dtype=int),
+        firstk=2,
+        lastk=2,
+    )
+    assert path.read_text(encoding="utf-8") == (
+        " &plot_rap nbnd_rap=   2, nks_rap=   1 /\n"
+        "            0.500000  0.000000  0.000000    T\n"
+        "       1       1\n"
+    )
+
+
+def test_bands_header_contains_qe_environment_opening() -> None:
+    text = format_qe_opening(
+        "BANDS-PY", "1.0.0", memory_mib=4096
+    )
+    assert text.startswith("\n     Program BANDS-PY v.1.0.0 starts on ")
+    assert "This program is part of the open-source Quantum ESPRESSO suite" in text
+    assert "Serial version\n     4096 MiB available memory" in text
+
+
+def test_upstream_qe_xml_k_points_are_converted_to_crystal_coordinates(
+    tmp_path,
+) -> None:
+    namespace = "http://www.quantum-espresso.org/ns/qes/qes-1.0"
+    save = tmp_path / "ref.save"
+    save.mkdir()
+    (save / "data-file-schema.xml").write_text(
+        f"""<qes:espresso xmlns:qes="{namespace}"><output>
+        <basis_set><reciprocal_lattice>
+        <b1>-1 -1 1</b1><b2>1 1 1</b2><b3>-1 1 -1</b3>
+        </reciprocal_lattice></basis_set><band_structure><ks_energies>
+        <k_point>-0.25 -0.25 0.25</k_point><eigenvalues>0.5</eigenvalues>
+        </ks_energies></band_structure></output></qes:espresso>""",
+        encoding="utf-8",
+    )
+    restored = read_saved_bands("ref", str(tmp_path))
+    np.testing.assert_allclose(restored.kpoints, [[0.25, 0.0, 0.0]])
+    np.testing.assert_allclose(restored.energies_ev, [[0.5 * EV_PER_HARTREE]])
+
+
+def test_upstream_qe_interleaved_wavefunction_dataset_is_read(tmp_path) -> None:
+    with h5py.File(tmp_path / "wfc1.hdf5", "w") as h5:
+        h5.create_dataset(
+            "MillerIndices", data=np.array([[0, 0, 0], [1, 0, 0]], np.int32)
+        )
+        h5.create_dataset(
+            "evc", data=np.array([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=float)
+        )
+    miller, coefficients = _read_wavefunctions(tmp_path, 1)[0]
+    np.testing.assert_array_equal(miller, [[0, 0, 0], [1, 0, 0]])
+    np.testing.assert_array_equal(
+        coefficients,
+        [[1 + 2j, 5 + 6j], [3 + 4j, 7 + 8j]],
+    )
+
+
 def test_plotband_six_line_input_and_vertices() -> None:
     options = parse_plotband_input(
         "bands.out\n-5 5\nbands.plot\nbands.ps\n0.5\n1.0 0.0\n"
@@ -159,8 +228,10 @@ def test_bands_reads_pw_save_and_performs_scalar_irrep_analysis(
         h5.create_dataset("MillerIndices", data=np.zeros((1, 3), dtype=np.int32))
         h5.create_dataset("evc", data=np.ones((1, 1), dtype=np.complex128))
     monkeypatch.chdir(tmp_path)
+    stdout = io.StringIO()
     filband, gnu = run_bands(
-        {"prefix": "si", "outdir": str(tmp_path), "filband": "si.bands"}
+        {"prefix": "si", "outdir": str(tmp_path), "filband": "si.bands"},
+        stdout=stdout,
     )
     assert filband.is_file()
     assert gnu.is_file()
@@ -170,6 +241,7 @@ def test_bands_reads_pw_save_and_performs_scalar_irrep_analysis(
     assert int(
         (tmp_path / "si.bands.rap").read_text(encoding="utf-8").splitlines()[2]
     ) == 1
+    assert "A_1g G_1   G_1+" in stdout.getvalue()
 
 
 def test_irrep_analysis_distinguishes_inversion_parity(tmp_path) -> None:
@@ -191,6 +263,30 @@ def test_irrep_analysis_distinguishes_inversion_parity(tmp_path) -> None:
     )
     miller = np.array([[1, 0, 0], [-1, 0, 0]], dtype=np.int32)
     coefficients = np.array([[1, 1], [1, -1]], dtype=complex) / np.sqrt(2.0)
+    data = BandData(np.zeros((1, 3)), np.array([[0.0, 1.0]]))
+    labels = classify_irreps(data, [(miller, coefficients)], save)
+    np.testing.assert_array_equal(labels, [[1, 2]])
+
+
+def test_irrep_analysis_uses_qe_fractional_translation_phase(tmp_path) -> None:
+    namespace = "http://www.quantum-espresso.org/ns/qes/qes-1.0"
+    save = tmp_path / "translated.save"
+    save.mkdir()
+    (save / "data-file-schema.xml").write_text(
+        f"""<espresso xmlns="{namespace}"><output>
+        <atomic_structure alat="1"><cell><a1>1 0 0</a1><a2>0 1 0</a2>
+        <a3>0 0 1</a3></cell><atomic_positions>
+        <atom name="X">0 0 0</atom></atomic_positions></atomic_structure>
+        <band_structure><symmetry_operations>
+        <symmetry><rotation>1 0 0 0 1 0 0 0 1</rotation>
+        <fractional_translation>0 0 0</fractional_translation></symmetry>
+        <symmetry><rotation>-1 0 0 0 -1 0 0 0 -1</rotation>
+        <fractional_translation>0.25 0 0</fractional_translation></symmetry>
+        </symmetry_operations></band_structure></output></espresso>""",
+        encoding="utf-8",
+    )
+    miller = np.array([[1, 0, 0], [-1, 0, 0]], dtype=np.int32)
+    coefficients = np.array([[1j, -1j], [1, 1]], dtype=complex) / np.sqrt(2.0)
     data = BandData(np.zeros((1, 3)), np.array([[0.0, 1.0]]))
     labels = classify_irreps(data, [(miller, coefficients)], save)
     np.testing.assert_array_equal(labels, [[1, 2]])
@@ -337,13 +433,13 @@ def test_bands_lp_writes_p_matrix_from_saved_upf_and_wavefunctions(
 <espresso xmlns="{namespace}">
   <output>
     <atomic_species><species name="Si"><mass>28.085</mass><pseudo_file>{pseudo_source.name}</pseudo_file></species></atomic_species>
-    <atomic_structure>
-      <cell><a1>10 0 0</a1><a2>0 10 0</a2><a3>0 0 10</a3></cell>
+    <atomic_structure alat="10.2">
+      <cell><a1>-5.1 0 5.1</a1><a2>0 5.1 5.1</a2><a3>-5.1 5.1 0</a3></cell>
       <atomic_positions><atom name="Si">0 0 0</atom></atomic_positions>
     </atomic_structure>
     <band_structure>
       <ks_energies>
-        <k_point weight="1">0 0 0</k_point>
+        <k_point weight="1">0.25 0 0</k_point>
         <eigenvalues>-0.5 0.2</eigenvalues>
         <occupations>2 0</occupations>
       </ks_energies>
@@ -368,3 +464,4 @@ def test_bands_lp_writes_p_matrix_from_saved_upf_and_wavefunctions(
     text = (tmp_path / "p_avg.dat").read_text(encoding="utf-8")
     assert "&p_mat nbnd=" in text
     assert "nks=" in text
+    assert "          -0.250000 -0.250000  0.250000      1" in text

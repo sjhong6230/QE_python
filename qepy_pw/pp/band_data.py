@@ -12,7 +12,7 @@ import numpy as np
 
 from ..constants import EV_PER_HARTREE
 from ..errors import QEInputError
-from ..pw.save import QES_NAMESPACE
+from .xml_data import find, findall, findtext, upstream_qe_xml
 
 
 @dataclass(frozen=True)
@@ -79,17 +79,14 @@ def read_saved_bands(prefix: str = "pwscf", outdir: str | None = None) -> BandDa
         root = ET.parse(path).getroot()
     except (OSError, ET.ParseError) as exc:
         raise QEInputError(f"cannot read saved band data {path}: {exc}") from exc
-    namespace = {"qes": QES_NAMESPACE}
-    records = root.findall(
-        "qes:output/qes:band_structure/qes:ks_energies", namespace
-    )
+    records = findall(root, "output/band_structure/ks_energies")
     if not records:
         raise QEInputError(f"saved data {path} contains no Kohn-Sham energies")
     points: list[np.ndarray] = []
     energies: list[np.ndarray] = []
     for index, record in enumerate(records, start=1):
-        point = record.findtext("qes:k_point", namespaces=namespace)
-        values = record.findtext("qes:eigenvalues", namespaces=namespace)
+        point = findtext(record, "k_point")
+        values = findtext(record, "eigenvalues")
         kpoint = np.fromstring(point or "", sep=" ")
         eigenvalues = np.fromstring(values or "", sep=" ")
         if kpoint.shape != (3,) or eigenvalues.size == 0:
@@ -99,7 +96,19 @@ def read_saved_bands(prefix: str = "pwscf", outdir: str | None = None) -> BandDa
     widths = {len(values) for values in energies}
     if len(widths) != 1:
         raise QEInputError("saved k points have inconsistent band counts")
-    return BandData(np.vstack(points), np.vstack(energies))
+    point_array = np.vstack(points)
+    if upstream_qe_xml(root):
+        reciprocal = find(root, "output/basis_set/reciprocal_lattice")
+        if reciprocal is None:
+            raise QEInputError("upstream QE save contains no reciprocal lattice")
+        reciprocal_vectors = np.vstack([
+            np.fromstring(findtext(reciprocal, f"b{i}") or "", sep=" ")
+            for i in range(1, 4)
+        ])
+        if reciprocal_vectors.shape != (3, 3):
+            raise QEInputError("upstream QE save contains an invalid reciprocal lattice")
+        point_array = point_array @ np.linalg.inv(reciprocal_vectors)
+    return BandData(point_array, np.vstack(energies))
 
 
 _HEADER = re.compile(r"nbnd\s*=\s*(\d+).*nks\s*=\s*(\d+)", re.IGNORECASE)
