@@ -415,6 +415,16 @@ def _description(matrix: np.ndarray) -> str:
     return f"{prefix}{angle:3d} deg rotation - cart. axis [{axis[0]},{axis[1]},{axis[2]}]"
 
 
+def operation_description(lattice: np.ndarray, operation) -> str:
+    """Return QE's human-readable name for a crystal symmetry operation."""
+    cartesian = (
+        np.linalg.inv(np.asarray(lattice, dtype=float))
+        @ np.asarray(operation.matrix, dtype=float)
+        @ np.asarray(lattice, dtype=float)
+    )
+    return _description(cartesian)
+
+
 def _irrep_sort_key(item, inversion_slot: int | None, mirror_slot: int | None):
     dimension, characters = item
     trivial = all(abs(value - 1.0) < 1.0e-7 for value in characters)
@@ -543,5 +553,5 @@ oh_character_table = point_group_character_table
 
 __all__ = [
     "PointGroupClass", "PointGroupTable", "point_group_character_table",
-    "oh_character_table",
+    "oh_character_table", "operation_description",
 ]

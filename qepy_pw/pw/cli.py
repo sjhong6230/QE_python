@@ -133,16 +133,28 @@ def main(argv: list[str] | None = None) -> int:
         result = run_scf(pw, progress=progress, mpi=mpi)
         save_directory = None
         if str(pw.control.get("disk_io", "low")).strip().lower() != "none":
-            from .save import write_qe_save
+            from .save import resolve_save_directory, write_qe_save
 
+            if mpi.is_root:
+                print(
+                    "\n     Writing all to output data dir "
+                    f"{resolve_save_directory(pw)} :",
+                    flush=True,
+                )
             save_directory = write_qe_save(pw, result, mpi=mpi)
         if mpi.is_root:
             from .output import format_footer
 
             if save_directory is not None:
+                calculation = str(
+                    pw.control.get("calculation", "scf")
+                ).strip().lower()
+                items = "XML data file, "
+                if calculation == "scf":
+                    items += "charge density, "
+                items += "pseudopotentials, collected wavefunctions"
                 print(
-                    f"\n     Writing XML/HDF5 data to output data dir "
-                    f"{save_directory} :\n",
+                    f"     {items}\n",
                     flush=True,
                 )
             print(format_footer(pw, result), end="", flush=True)

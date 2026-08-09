@@ -72,6 +72,7 @@ def test_qe_diamond_character_classes_use_the_printed_symmetry_indices():
     assert len(class_indices) == len(set(class_indices))
 
     output = format_header(pw)
+    assert "deg rotation - cart. axis" in output
     assert "point group O_h (m-3m)" in output
     assert "there are 10 classes" in output
     for point_class in table.classes:
@@ -129,3 +130,48 @@ def test_all_32_crystallographic_point_group_character_tables():
             character_rows.conj() * class_sizes[None, :]
         ) @ character_rows.T
         assert np.allclose(gram, len(rotations) * np.eye(len(table.irreps)))
+
+
+def test_high_verbosity_force_and_stress_decompositions_sum_to_totals():
+    from qepy_pw.output import format_footer
+    from qepy_pw.scf import run_scf
+
+    case = CASES["scf_baseline"]
+    pw = read_pw_input(input_path(case))
+    pw.control["pseudo_dir"] = str(input_path(case).parents[1] / "pseudo")
+    pw.control["verbosity"] = "high"
+    pw.control["tprnfor"] = True
+    result = run_scf(pw)
+
+    assert result.force_terms is not None
+    assert result.stress_terms is not None
+    force_sum = sum((
+        result.force_terms.nonlocal_ha_per_bohr,
+        result.force_terms.ionic_ha_per_bohr,
+        result.force_terms.local_ha_per_bohr,
+        result.force_terms.core_correction_ha_per_bohr,
+        result.force_terms.scf_correction_ha_per_bohr,
+    ))
+    stress_sum = sum((
+        result.stress_terms.kinetic_ha_per_bohr3,
+        result.stress_terms.local_ha_per_bohr3,
+        result.stress_terms.nonlocal_ha_per_bohr3,
+        result.stress_terms.hartree_ha_per_bohr3,
+        result.stress_terms.xc_ha_per_bohr3,
+        result.stress_terms.core_correction_ha_per_bohr3,
+        result.stress_terms.ewald_ha_per_bohr3,
+    ))
+    np.testing.assert_allclose(force_sum, result.forces_ha_per_bohr)
+    np.testing.assert_allclose(
+        stress_sum, result.stress_ha_per_bohr3, atol=1.0e-18
+    )
+    output = format_footer(pw, result)
+    assert "The non-local contrib.  to forces" in output
+    assert "The SCF correction term to forces" in output
+    assert "kinetic stress (kbar)" in output
+    assert "ewald   stress (kbar)" in output
+
+    pw.control["calculation"] = "nscf"
+    nscf_output = format_footer(pw, result)
+    assert "End of band structure calculation" in nscf_output
+    assert "convergence has been achieved" not in nscf_output

@@ -69,8 +69,9 @@ def _format_symmetry(out: io.StringIO, pw: PWInput) -> None:
     print("\n\n                                    s                        frac. trans.", file=out)
     inverse_lattice = np.linalg.inv(pw.lattice)
     for index, operation in enumerate(operations, start=1):
-        is_identity = np.array_equal(operation.matrix, np.eye(3, dtype=int))
-        label = "identity" if is_identity else "crystal symmetry"
+        from ..point_group import operation_description
+
+        label = operation_description(pw.lattice, operation)
         print(f"\n      isym = {index:2d}     {label:<45s}\n", file=out)
         translation = np.asarray(operation.translation, dtype=float)
         has_translation = not np.allclose(translation, 0.0)
@@ -489,8 +490,43 @@ def format_setup(setup: SCFSetup) -> str:
         f"{format_bytes(estimated_total)}",
         file=out,
     )
+    if setup.calculation in {"nscf", "bands"}:
+        print("\n     Band Structure Calculation", file=out)
     print("", file=out)
     return out.getvalue()
+
+
+def _format_force_component(
+    out: io.StringIO, title: str, values: np.ndarray, species_types: list[int]
+) -> None:
+    print(f"\n     {title}\n", file=out)
+    for index, (atom_type, force) in enumerate(
+        zip(species_types, values), start=1
+    ):
+        force_ry = 2.0 * force
+        force_ry = np.asarray([_clean_zero(value, 5.0e-9) for value in force_ry])
+        print(
+            f"     atom {index:4d} type {atom_type:2d}   force = "
+            f"{force_ry[0]:14.8f}{force_ry[1]:14.8f}{force_ry[2]:14.8f}",
+            file=out,
+        )
+
+
+def _format_stress_component(
+    out: io.StringIO, title: str, values: np.ndarray
+) -> None:
+    hartree_kbar = (
+        10.0 * 4.3597447222071e-18 / 0.529177210903e-10**3 / 1.0e9
+    )
+    for row_index, row in enumerate(hartree_kbar * values):
+        prefix = f"     {title:<18s}" if row_index == 0 else " " * 23
+        print(
+            prefix
+            + "".join(
+                f"{_clean_zero(value, 5.0e-3):10.2f}" for value in row
+            ),
+            file=out,
+        )
 
 
 def format_iteration(step: SCFIteration) -> str:
@@ -597,6 +633,16 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
     out = io.StringIO()
     calculation = str(pw.control.get("calculation", "scf")).strip().lower()
     if calculation in {"nscf", "bands"}:
+        cpu_so_far = sum(
+            entry.cpu_seconds
+            for name in ("init_run", "electrons")
+            if (entry := result.timings.get(name)) is not None
+        )
+        print(
+            f"     total cpu time spent up to now is "
+            f"{cpu_so_far:10.1f} secs\n",
+            file=out,
+        )
         print("     End of band structure calculation\n", file=out)
     elif result.converged:
         print("     End of self-consistent calculation\n", file=out)
@@ -681,23 +727,23 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
             )
     marker = "!" if result.converged else " "
     if calculation == "scf":
-        print(f"\n{marker}    total energy              = {result.total_energy_ha * 2:18.10f} Ry", file=out)
+        print(f"\n{marker}    total energy              = {result.total_energy_ha * 2:18.8f} Ry", file=out)
     if result.iterations:
         print(
             f"     estimated scf accuracy    < "
-            f"{2.0 * result.iterations[-1].estimated_accuracy_ha:18.10f} Ry",
+            f"{2.0 * result.iterations[-1].estimated_accuracy_ha:18.8f} Ry",
             file=out,
         )
     if occupations_mode == "smearing" and result.energy_terms is not None:
         smearing_ry = 2.0 * result.energy_terms.smearing_ha
         print(
             f"     smearing contrib. (-TS)   = "
-            f"{smearing_ry:18.10f} Ry",
+            f"{smearing_ry:18.8f} Ry",
             file=out,
         )
         print(
             f"     internal energy E=F+TS    = "
-            f"{2.0 * result.total_energy_ha - smearing_ry:18.10f} Ry",
+            f"{2.0 * result.total_energy_ha - smearing_ry:18.8f} Ry",
             file=out,
         )
     if result.energy_terms is not None:
@@ -715,35 +761,61 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
             )
         print(
             f"     one-electron contribution = "
-            f"{2.0 * terms.one_electron_ha:18.10f} Ry",
+            f"{2.0 * terms.one_electron_ha:18.8f} Ry",
             file=out,
         )
         print(
             f"     hartree contribution      = "
-            f"{2.0 * terms.hartree_ha:18.10f} Ry",
+            f"{2.0 * terms.hartree_ha:18.8f} Ry",
             file=out,
         )
         print(
             f"     xc contribution           = "
-            f"{2.0 * terms.xc_ha:18.10f} Ry",
+            f"{2.0 * terms.xc_ha:18.8f} Ry",
             file=out,
         )
         print(
             f"     ewald contribution        = "
-            f"{2.0 * terms.ewald_ha:18.10f} Ry",
+            f"{2.0 * terms.ewald_ha:18.8f} Ry",
             file=out,
         )
         if abs(terms.descf_ha) > 1.0e-12:
             print(
                 f"     scf correction            = "
-                f"{2.0 * terms.descf_ha:18.10f} Ry",
+                f"{2.0 * terms.descf_ha:18.8f} Ry",
                 file=out,
             )
     if result.forces_ha_per_bohr is not None:
-        species_types = {
+        species_type_map = {
             species.label: index
             for index, species in enumerate(pw.species, start=1)
         }
+        species_types = [species_type_map[atom.label] for atom in pw.atoms]
+        if (
+            str(pw.control.get("verbosity", "low")).lower() == "high"
+            and result.force_terms is not None
+        ):
+            terms = result.force_terms
+            _format_force_component(
+                out, "The non-local contrib.  to forces",
+                terms.nonlocal_ha_per_bohr, species_types,
+            )
+            _format_force_component(
+                out, "The ionic contribution  to forces",
+                terms.ionic_ha_per_bohr, species_types,
+            )
+            _format_force_component(
+                out, "The local contribution  to forces",
+                terms.local_ha_per_bohr, species_types,
+            )
+            _format_force_component(
+                out, "The core correction contribution to forces",
+                terms.core_correction_ha_per_bohr, species_types,
+            )
+            _format_force_component(
+                out, "The SCF correction term to forces",
+                terms.scf_correction_ha_per_bohr, species_types,
+            )
         print(
             "\n     Forces acting on atoms (cartesian axes, Ry/au):\n",
             file=out,
@@ -752,9 +824,12 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
             zip(pw.atoms, result.forces_ha_per_bohr), start=1
         ):
             force_ry = 2.0 * force
+            force_ry = np.asarray([
+                _clean_zero(value, 5.0e-9) for value in force_ry
+            ])
             print(
                 f"     atom {index:4d} type "
-                f"{species_types[atom.label]:2d}   force = "
+                f"{species_type_map[atom.label]:2d}   force = "
                 f"{force_ry[0]:14.8f}{force_ry[1]:14.8f}"
                 f"{force_ry[2]:14.8f}",
                 file=out,
@@ -762,9 +837,14 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
         total_force_ry = 2.0 * float(
             np.linalg.norm(result.forces_ha_per_bohr)
         )
+        scf_correction_ry = 0.0
+        if result.force_terms is not None:
+            scf_correction_ry = 2.0 * float(
+                np.linalg.norm(result.force_terms.scf_correction_ha_per_bohr)
+            )
         print(
             f"\n     Total force = {total_force_ry:12.6f}"
-            "     Total SCF correction =     0.000000",
+            f"     Total SCF correction = {scf_correction_ry:12.6f}",
             file=out,
         )
     if result.stress_ha_per_bohr3 is not None:
@@ -777,20 +857,39 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
         stress_ry = 2.0 * result.stress_ha_per_bohr3
         stress_kbar = hartree_kbar * result.stress_ha_per_bohr3
         pressure = float(np.trace(stress_kbar) / 3.0)
+        if (
+            str(pw.control.get("verbosity", "low")).lower() == "high"
+            and result.stress_terms is not None
+        ):
+            terms = result.stress_terms
+            print(file=out)
+            _format_stress_component(out, "kinetic stress (kbar)", terms.kinetic_ha_per_bohr3)
+            _format_stress_component(out, "local   stress (kbar)", terms.local_ha_per_bohr3)
+            _format_stress_component(out, "nonloc. stress (kbar)", terms.nonlocal_ha_per_bohr3)
+            _format_stress_component(out, "hartree stress (kbar)", terms.hartree_ha_per_bohr3)
+            _format_stress_component(out, "exc-cor stress (kbar)", terms.xc_ha_per_bohr3)
+            _format_stress_component(out, "corecor stress (kbar)", terms.core_correction_ha_per_bohr3)
+            _format_stress_component(out, "ewald   stress (kbar)", terms.ewald_ha_per_bohr3)
         print(
             "\n          total   stress  (Ry/bohr**3)"
-            f"                   (kbar)     P= {pressure:8.2f}",
+            f"                   (kbar)     P= {pressure:12.2f}",
             file=out,
         )
         for row_ry, row_kbar in zip(stress_ry, stress_kbar):
+            row_ry = np.asarray([
+                _clean_zero(value, 5.0e-12) for value in row_ry
+            ])
+            row_kbar = np.asarray([
+                _clean_zero(value, 5.0e-3) for value in row_kbar
+            ])
             print(
                 "  "
                 + "".join(f"{value:13.8f}" for value in row_ry)
                 + "   "
-                + "".join(f"{value:11.2f}" for value in row_kbar),
+                + "".join(f"{value:12.2f}" for value in row_kbar),
                 file=out,
             )
-    if result.converged:
+    if result.converged and calculation == "scf":
         print(
             f"\n     convergence has been achieved in "
             f"{len(result.iterations):3d} iterations",

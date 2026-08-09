@@ -194,6 +194,11 @@ containing XML/HDF5 density and wavefunction data plus pseudopotential copies.
 This is intended for the implemented restart path and interoperability tests,
 not as a guarantee that every QE postprocessor accepts every file.
 
+The final save follows QE's `punch('all')` phase: after force and stress
+evaluation it writes schema metadata, writes charge density only for SCF,
+copies pseudopotentials, and finally writes collected wavefunctions. Thus an
+NSCF or bands run does not replace the converged SCF charge density.
+
 QE has several disk-I/O levels controlling wavefunction retention and
 frequency. qepy-pw currently keeps active wavefunctions in memory and treats
 all non-`none` values as one save policy. `disk_io='none'` skips persistent

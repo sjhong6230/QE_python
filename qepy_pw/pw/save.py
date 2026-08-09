@@ -899,15 +899,25 @@ def _write_qe_save_distributed(
         raise QEInputError(first_error)
 
     save_directory = resolve_save_directory(pw)
+    writes_density = (
+        str(pw.control.get("calculation", "scf")).strip().lower() == "scf"
+    )
     setup_error: str | None = None
     if mpi.is_root:
         try:
             save_directory.mkdir(parents=True, exist_ok=True)
             _atomic_write(
                 save_directory,
-                "charge-density.hdf5",
-                lambda path: _write_charge_density(path, pw, result),
+                "data-file-schema.xml",
+                lambda path: _write_xml(path, pw, result),
             )
+            if writes_density:
+                _atomic_write(
+                    save_directory,
+                    "charge-density.hdf5",
+                    lambda path: _write_charge_density(path, pw, result),
+                )
+            _finish_save_directory(save_directory, pw, kpoints)
         except Exception as exc:  # propagate root I/O failure to every rank
             setup_error = str(exc)
     setup_error = mpi.broadcast(setup_error)
@@ -947,20 +957,6 @@ def _write_qe_save_distributed(
                 f"{write_error}"
             )
 
-    finish_error: str | None = None
-    if mpi.is_root:
-        try:
-            _atomic_write(
-                save_directory,
-                "data-file-schema.xml",
-                lambda path: _write_xml(path, pw, result),
-            )
-            _finish_save_directory(save_directory, pw, kpoints)
-        except Exception as exc:
-            finish_error = str(exc)
-    finish_error = mpi.broadcast(finish_error)
-    if finish_error is not None:
-        raise QEInputError(f"cannot finalize distributed save: {finish_error}")
     return save_directory if mpi.is_root else None
 
 
@@ -985,19 +981,14 @@ def write_qe_save(
         raise QEInputError("wavefunction coefficient and Miller-index lists differ")
     if result.wavefunctions and len(result.wavefunctions) != len(pw.kpoints):
         raise QEInputError("saved wavefunctions do not cover every k point")
+    writes_density = (
+        str(pw.control.get("calculation", "scf")).strip().lower() == "scf"
+    )
     writers: list[tuple[str, Any]] = [
-        ("charge-density.hdf5", _write_charge_density),
+        ("data-file-schema.xml", _write_xml),
     ]
-    for kpoint_index in range(len(result.wavefunctions)):
-        writers.append(
-            (
-                f"wfc{kpoint_index + 1}.hdf5",
-                lambda path, input_pw, scf_result, index=kpoint_index: (
-                    _write_wavefunction(path, input_pw, scf_result, index)
-                ),
-            )
-        )
-    writers.append(("data-file-schema.xml", _write_xml))
+    if writes_density:
+        writers.append(("charge-density.hdf5", _write_charge_density))
     temporary_files: list[Path] = []
     try:
         for final_name, writer in writers:
@@ -1009,6 +1000,13 @@ def write_qe_save(
         _finish_save_directory(
             save_directory, pw, len(result.wavefunctions)
         )
+        for kpoint_index in range(len(result.wavefunctions)):
+            final_name = f"wfc{kpoint_index + 1}.hdf5"
+            temporary = _temporary_path(save_directory, final_name)
+            temporary_files.append(temporary)
+            _write_wavefunction(temporary, pw, result, kpoint_index)
+            os.replace(temporary, save_directory / final_name)
+            temporary_files.remove(temporary)
     finally:
         for temporary in temporary_files:
             temporary.unlink(missing_ok=True)

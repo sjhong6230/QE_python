@@ -43,11 +43,22 @@ class BandData:
         return self.energies_ev.shape[1]
 
     def path_coordinate(self) -> np.ndarray:
-        """Return cumulative Euclidean distance in saved reciprocal units."""
+        """Return QE's plottable-band path coordinate."""
         if self.nks == 0:
             return np.empty(0)
         steps = np.linalg.norm(np.diff(self.kpoints, axis=0), axis=1)
-        return np.concatenate(([0.0], np.cumsum(steps)))
+        coordinate = np.zeros(self.nks)
+        if not len(steps):
+            return coordinate
+        typical = float(steps[0])
+        for index, distance in enumerate(steps, start=1):
+            if typical > 0.0 and distance > 5.0 * typical:
+                coordinate[index] = coordinate[index - 1]
+            else:
+                coordinate[index] = coordinate[index - 1] + distance
+                if distance > 1.0e-4:
+                    typical = float(distance)
+        return coordinate
 
 
 def resolve_save_directory(prefix: str, outdir: str | None) -> Path:
@@ -101,7 +112,7 @@ def write_band_file(path: str | Path, data: BandData) -> Path:
         for point, values in zip(data.kpoints, data.energies_ev):
             stream.write("          " + "".join(f"{value:10.6f}" for value in point) + "\n")
             for start in range(0, data.nbnd, 10):
-                stream.write("".join(f"{value:10.4f}" for value in values[start:start + 10]) + "\n")
+                stream.write("".join(f"{value:9.3f}" for value in values[start:start + 10]) + "\n")
     return output
 
 
@@ -145,6 +156,6 @@ def write_gnuplot(path: str | Path, data: BandData, reference_ev: float = 0.0) -
     with output.open("w", encoding="utf-8", newline="\n") as stream:
         for band in range(data.nbnd):
             for x, energy in zip(coordinate, data.energies_ev[:, band]):
-                stream.write(f"{x:12.7f} {energy - reference_ev:12.7f}\n")
+                stream.write(f"{x:10.4f}{energy - reference_ev:10.4f}\n")
             stream.write("\n")
     return output

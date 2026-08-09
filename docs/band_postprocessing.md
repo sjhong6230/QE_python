@@ -19,9 +19,13 @@ by a preceding `calculation='bands'` run. It writes the QE `filband` format,
 /
 ```
 
-For scalar wavefunctions, irrep classes are obtained from numerical
-little-group representation matrices in degenerate eigenspaces. The positive
-integer classes are written using QE's `&plot_rap` format. With
+For scalar wavefunctions, characters are obtained from numerical little-group
+representation matrices in degenerate eigenspaces and decomposed with the
+QE-ordered point-group character table. The resulting QE irrep indices (and
+Mulliken labels on stdout) are written using QE's `&plot_rap` format. At a
+nonsymmorphic zone-border k point, where the small representation requires
+the factor-system treatment not yet implemented here, the representation is
+left unavailable instead of assigning a misleading label. With
 `lsym=.false., no_overlap=.false.`, adjacent bands are instead connected by a
 maximum-weight one-to-one assignment of wavefunction overlaps.
 

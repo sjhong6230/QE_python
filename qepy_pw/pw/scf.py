@@ -148,6 +148,30 @@ class SCFEnergyTerms:
 
 
 @dataclass(frozen=True)
+class SCFForceTerms:
+    """QE force decomposition, in Hartree/bohr."""
+
+    nonlocal_ha_per_bohr: np.ndarray
+    ionic_ha_per_bohr: np.ndarray
+    local_ha_per_bohr: np.ndarray
+    core_correction_ha_per_bohr: np.ndarray
+    scf_correction_ha_per_bohr: np.ndarray
+
+
+@dataclass(frozen=True)
+class SCFStressTerms:
+    """QE stress decomposition, in Hartree/bohr**3."""
+
+    kinetic_ha_per_bohr3: np.ndarray
+    local_ha_per_bohr3: np.ndarray
+    nonlocal_ha_per_bohr3: np.ndarray
+    hartree_ha_per_bohr3: np.ndarray
+    xc_ha_per_bohr3: np.ndarray
+    core_correction_ha_per_bohr3: np.ndarray
+    ewald_ha_per_bohr3: np.ndarray
+
+
+@dataclass(frozen=True)
 class SCFSetup:
     """Read-only setup summary emitted once before the SCF loop."""
 
@@ -179,6 +203,7 @@ class SCFSetup:
     runtime_baseline_rss_bytes_per_rank: int = 0
     runtime_baseline_pss_bytes_all_ranks: int = 0
     runtime_baseline_uss_bytes_all_ranks: int = 0
+    calculation: str = "scf"
 
 
 @dataclass
@@ -199,6 +224,8 @@ class SCFResult:
     timings: dict[str, TimingEntry] = field(default_factory=dict)
     forces_ha_per_bohr: np.ndarray | None = None
     stress_ha_per_bohr3: np.ndarray | None = None
+    force_terms: SCFForceTerms | None = None
+    stress_terms: SCFStressTerms | None = None
     occupations: list[np.ndarray] = field(default_factory=list)
     fermi_energy_ha: float | None = None
     mpi_processes: int = 1
@@ -1412,7 +1439,7 @@ def _hellmann_feynman_stress(
     nonlocal_energy: float,
     nonlocal_tensor: np.ndarray,
     real_workspace: np.ndarray | None = None,
-) -> np.ndarray:
+) -> tuple[np.ndarray, SCFStressTerms]:
     """Return analytic compressive-positive HF stress in Ha/bohr^3."""
     volume = pw.volume
     stress = np.zeros((3, 3))
@@ -1472,7 +1499,8 @@ def _hellmann_feynman_stress(
         local_tensor += mpi.sum_array(
             np.einsum("g,gi,gj->ij", radial_weight, g_vectors, g_vectors)
         )
-    stress += local_tensor + local_energy / volume * np.eye(3)
+    local_stress = local_tensor + local_energy / volume * np.eye(3)
+    stress += local_stress
     del local_radial, potential, radial_derivative, phase, coefficient
 
     # Hartree term, obtained by differentiating 4*pi/G^2 and the two
@@ -1494,7 +1522,8 @@ def _hellmann_feynman_stress(
             g_vectors,
         )
     )
-    stress += hartree_tensor + hartree_energy / volume * np.eye(3)
+    hartree_stress = hartree_tensor + hartree_energy / volume * np.eye(3)
+    stress += hartree_stress
     del density_g, radial_weight
 
     # Exchange-correlation contribution. QE's diagonal term contains the
@@ -1534,14 +1563,16 @@ def _hellmann_feynman_stress(
     xc_potential_energy = grid_scale * mpi.sum_scalar(
         float(np.sum(density * potential_xc))
     )
-    stress -= (xc_energy - xc_potential_energy) / volume * np.eye(3)
+    xc_stress = -(xc_energy - xc_potential_energy) / volume * np.eye(3)
     if gga_stress_tensor is not None:
-        stress += mpi.sum_array(gga_stress_tensor) / np.prod(shape)
+        xc_stress += mpi.sum_array(gga_stress_tensor) / np.prod(shape)
+    stress += xc_stress
     del epsilon_xc, total_density, gga_stress_tensor
 
     # Nonlinear core correction. This is QE's stres_cc: the diagonal term
     # restores the frozen-core part omitted from vtxc, and the radial tensor
     # differentiates each spherical core profile with respect to |G|.
+    core_stress = np.zeros((3, 3))
     if any(pseudo.has_nlcc for pseudo in pseudos.values()):
         core_diagonal = mpi.sum_scalar(
             float(np.sum(core_density * potential_xc))
@@ -1580,19 +1611,21 @@ def _hellmann_feynman_stress(
                     g_vectors,
                 )
             )
-        stress += core_tensor + core_diagonal * np.eye(3)
+        core_stress = core_tensor + core_diagonal * np.eye(3)
+        stress += core_stress
         del potential_xc_g, radial_weight
 
     del potential_xc
 
     # Norm-conserving projector derivatives are evaluated jointly with
     # forces before entering this routine, once per species and k point.
-    stress += (
+    nonlocal_stress = (
         0.5 * (nonlocal_tensor + nonlocal_tensor.T)
         + nonlocal_energy / volume * np.eye(3)
     )
+    stress += nonlocal_stress
 
-    stress += ewald_stress(
+    ewald_term = ewald_stress(
         pw.lattice,
         np.array([atom.position for atom in pw.atoms]),
         charges,
@@ -1600,9 +1633,20 @@ def _hellmann_feynman_stress(
         reciprocal_vectors=charge_vectors,
         mpi=mpi,
     )
-    return symmetrize_stress(
+    stress += ewald_term
+    symmetrized_terms = SCFStressTerms(*(
+        symmetrize_stress(
+            0.5 * (term + term.T), pw.lattice, pw.symmetry_operations
+        )
+        for term in (
+            kinetic_stress, local_stress, nonlocal_stress, hartree_stress,
+            xc_stress, core_stress, ewald_term,
+        )
+    ))
+    total = symmetrize_stress(
         0.5 * (stress + stress.T), pw.lattice, pw.symmetry_operations
     )
+    return total, symmetrized_terms
 
 
 def _serial_blas_thread_count(
@@ -2354,6 +2398,7 @@ def _run_scf(
         runtime_baseline_rss_bytes_per_rank=baseline_rss_per_rank,
         runtime_baseline_pss_bytes_all_ranks=baseline_pss_all_ranks,
         runtime_baseline_uss_bytes_all_ranks=baseline_uss_all_ranks,
+        calculation=calculation,
     )
     if release_replicated_reciprocal_grid:
         # From here onward MPI branches use only local_charge_vectors/g2 and
@@ -3422,6 +3467,8 @@ def _run_scf(
             trim_allocator()
             forces_ha_per_bohr = None
             stress_ha_per_bohr3 = None
+            force_terms = None
+            stress_terms = None
             nonlocal_energy = 0.0
             nonlocal_force = None
             nonlocal_tensor = None
@@ -3477,24 +3524,27 @@ def _run_scf(
                     reciprocal_vectors=local_charge_vectors,
                     mpi=mpi,
                 )
-                forces_ha_per_bohr = (
-                    local_force
-                    + core_force
-                    + nonlocal_force
-                    + ionic_force
-                )
-                forces_ha_per_bohr = symmetrize_forces(
-                    forces_ha_per_bohr,
-                    pw.lattice,
-                    positions @ np.linalg.inv(pw.lattice),
-                    [atom.label for atom in pw.atoms],
-                    pw.symmetry_operations,
-                )
+                fractional_positions = positions @ np.linalg.inv(pw.lattice)
+                atom_labels = [atom.label for atom in pw.atoms]
+                force_components = [
+                    symmetrize_forces(
+                        component, pw.lattice, fractional_positions,
+                        atom_labels, pw.symmetry_operations,
+                    )
+                    for component in (
+                        nonlocal_force, ionic_force, local_force, core_force,
+                    )
+                ]
+                forces_ha_per_bohr = sum(force_components)
                 # A periodic neutral cell is invariant under a rigid
                 # translation. Enforce the corresponding acoustic sum rule
                 # after assembling independently rounded FFT/projector terms.
                 forces_ha_per_bohr -= np.mean(
                     forces_ha_per_bohr, axis=0, keepdims=True
+                )
+                force_terms = SCFForceTerms(
+                    *force_components,
+                    forces_ha_per_bohr - sum(force_components),
                 )
                 del final_vxc
                 trim_allocator()
@@ -3502,7 +3552,7 @@ def _run_scf(
             if calculate_stress:
                 stress_started = timers.start()
                 assert nonlocal_tensor is not None
-                stress_ha_per_bohr3 = _hellmann_feynman_stress(
+                stress_ha_per_bohr3, stress_terms = _hellmann_feynman_stress(
                     pw,
                     pseudo_by_label,
                     bases,
@@ -3573,6 +3623,8 @@ def _run_scf(
                 timings=timers.snapshot(),
                 forces_ha_per_bohr=forces_ha_per_bohr,
                 stress_ha_per_bohr3=stress_ha_per_bohr3,
+                force_terms=force_terms,
+                stress_terms=stress_terms,
                 occupations=[values.copy() for values in band_occupations],
                 fermi_energy_ha=fermi_energy,
                 mpi_processes=mpi.size,

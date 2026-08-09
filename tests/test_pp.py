@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import h5py
+import hashlib
 from pathlib import Path
 import shutil
 import pytest
@@ -10,11 +11,17 @@ from qepy_pw.errors import QEInputError
 from qepy_pw.constants import EV_PER_HARTREE
 from qepy_pw.pp.band_data import BandData, read_band_file, write_band_file, write_gnuplot
 from qepy_pw.pp.bands import (
+    classify_irreps,
+    main as bands_main,
     reorder_by_overlap,
     run_bands,
     write_band_grid_2d,
     write_irrep_file,
 )
+from qepy_pw.input import read_pw_input
+from qepy_pw.output import format_footer
+from qepy_pw.pw.save import write_qe_save
+from qepy_pw.scf import run_scf
 from qepy_pw.pp.plotband import high_symmetry_indices, parse_plotband_input
 from qepy_pw.pp.p_matrix import momentum_matrices, write_p_avg
 
@@ -71,7 +78,7 @@ def test_no_overlap_true_preserves_eigenvalue_order_without_wavefunctions(
     restored = read_band_file(filband)
     np.testing.assert_allclose(
         restored.energies_ev[1],
-        np.round(np.array([0.2, 0.8]) * EV_PER_HARTREE, 4),
+        np.round(np.array([0.2, 0.8]) * EV_PER_HARTREE, 3),
     )
 
 
@@ -158,6 +165,82 @@ def test_bands_reads_pw_save_and_performs_scalar_irrep_analysis(
     assert (tmp_path / "si.bands.rap").read_text(encoding="utf-8").startswith(
         " &plot_rap"
     )
+    assert int(
+        (tmp_path / "si.bands.rap").read_text(encoding="utf-8").splitlines()[2]
+    ) == 1
+
+
+def test_irrep_analysis_distinguishes_inversion_parity(tmp_path) -> None:
+    namespace = "http://www.quantum-espresso.org/ns/qes/qes-1.0"
+    save = tmp_path / "parity.save"
+    save.mkdir()
+    (save / "data-file-schema.xml").write_text(
+        f"""<espresso xmlns="{namespace}"><output>
+        <atomic_structure alat="1"><cell><a1>1 0 0</a1><a2>0 1 0</a2>
+        <a3>0 0 1</a3></cell><atomic_positions>
+        <atom name="X">0 0 0</atom></atomic_positions></atomic_structure>
+        <band_structure><symmetry_operations>
+        <symmetry><rotation>1 0 0 0 1 0 0 0 1</rotation>
+        <fractional_translation>0 0 0</fractional_translation></symmetry>
+        <symmetry><rotation>-1 0 0 0 -1 0 0 0 -1</rotation>
+        <fractional_translation>0 0 0</fractional_translation></symmetry>
+        </symmetry_operations></band_structure></output></espresso>""",
+        encoding="utf-8",
+    )
+    miller = np.array([[1, 0, 0], [-1, 0, 0]], dtype=np.int32)
+    coefficients = np.array([[1, 1], [1, -1]], dtype=complex) / np.sqrt(2.0)
+    data = BandData(np.zeros((1, 3)), np.array([[0.0, 1.0]]))
+    labels = classify_irreps(data, [(miller, coefficients)], save)
+    np.testing.assert_array_equal(labels, [[1, 2]])
+
+
+def test_scf_nscf_save_order_and_bands_inp_integration(
+    tmp_path, capsys
+) -> None:
+    root = Path(__file__).parent / "qe_reference"
+    source = root / "upstream" / "pw_scf" / "scf.in"
+    pseudo_dir = root / "upstream" / "pseudo"
+
+    scf_pw = read_pw_input(source)
+    scf_pw.control.update({
+        "prefix": "integ", "outdir": str(tmp_path),
+        "pseudo_dir": str(pseudo_dir), "disk_io": "medium",
+    })
+    scf_result = run_scf(scf_pw)
+    save_directory = write_qe_save(scf_pw, scf_result)
+    assert save_directory is not None
+    density_path = save_directory / "charge-density.hdf5"
+    density_before = hashlib.sha256(density_path.read_bytes()).digest()
+
+    nscf_pw = read_pw_input(source)
+    nscf_pw.control.update({
+        "calculation": "nscf", "prefix": "integ",
+        "outdir": str(tmp_path), "pseudo_dir": str(pseudo_dir),
+        "disk_io": "medium", "verbosity": "high", "tstress": False,
+    })
+    nscf_result = run_scf(nscf_pw)
+    write_qe_save(nscf_pw, nscf_result)
+    assert hashlib.sha256(density_path.read_bytes()).digest() == density_before
+    nscf_output = format_footer(nscf_pw, nscf_result)
+    assert "End of band structure calculation" in nscf_output
+    assert "convergence has been achieved" not in nscf_output
+
+    band_input = tmp_path / "bands.in"
+    filband = tmp_path / "integ.bands"
+    band_input.write_text(
+        "&bands\n"
+        " prefix='integ',\n"
+        f" outdir='{tmp_path}',\n"
+        f" filband='{filband}'\n"
+        "/\n",
+        encoding="utf-8",
+    )
+    assert bands_main(["-inp", str(band_input)]) == 0
+    stdout = capsys.readouterr().out
+    assert "Band symmetry" in stdout
+    assert "JOB DONE." in stdout
+    assert filband.is_file()
+    assert Path(f"{filband}.rap").is_file()
 
 
 def test_plane_wave_momentum_matrix_has_k_plus_g_diagonal() -> None:
