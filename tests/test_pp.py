@@ -341,7 +341,7 @@ def test_irrep_analysis_uses_qe_fractional_translation_phase(tmp_path) -> None:
     coefficients = np.array([[1j, -1j], [1, 1]], dtype=complex) / np.sqrt(2.0)
     data = BandData(np.zeros((1, 3)), np.array([[0.0, 1.0]]))
     labels = classify_irreps(data, [(miller, coefficients)], save)
-    np.testing.assert_array_equal(labels, [[1, 2]])
+    np.testing.assert_array_equal(labels, [[2, 1]])
 
 
 def test_scf_nscf_save_order_and_bands_inp_integration(

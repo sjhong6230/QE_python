@@ -126,6 +126,84 @@ def test_gamma_only_scf_preserves_multidimensional_irrep_degeneracies():
         assert np.ptp(multiplet) < 1.0e-10, label
 
 
+def test_gamma_nscf_preserves_degeneracies_and_bands_finds_irreps(
+    tmp_path, monkeypatch,
+):
+    """NSCF uses QE's tighter default ethr and bands rotates translations."""
+    from qepy_pw.pp.band_data import read_saved_bands
+    from qepy_pw.pp.bands import _read_wavefunctions, classify_irreps
+    from qepy_pw.pw.save import resolve_save_directory, write_qe_save
+    import qepy_pw.pw.scf as scf_module
+
+    case = CASES["scf_gamma"]
+    source = input_path(case)
+    pseudo_dir = source.parents[1] / "pseudo"
+    scf_pw = read_pw_input(source)
+    scf_pw.control.update({
+        "prefix": "gamma-nscf",
+        "outdir": str(tmp_path),
+        "pseudo_dir": str(pseudo_dir),
+        "disk_io": "medium",
+        "tstress": False,
+    })
+    scf_pw.system["nbnd"] = 12
+    scf_pw.electrons.update({
+        "conv_thr": 1.0e-10,
+        "diago_thr_init": 1.0e-10,
+    })
+    write_qe_save(scf_pw, run_scf(scf_pw))
+
+    nscf_pw = read_pw_input(source)
+    nscf_pw.control.update({
+        "calculation": "nscf",
+        "prefix": "gamma-nscf",
+        "outdir": str(tmp_path),
+        "pseudo_dir": str(pseudo_dir),
+        "disk_io": "medium",
+        "tstress": False,
+    })
+    nscf_pw.system["nbnd"] = 12
+    # Exercise QE's NSCF defaults, independently of the tight SCF settings.
+    nscf_pw.electrons.clear()
+
+    thresholds = []
+    symmetry_applications = 0
+    original_davidson = scf_module.davidson
+    original_apply = ReciprocalDensitySymmetrizer.apply
+
+    def tracked_davidson(*args, **kwargs):
+        thresholds.append(kwargs["tolerance"])
+        return original_davidson(*args, **kwargs)
+
+    def tracked_apply(self, density):
+        nonlocal symmetry_applications
+        symmetry_applications += 1
+        return original_apply(self, density)
+
+    monkeypatch.setattr(scf_module, "davidson", tracked_davidson)
+    monkeypatch.setattr(ReciprocalDensitySymmetrizer, "apply", tracked_apply)
+    result = run_scf(nscf_pw)
+
+    assert thresholds
+    # QE prints ethr in Ry; the solver receives Hartree.
+    np.testing.assert_allclose(thresholds, 0.5 * 0.1e-6 / 8.0)
+    assert symmetry_applications == 1
+    eigenvalues = result.eigenvalues_ha[0]
+    for multiplet in (eigenvalues[1:4], eigenvalues[4:7], eigenvalues[9:11]):
+        assert np.ptp(multiplet) < 1.0e-8
+
+    write_qe_save(nscf_pw, result)
+    save = resolve_save_directory(nscf_pw)
+    data = read_saved_bands("gamma-nscf", str(tmp_path))
+    wavefunctions = _read_wavefunctions(save, data.nks)
+    irreps = classify_irreps(data, wavefunctions, save)
+    # O_h rows: A1g, T2g, T1u, A2u, A1g, Eu.
+    np.testing.assert_array_equal(
+        irreps[0, :11],
+        [1, 5, 5, 5, 9, 9, 9, 7, 1, 8, 8],
+    )
+
+
 @pytest.mark.filterwarnings("ignore:Set OLD_ERROR_HANDLING:DeprecationWarning")
 def test_all_32_crystallographic_point_group_character_tables():
     """Exercise every scalar point group represented in QE's tables."""

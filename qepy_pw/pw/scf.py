@@ -2555,6 +2555,17 @@ def _run_scf(
                 )
             )
         )
+        # A fixed-potential calculation never reaches sum_band/sym_rho below.
+        # Project the restart density as it is loaded so NSCF and bands also
+        # inherit the crystal symmetry invariant.  This is a no-op (to
+        # roundoff) for a save written by the corrected SCF path, and repairs
+        # saves produced before Gamma-only density symmetrization was fixed.
+        if len(pw.symmetry_operations) > 1:
+            symmetry_started = timers.start()
+            rho = density_symmetrizer.apply(rho)
+            total_density = mpi.sum_scalar(float(np.sum(rho)))
+            rho *= nelec * np.prod(shape) / (total_density * pw.volume)
+            timers.stop("potinit:sym", symmetry_started)
         _starting_charge = nelec
         del saved_coefficients
     elif mpi.size == 1:
@@ -2742,11 +2753,22 @@ def _run_scf(
         )
     qe_random = _QERandom()
     requested_diago_thr = pw.electrons.get("diago_thr_init")
-    diago_thr_ry = (
-        float(requested_diago_thr)
-        if requested_diago_thr is not None
-        else (1.0e-5 if starting_potential == "file" else 1.0e-2)
-    )
+    if requested_diago_thr is not None:
+        diago_thr_ry = float(requested_diago_thr)
+    elif fixed_potential:
+        # QE does not use the generic startingpot='file' value (1e-5 Ry)
+        # for an NSCF/bands run.  In electrons() it derives ethr from the
+        # requested electronic accuracy: 0.1*conv_thr/nelec.  For example,
+        # the default conv_thr=1e-6 Ry and eight Si valence electrons give
+        # the 1.25e-8 Ry printed by pw.x.  The looser restart default split
+        # multidimensional little-group multiplets even when the saved
+        # Hamiltonian was exactly symmetric.
+        diago_thr_ry = max(
+            1.0e-13,
+            0.1 * conv_thr_ry / max(1.0, nelec),
+        )
+    else:
+        diago_thr_ry = 1.0e-5 if starting_potential == "file" else 1.0e-2
     if not np.isfinite(diago_thr_ry) or diago_thr_ry < 0.0:
         raise QEInputError("diago_thr_init must be nonnegative")
     davidson_tolerance = (

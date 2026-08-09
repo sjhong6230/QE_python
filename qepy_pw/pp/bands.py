@@ -206,11 +206,12 @@ def _symmetry_matrix(kpoint, miller, coefficients, operation) -> np.ndarray:
         destination = np.asarray([lookup[tuple(row)] for row in target], dtype=int)
     except KeyError as exc:
         raise QEInputError("symmetry-transformed plane wave is absent from saved basis") from exc
-    # QE's rotate_all_psi applies the fractional-translation phase with this
-    # sign to the destination coefficient.  The opposite sign happens to be
-    # invisible for symmorphic little groups but corrupts Gamma-point irreps
-    # in crystals such as diamond, where half the operations exchange atoms.
-    phase = np.exp(2j * np.pi * (transformed @ operation.translation))
+    # For x' = x S + t, the scalar-wavefunction action is
+    # (U psi)(x') = psi((x' - t) S^-1).  A source plane wave q therefore
+    # lands at q' = q S^-T with phase exp(-i 2pi q'.t).  The sign is invisible
+    # for symmorphic operations, but the opposite sign mixes distinct
+    # diamond Gamma irreps for operations that exchange the two atoms.
+    phase = np.exp(-2j * np.pi * (transformed @ operation.translation))
     transformed_coefficients = np.empty_like(coefficients)
     transformed_coefficients[destination] = phase[:, None] * coefficients
     return coefficients.conj().T @ transformed_coefficients
