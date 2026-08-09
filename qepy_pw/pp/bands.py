@@ -15,7 +15,7 @@ from scipy.optimize import linear_sum_assignment
 
 from ..cli_options import add_input_file_argument
 from ..errors import QEInputError, UnsupportedFeatureError, emit_qe_error
-from ..qe_format import format_qe_closing, format_qe_duration, format_qe_opening
+from ..qe_format import format_qe_closing, format_qe_opening, format_qe_timing
 from ..point_group import point_group_character_table
 from ..symmetry import SymmetryOperation, find_space_group
 from ..version import __version__
@@ -637,11 +637,7 @@ def main(argv: list[str] | None = None) -> int:
         run_bands(parse_namelist(text, "bands"), stdout=sys.stdout)
         elapsed = time.perf_counter() - started
         cpu_elapsed = time.process_time() - cpu_started
-        print(
-            "\n     BANDS        : "
-            f"{format_qe_duration(cpu_elapsed, 'CPU')} "
-            f"{format_qe_duration(elapsed, 'WALL')}\n"
-        )
+        print(format_qe_timing("BANDS", cpu_elapsed, elapsed))
         print(format_qe_closing(), end="")
         return 0
     except (QEInputError, UnsupportedFeatureError, OSError, ValueError) as exc:

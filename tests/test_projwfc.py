@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import io
 from pathlib import Path
 import shutil
 
 import numpy as np
 import pytest
 
+import qepy_pw.pp.projwfc as projwfc_module
 from qepy_pw.errors import QEInputError
 from qepy_pw.pp.projwfc import (
     Orbital,
+    ProjectionData,
     _dos_kernel,
     _lowdin_basis,
     run_projwfc,
@@ -79,11 +82,12 @@ def test_projwfc_end_to_end_on_saved_scalar_wavefunctions(
     source = Path(__file__).parent / "qe_reference" / "upstream" / "pseudo" / "pwscf.save"
     shutil.copytree(source, tmp_path / "pwscf.save")
     monkeypatch.chdir(tmp_path)
+    stdout = io.StringIO()
     data, paths = run_projwfc({
         "prefix": "pwscf", "outdir": ".", "filpdos": "si",
         "filproj": "si.proj", "emin": -10.0, "emax": 10.0,
         "deltae": 0.5, "degauss": 0.02, "lwrite_overlaps": True,
-    })
+    }, stdout=stdout)
     assert data.projections.shape[:2] == data.energies_ev.shape
     assert data.projections.shape[2] == len(data.orbitals) > 0
     assert np.all(data.projections >= 0.0)
@@ -92,6 +96,12 @@ def test_projwfc_end_to_end_on_saved_scalar_wavefunctions(
     total = (tmp_path / "si.pdos_tot").read_text(encoding="utf-8").splitlines()
     assert total[0] == "# E (eV) DOS(E) PDOS(E)"
     assert (tmp_path / "pwscf.save" / "atomic_proj.xml").is_file()
+    report = stdout.getvalue()
+    assert "     Reading xml data from directory:\n\n" in report
+    assert (
+        "     Gaussian broadening (read from input): "
+        "ngauss,degauss=   0    0.020000\n"
+    ) in report
 
 
 def test_box_ldos_full_grid_has_unit_state_weights(
@@ -119,3 +129,37 @@ def test_box_two_dimensional_indices_parse() -> None:
     )
     assert options["irmin(1,2)"] == 3
     assert options["irmax(3,2)"] == 7
+
+
+def test_projwfc_main_uses_qe_projection_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = tmp_path / "projwfc.in"
+    source.write_text("&PROJWFC\n/\n", encoding="utf-8")
+    data = ProjectionData(
+        energies_ev=np.asarray([[0.0]]),
+        weights=np.asarray([1.0]),
+        projections=np.asarray([[[0.9]]]),
+        amplitudes=np.asarray([[[np.sqrt(0.9)]]], dtype=complex),
+        occupations=np.asarray([[2.0]]),
+        orbitals=(Orbital(1, "Si", 1, 0, 0, "3S"),),
+        overlaps=(np.eye(1),),
+        fermi_ev=0.0,
+    )
+    monkeypatch.setattr(
+        projwfc_module,
+        "run_projwfc",
+        lambda _options, stdout=None: (data, []),
+    )
+
+    assert projwfc_module.main(["-inp", str(source)]) == 0
+    output = capsys.readouterr().out
+    assert output.startswith("\n     Program PROJWFC-PY v.")
+    assert "     Atomic states used for projection\n" in output
+    assert "     state #   1: atom   1 ( Si), wfc  1 (l=0 m= 1)" in output
+    assert "\nLowdin Charges: \n" in output
+    assert "     Atom #   1: total charge =   1.8000, s =  1.8000" in output
+    assert "     Spilling Parameter:   0.1000" in output
+    assert "\n     PROJWFC      : " in output
+    assert "\n   JOB DONE.\n" in output
+    assert "files written" not in output

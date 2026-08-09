@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import sys
+import time
+from typing import TextIO
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -15,6 +18,8 @@ from ..constants import EV_PER_HARTREE
 from ..errors import QEInputError, emit_qe_error
 from ..occupations import _linear_tetra_moments_block, _tetrahedra, smearing_order, wgauss
 from ..pw.save import QES_NAMESPACE
+from ..qe_format import format_qe_closing, format_qe_opening, format_qe_timing
+from ..version import __version__
 from .band_data import resolve_save_directory
 from .namelist import parse_namelist
 
@@ -104,26 +109,61 @@ def tetrahedron_dos(data: DOSData, grid_ev: np.ndarray, method: str) -> tuple[np
     return np.asarray(dos), np.asarray(integrated)
 
 
-def run_dos(options: dict[str, object]) -> Path:
+def run_dos(
+    options: dict[str, object], stdout: TextIO | None = None
+) -> Path:
     allowed = {"prefix", "outdir", "bz_sum", "ngauss", "degauss", "emin", "emax", "deltae", "fildos"}
     unknown = set(options) - allowed
     if unknown:
         raise QEInputError(f"unknown &DOS variable {sorted(unknown)[0]!r}")
     prefix = str(options.get("prefix", "pwscf"))
     outdir = str(options["outdir"]) if "outdir" in options else None
+    if stdout is not None:
+        directory = resolve_save_directory(prefix, outdir)
+        print(
+            f"\n     Reading xml data from directory:\n\n"
+            f"     {directory}{os.sep}",
+            file=stdout,
+        )
     data = read_saved_dos(prefix, outdir)
     delta = float(options.get("deltae", 0.01))
     if delta <= 0:
         raise QEInputError("DeltaE must be positive")
-    explicit_degauss = "degauss" in options
+    input_degauss = float(options.get("degauss", 0.0))
+    explicit_degauss = input_degauss != 0.0
     method = str(options.get("bz_sum", "")).strip().lower()
     if not method:
         method = data.occupations_kind.lower()
     tetra = method in {"tetrahedra", "tetrahedra_lin", "tetrahedra_opt"} and not explicit_degauss
-    ngauss = int(options.get("ngauss", smearing_order(data.smearing) if data.degauss_ry > 0 else 0))
-    degauss_ry = float(options.get("degauss", data.degauss_ry))
-    if not tetra and degauss_ry <= 0:
+    if explicit_degauss:
+        ngauss = int(options.get("ngauss", 0))
+        degauss_ry = input_degauss
+    elif data.degauss_ry > 0.0:
+        ngauss = smearing_order(data.smearing)
+        degauss_ry = data.degauss_ry
+    else:
+        ngauss = 0
         degauss_ry = delta / (0.5 * EV_PER_HARTREE)
+    if stdout is not None:
+        if tetra:
+            messages = {
+                "tetrahedra": "Tetrahedra used",
+                "tetrahedra_lin": "Linear tetrahedron method is used",
+                "tetrahedra_opt": "Optimized tetrahedron method used",
+            }
+            print(f"\n     {messages[method]}\n", file=stdout)
+        else:
+            if explicit_degauss:
+                source = "read from input"
+            elif data.degauss_ry > 0.0:
+                source = "read from file"
+            else:
+                source = "default values"
+            print(
+                f"\n     Gaussian broadening ({source}): "
+                f"ngauss,degauss={ngauss:4d}{degauss_ry:12.6f}\n",
+                file=stdout,
+            )
     width_ev = 0.5 * degauss_ry * EV_PER_HARTREE
     minimum, maximum = float(np.min(data.eigenvalues_ev)), float(np.max(data.eigenvalues_ev))
     emin = float(options.get("emin", minimum - (3 * width_ev if not tetra else 0)))
@@ -152,10 +192,20 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="dos.py")
     add_input_file_argument(parser)
     args = parser.parse_args(argv)
+    started = time.perf_counter()
+    cpu_started = time.process_time()
     try:
+        print(format_qe_opening("DOS-PY", __version__), end="")
         text = Path(args.input_file).read_text(encoding="utf-8") if args.input_file else sys.stdin.read()
-        output = run_dos(parse_namelist(text, "dos"))
-        print(f"     DOS written to file {output}")
+        run_dos(parse_namelist(text, "dos"), stdout=sys.stdout)
+        print(
+            format_qe_timing(
+                "DOS",
+                time.process_time() - cpu_started,
+                time.perf_counter() - started,
+            )
+        )
+        print(format_qe_closing(), end="")
         return 0
     except (QEInputError, OSError, ValueError, ET.ParseError) as exc:
         emit_qe_error(exc)

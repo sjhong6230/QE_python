@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import io
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+import qepy_pw.pp.dos as dos_module
 from qepy_pw.constants import EV_PER_HARTREE
 from qepy_pw.errors import QEInputError
 from qepy_pw.pp.dos import DOSData, run_dos, smearing_dos, tetrahedron_dos
@@ -38,14 +40,21 @@ def test_run_dos_reads_save_and_includes_energy_endpoint(tmp_path: Path, monkeyp
 </qes:espresso>"""
     (save / "data-file-schema.xml").write_text(xml, encoding="utf-8")
     monkeypatch.chdir(tmp_path)
+    stdout = io.StringIO()
     output = run_dos({
         "prefix": "si", "outdir": "./tmp", "emin": -1.0, "emax": 1.0,
         "deltae": 0.5, "degauss": 0.02, "ngauss": 0, "fildos": "si.dos",
-    })
+    }, stdout=stdout)
     lines = output.read_text(encoding="utf-8").splitlines()
     assert "EFermi =    0.100 eV" in lines[0]
     assert len(lines) == 6
     assert float(lines[-1].split()[0]) == pytest.approx(1.0)
+    report = stdout.getvalue()
+    assert "     Reading xml data from directory:\n\n" in report
+    assert (
+        "     Gaussian broadening (read from input): "
+        "ngauss,degauss=   0    0.020000\n"
+    ) in report
 
 
 def test_linear_tetrahedron_integrates_all_bands() -> None:
@@ -63,3 +72,22 @@ def test_linear_tetrahedron_integrates_all_bands() -> None:
     density, integrated = tetrahedron_dos(data, energies, "tetrahedra_lin")
     assert density == pytest.approx([0.0, 0.0])
     assert integrated == pytest.approx([0.0, 4.0])
+
+
+def test_dos_main_uses_qe_environment_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = tmp_path / "dos.in"
+    source.write_text("&DOS\n/\n", encoding="utf-8")
+    monkeypatch.setattr(
+        dos_module,
+        "run_dos",
+        lambda _options, stdout=None: tmp_path / "pwscf.dos",
+    )
+
+    assert dos_module.main(["-in", str(source)]) == 0
+    output = capsys.readouterr().out
+    assert output.startswith("\n     Program DOS-PY v.")
+    assert "\n     DOS          : " in output
+    assert "\n   JOB DONE.\n" in output
+    assert "DOS written to file" not in output

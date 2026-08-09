@@ -40,6 +40,15 @@ def format_qe_duration(seconds: float, label: str) -> str:
     return f"    {remainder:5.2f}s {label}"
 
 
+def format_qe_timing(program: str, cpu_seconds: float, wall_seconds: float) -> str:
+    """Render an ``environment_end`` primary-clock summary line."""
+    return (
+        f"\n     {program:<13}: "
+        f"{format_qe_duration(cpu_seconds, 'CPU')} "
+        f"{format_qe_duration(wall_seconds, 'WALL')}\n"
+    )
+
+
 def format_qe_closing(*, success: bool = True, now: datetime | None = None) -> str:
     """Render ``closing_message`` plus QE's final job-status rule."""
     cdate, ctime = qe_date_and_time(now)

@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import sys
+import time
+from typing import TextIO
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -15,10 +18,12 @@ from ..constants import BOHR_PER_ANGSTROM, EV_PER_HARTREE
 from ..errors import QEInputError, UnsupportedFeatureError, emit_qe_error
 from ..occupations import smearing_order, wgauss
 from ..pw.save import QES_NAMESPACE
+from ..qe_format import format_qe_closing, format_qe_opening, format_qe_timing
 from ..symmetry import SymmetryOperation
 from ..upf import _qe_real_spherical_harmonics, read_upf
+from ..version import __version__
 from .band_data import resolve_save_directory
-from .dos import read_saved_dos
+from .dos import DOSData, read_saved_dos
 from .namelist import parse_namelist
 
 
@@ -427,11 +432,8 @@ def _run_boxes(options: dict[str, object], prefix: str, outdir: str | None) -> t
     delta = float(options.get("deltae", 0.01))
     if delta <= 0:
         raise QEInputError("DeltaE must be positive")
-    degauss_ry = float(options.get("degauss", saved.degauss_ry))
-    if degauss_ry <= 0:
-        degauss_ry = delta / (0.5 * EV_PER_HARTREE)
+    degauss_ry, ngauss, _source = _smearing_parameters(saved, options, delta)
     width = 0.5 * degauss_ry * EV_PER_HARTREE
-    ngauss = int(options.get("ngauss", smearing_order(saved.smearing) if saved.degauss_ry > 0 else 0))
     emin = float(options.get("emin", np.min(data.energies_ev) - 3.0 * width))
     emax = float(options.get("emax", np.max(data.energies_ev) + 3.0 * width))
     grid = emin + np.arange(int(np.floor((emax - emin) / delta + 1.000001))) * delta
@@ -497,7 +499,20 @@ def _groups(orbitals: tuple[Orbital, ...]):
     return result
 
 
-def run_projwfc(options: dict[str, object]) -> tuple[ProjectionData | BoxData, list[Path]]:
+def _smearing_parameters(
+    saved: DOSData, options: dict[str, object], delta: float
+) -> tuple[float, int, str]:
+    input_degauss = float(options.get("degauss", 0.0))
+    if input_degauss != 0.0:
+        return input_degauss, int(options.get("ngauss", 0)), "read from input"
+    if saved.degauss_ry > 0.0:
+        return saved.degauss_ry, smearing_order(saved.smearing), "read from file"
+    return delta / (0.5 * EV_PER_HARTREE), 0, "default values"
+
+
+def run_projwfc(
+    options: dict[str, object], stdout: TextIO | None = None
+) -> tuple[ProjectionData | BoxData, list[Path]]:
     unknown = {
         key for key in options
         if key not in _ALLOWED and not key.startswith("irmin(") and not key.startswith("irmax(")
@@ -511,23 +526,34 @@ def run_projwfc(options: dict[str, object]) -> tuple[ProjectionData | BoxData, l
         raise QEInputError("lsym=.false. requires kresolveddos=.true.")
     prefix = str(options.get("prefix", "pwscf"))
     outdir = str(options["outdir"]) if "outdir" in options else None
+    if stdout is not None:
+        directory = resolve_save_directory(prefix, outdir)
+        print(
+            f"\n     Reading xml data from directory:\n\n"
+            f"     {directory}{os.sep}",
+            file=stdout,
+        )
     saved = read_saved_dos(prefix, outdir)
-    if saved.occupations_kind.lower().startswith("tetra") and "degauss" not in options:
+    input_degauss = float(options.get("degauss", 0.0))
+    if saved.occupations_kind.lower().startswith("tetra") and input_degauss == 0.0:
         raise UnsupportedFeatureError("projected tetrahedron DOS is not yet ported; specify degauss for smearing")
+    delta = float(options.get("deltae", 0.01))
+    if delta <= 0:
+        raise QEInputError("DeltaE must be positive")
+    degauss_ry, ngauss, source = _smearing_parameters(saved, options, delta)
+    if stdout is not None:
+        print(
+            f"\n     Gaussian broadening ({source}): "
+            f"ngauss,degauss={ngauss:4d}{degauss_ry:12.6f}\n",
+            file=stdout,
+        )
     if bool(options.get("tdosinboxes", False)):
         return _run_boxes(options, prefix, outdir)
     data = compute_projections(
         prefix, outdir, symmetrize=bool(options.get("lsym", True)),
         diag_basis=bool(options.get("diag_basis", False)),
     )
-    delta = float(options.get("deltae", 0.01))
-    if delta <= 0:
-        raise QEInputError("DeltaE must be positive")
-    degauss_ry = float(options.get("degauss", saved.degauss_ry))
-    if degauss_ry <= 0:
-        degauss_ry = delta / (0.5 * EV_PER_HARTREE)
     width = 0.5 * degauss_ry * EV_PER_HARTREE
-    ngauss = int(options.get("ngauss", smearing_order(saved.smearing) if saved.degauss_ry > 0 else 0))
     emin = float(options.get("emin", np.min(data.energies_ev) - 3.0 * width))
     emax = float(options.get("emax", np.max(data.energies_ev) + 3.0 * width))
     if emax < emin:
@@ -587,27 +613,113 @@ def run_projwfc(options: dict[str, object]) -> tuple[ProjectionData | BoxData, l
     return data, paths
 
 
+_M_LABELS = {
+    1: ("z", "x", "y"),
+    2: ("z2", "xz", "yz", "x2-y2", "xy"),
+    3: ("z3", "xz2", "yz2", "zx2-zy2", "xyz", "x3-3xy2", "3yx2-y3"),
+}
+
+
+def _format_projection_summary(data: ProjectionData, *, diag_basis: bool = False) -> str:
+    """Render the atomic-state and Lowdin-charge blocks printed by ``projwfc.x``."""
+    lines = [
+        "",
+        "     Atomic states used for projection",
+        "     (read from pseudopotential files):",
+        "",
+    ]
+    for index, orbital in enumerate(data.orbitals, start=1):
+        lines.append(
+            f"     state #{index:4d}: atom {orbital.atom:3d} ({orbital.symbol:>3}), "
+            f"wfc {orbital.wfc:2d} (l={orbital.l:d} m={orbital.m + 1:2d})"
+        )
+
+    charges = np.einsum(
+        "k,kb,kbo->o", data.weights, data.occupations, data.projections
+    )
+    lines.extend(("", "Lowdin Charges: ", ""))
+    atom_numbers = sorted({orbital.atom for orbital in data.orbitals})
+    maximum_l = max((orbital.l for orbital in data.orbitals), default=0)
+    for atom in atom_numbers:
+        atom_indices = [
+            index for index, orbital in enumerate(data.orbitals)
+            if orbital.atom == atom
+        ]
+        total = float(np.sum(charges[atom_indices]))
+        for angular_momentum in range(maximum_l + 1):
+            component_indices = [
+                index for index in atom_indices
+                if data.orbitals[index].l == angular_momentum
+            ]
+            label = (
+                _L_NAMES[angular_momentum]
+                if angular_momentum < len(_L_NAMES)
+                else f"l{angular_momentum}"
+            )
+            angular_charge = float(np.sum(charges[component_indices]))
+            line = (
+                f"     Atom # {atom:3d}: total charge = {total:8.4f}, "
+                f"{label} ={angular_charge:8.4f}"
+            )
+            if angular_momentum:
+                labels = (
+                    tuple(str(index + 1) for index in range(2 * angular_momentum + 1))
+                    if diag_basis
+                    else _M_LABELS.get(
+                        angular_momentum,
+                        tuple(str(index + 1) for index in range(2 * angular_momentum + 1)),
+                    )
+                )
+                component_charges = {
+                    magnetic: float(np.sum([
+                        charges[index] for index in component_indices
+                        if data.orbitals[index].m == magnetic
+                    ]))
+                    for magnetic in range(2 * angular_momentum + 1)
+                }
+                line += "".join(
+                    f"{label}{component_label}={component_charges[magnetic]:8.4f}, "
+                    for magnetic, component_label in enumerate(labels)
+                )
+            lines.append(line)
+
+    electrons = float(np.einsum("k,kb->", data.weights, data.occupations))
+    spilling = 1.0 - float(np.sum(charges)) / max(1.0e-14, electrons)
+    lines.extend(("", f"     Spilling Parameter: {spilling:8.4f}", ""))
+    return "\n".join(lines)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="projwfc.py")
     add_input_file_argument(parser)
     args = parser.parse_args(argv)
+    started = time.perf_counter()
+    cpu_started = time.process_time()
     try:
+        print(format_qe_opening("PROJWFC-PY", __version__), end="")
         text = Path(args.input_file).read_text(encoding="utf-8") if args.input_file else sys.stdin.read()
-        data, paths = run_projwfc(parse_namelist(text, "projwfc"))
+        options = parse_namelist(text, "projwfc")
+        data, _paths = run_projwfc(options, stdout=sys.stdout)
         if isinstance(data, BoxData):
             charges = np.einsum(
                 "k,kb,kbx->x", data.weights, data.occupations, data.box_weights
             )
             for box, charge in enumerate(charges, start=1):
                 print(f"     box # {box:4d}: integrated occupied weight = {charge:11.6f}")
-            print("     PROJWFC box files written: " + ", ".join(str(path) for path in paths))
-            return 0
-        charges = np.einsum("k,kb,kbo->o", data.weights, data.occupations, data.projections)
-        for index, (orbital, charge) in enumerate(zip(data.orbitals, charges), start=1):
-            print(f"     state # {index:4d}: atom {orbital.atom:4d} ({orbital.symbol}), wfc {orbital.wfc} (l={orbital.l} m={orbital.m + 1}) charge = {charge:9.5f}")
-        electrons = float(np.einsum("k,kb->", data.weights, data.occupations))
-        print(f"     Spilling Parameter: {1.0 - float(np.sum(charges)) / max(1.0e-14, electrons):9.5f}")
-        print("     PROJWFC files written: " + ", ".join(str(path) for path in paths))
+        else:
+            print(
+                _format_projection_summary(
+                    data, diag_basis=bool(options.get("diag_basis", False))
+                )
+            )
+        print(
+            format_qe_timing(
+                "PROJWFC",
+                time.process_time() - cpu_started,
+                time.perf_counter() - started,
+            )
+        )
+        print(format_qe_closing(), end="")
         return 0
     except (QEInputError, UnsupportedFeatureError, OSError, ValueError, ET.ParseError) as exc:
         emit_qe_error(exc)
