@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -173,7 +174,16 @@ def test_gamma_nscf_preserves_degeneracies_and_bands_finds_irreps(
 
     def tracked_davidson(*args, **kwargs):
         thresholds.append(kwargs["tolerance"])
-        return original_davidson(*args, **kwargs)
+        solution = original_davidson(*args, **kwargs)
+        if len(thresholds) == 1:
+            # Exercise QE's outer c_bands retry independently of whether
+            # this small Gamma fixture happens to converge in one call.
+            return replace(
+                solution,
+                converged=False,
+                number_unconverged=nscf_pw.system["nbnd"],
+            )
+        return solution
 
     def tracked_apply(self, density):
         nonlocal symmetry_applications
@@ -184,7 +194,7 @@ def test_gamma_nscf_preserves_degeneracies_and_bands_finds_irreps(
     monkeypatch.setattr(ReciprocalDensitySymmetrizer, "apply", tracked_apply)
     result = run_scf(nscf_pw)
 
-    assert thresholds
+    assert len(thresholds) >= 2
     # QE prints ethr in Ry; the solver receives Hartree.
     np.testing.assert_allclose(thresholds, 0.5 * 0.1e-6 / 8.0)
     assert symmetry_applications == 1

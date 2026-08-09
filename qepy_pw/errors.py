@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import sys
+from typing import TextIO
 
 
 @dataclass(frozen=True)
@@ -53,6 +55,26 @@ def format_qe_error(error: BaseException) -> str:
         f"{border}\n\n"
         "     stopping ...\n"
     )
+
+
+def emit_qe_error(
+    error: BaseException,
+    *,
+    stdout: TextIO | None = None,
+    stderr: TextIO | None = None,
+) -> None:
+    """Emit a QE error block to both the redirected output and stderr.
+
+    QE users conventionally redirect program stdout to an ``*.out`` file and
+    expect the fatal ``errore`` block to be present there.  Retaining stderr
+    as well preserves shell/CI diagnostics when stdout is not collected.
+    """
+    output_stream = sys.stdout if stdout is None else stdout
+    error_stream = sys.stderr if stderr is None else stderr
+    rendered = format_qe_error(error)
+    print(rendered, end="", file=output_stream, flush=True)
+    if error_stream is not output_stream:
+        print(rendered, end="", file=error_stream, flush=True)
 
 
 def format_qe_warning(warning: QEWarning) -> str:

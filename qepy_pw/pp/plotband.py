@@ -9,7 +9,7 @@ from typing import TextIO
 
 import numpy as np
 
-from ..errors import QEInputError, format_qe_error
+from ..errors import QEInputError, emit_qe_error
 from .band_data import BandData, read_band_file, write_gnuplot
 
 
@@ -284,7 +284,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"bands in PostScript format written to file {ps_file}")
         return 0
     except (QEInputError, OSError, ValueError) as exc:
-        print(format_qe_error(exc), end="", file=sys.stderr)
+        emit_qe_error(exc)
         return 1
 
 

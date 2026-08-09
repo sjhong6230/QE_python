@@ -11,7 +11,7 @@ import xml.etree.ElementTree as ET
 import numpy as np
 
 from ..constants import BOHR_PER_ANGSTROM, EV_PER_HARTREE
-from ..errors import QEInputError, UnsupportedFeatureError, format_qe_error
+from ..errors import QEInputError, UnsupportedFeatureError, emit_qe_error
 from ..occupations import smearing_order, wgauss
 from ..pw.save import QES_NAMESPACE
 from ..symmetry import SymmetryOperation
@@ -609,7 +609,7 @@ def main(argv=None) -> int:
         print("     PROJWFC files written: " + ", ".join(str(path) for path in paths))
         return 0
     except (QEInputError, UnsupportedFeatureError, OSError, ValueError, ET.ParseError) as exc:
-        print(format_qe_error(exc), end="", file=sys.stderr)
+        emit_qe_error(exc)
         return 1
 
 

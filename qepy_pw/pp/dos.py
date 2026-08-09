@@ -11,7 +11,7 @@ import xml.etree.ElementTree as ET
 import numpy as np
 
 from ..constants import EV_PER_HARTREE
-from ..errors import QEInputError, format_qe_error
+from ..errors import QEInputError, emit_qe_error
 from ..occupations import _linear_tetra_moments_block, _tetrahedra, smearing_order, wgauss
 from ..pw.save import QES_NAMESPACE
 from .band_data import resolve_save_directory
@@ -157,7 +157,7 @@ def main(argv=None) -> int:
         print(f"     DOS written to file {output}")
         return 0
     except (QEInputError, OSError, ValueError, ET.ParseError) as exc:
-        print(format_qe_error(exc), end="", file=sys.stderr)
+        emit_qe_error(exc)
         return 1
 
 

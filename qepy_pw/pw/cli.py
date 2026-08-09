@@ -110,7 +110,7 @@ def _root_progress_reporter() -> ProgressCallback:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    from ..errors import QEInputError, UnsupportedFeatureError, format_qe_error
+    from ..errors import QEInputError, UnsupportedFeatureError, emit_qe_error
     from ..memory import trim_allocator
     from ..mpi import MPIContext
 
@@ -164,5 +164,5 @@ def main(argv: list[str] | None = None) -> int:
     except (QEInputError, UnsupportedFeatureError, OSError) as exc:
         rank = mpi.rank if mpi is not None else 0
         if rank == 0:
-            print(format_qe_error(exc), end="", file=sys.stderr)
+            emit_qe_error(exc)
         return 1

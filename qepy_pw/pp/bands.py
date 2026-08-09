@@ -13,7 +13,7 @@ import xml.etree.ElementTree as ET
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from ..errors import QEInputError, UnsupportedFeatureError, format_qe_error
+from ..errors import QEInputError, UnsupportedFeatureError, emit_qe_error
 from ..qe_format import format_qe_closing, format_qe_duration, format_qe_opening
 from ..point_group import point_group_character_table
 from ..symmetry import SymmetryOperation, find_space_group
@@ -642,7 +642,7 @@ def main(argv: list[str] | None = None) -> int:
         print(format_qe_closing(), end="")
         return 0
     except (QEInputError, UnsupportedFeatureError, OSError, ValueError) as exc:
-        print(format_qe_error(exc), end="", file=sys.stderr)
+        emit_qe_error(exc)
         return 1
 
 

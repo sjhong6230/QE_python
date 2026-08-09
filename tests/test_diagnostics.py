@@ -8,6 +8,7 @@ from qepy_pw.errors import (
     QEInputError,
     QEWarning,
     UnsupportedFeatureError,
+    emit_qe_error,
     format_qe_error,
     format_qe_warning,
 )
@@ -52,6 +53,15 @@ def test_qe_error_and_warning_rendering() -> None:
     assert format_qe_warning(QEWarning("setup", "check")) == (
         "     Message from routine setup:\n     check\n"
     )
+
+
+def test_qe_error_is_emitted_to_stdout_and_stderr() -> None:
+    error = QEInputError("too many bands are not converged", routine="c_bands")
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    emit_qe_error(error, stdout=stdout, stderr=stderr)
+    assert stdout.getvalue() == stderr.getvalue()
+    assert "Error in routine c_bands (1):" in stdout.getvalue()
 
 
 def test_cutoff_warning_and_silent_fixed_degauss_reset_match_qe() -> None:

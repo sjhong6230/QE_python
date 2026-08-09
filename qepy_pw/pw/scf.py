@@ -3067,31 +3067,67 @@ def _run_scf(
                     else nbnd
                 )
                 if active_diagonalization == "david":
-                    solution = davidson(
-                        operator.apply,
-                        operator.diagonal,
-                        nbnd,
-                        initial_vectors=trial_vectors,
-                        tolerance=davidson_tolerance,
-                        max_iterations=20,
-                        subspace_multiplier=davidson_ndim,
-                        residual_factor=None,
-                        residual_energy_scale=None,
-                        occupied_roots=(
-                            nbnd if full_accuracy else occupied_roots
-                        ),
-                        initial_is_ritz=(
-                            iteration == 1 and not loaded_wavefunctions
-                        ),
-                        initial_is_orthonormal=True,
-                        initial_eigenvalues=trial_eigenvalues,
-                        initial_applied=trial_applied,
-                        mpi=mpi,
-                        global_dimension=len(basis),
-                        global_row_indices=operator.local_rows,
-                        timers=timers,
-                        operator_into=operator.apply_into,
-                    )
+                    # QE's cegterg has a 20-step internal limit, but
+                    # diag_bands retries it up to five additional times.  A
+                    # fixed-potential calculation retries whenever any band
+                    # remains unconverged; SCF retries only when more than
+                    # five do.  Omitting this outer loop made realistic band
+                    # paths abort at the first difficult k point even though
+                    # pw.x completed them (often with an average above 20).
+                    davidson_iterations = 0
+                    davidson_applications = 0
+                    davidson_attempt = 0
+                    retry_vectors = trial_vectors
+                    retry_eigenvalues = trial_eigenvalues
+                    retry_applied = trial_applied
+                    while True:
+                        solution = davidson(
+                            operator.apply,
+                            operator.diagonal,
+                            nbnd,
+                            initial_vectors=retry_vectors,
+                            tolerance=davidson_tolerance,
+                            max_iterations=20,
+                            subspace_multiplier=davidson_ndim,
+                            residual_factor=None,
+                            residual_energy_scale=None,
+                            occupied_roots=(
+                                nbnd if full_accuracy else occupied_roots
+                            ),
+                            initial_is_ritz=(
+                                iteration == 1
+                                and (
+                                    davidson_attempt > 0
+                                    or not loaded_wavefunctions
+                                )
+                            ),
+                            initial_is_orthonormal=True,
+                            initial_eigenvalues=retry_eigenvalues,
+                            initial_applied=retry_applied,
+                            mpi=mpi,
+                            global_dimension=len(basis),
+                            global_row_indices=operator.local_rows,
+                            timers=timers,
+                            operator_into=operator.apply_into,
+                        )
+                        davidson_attempt += 1
+                        davidson_iterations += solution.iterations
+                        davidson_applications += (
+                            solution.hamiltonian_applications
+                        )
+                        retry_required = (
+                            not solution.converged
+                            and (
+                                solution.number_unconverged > 0
+                                if fixed_potential
+                                else solution.number_unconverged > 5
+                            )
+                        )
+                        if not retry_required or davidson_attempt >= 6:
+                            break
+                        retry_vectors = solution.eigenvectors
+                        retry_eigenvalues = solution.eigenvalues
+                        retry_applied = None
                     timer_name = "cegterg"
                 elif active_diagonalization == "cg":
                     solution = conjugate_gradient(
@@ -3151,21 +3187,20 @@ def _run_scf(
                     )
                     timer_name = "rmm-diis"
                 timers.stop(timer_name, diagonalization_started)
-                davidson_iterations = solution.iterations
-                # cegterg returns its best Ritz vectors after 20 iterations.
-                # c_bands accepts that result unless more than five bands are
-                # unconverged; do not turn QE's accepted small-band result
-                # into a fatal Python error.
+                if active_diagonalization != "david":
+                    davidson_iterations = solution.iterations
+                    davidson_applications = (
+                        solution.hamiltonian_applications
+                    )
+                # QE aborts only when the final notconv exceeds
+                # MAX(5,nbnd/4); a smaller remainder is reported and kept.
                 if (
                     not solution.converged
-                    and solution.number_unconverged > 5
+                    and solution.number_unconverged > max(5, nbnd // 4)
                 ):
                     raise QEInputError(
-                        f"{active_diagonalization} diagonalization did not "
-                        f"converge at k point "
-                        f"{kpoint_index + 1} after {davidson_iterations} "
-                        f"iterations (largest residual "
-                        f"{np.max(solution.residual_norms):.3e} Ha)"
+                        "too many bands are not converged",
+                        routine="c_bands",
                     )
                 values, vectors = (
                     solution.eigenvalues,
@@ -3173,7 +3208,7 @@ def _run_scf(
                 )
                 diagonalization_iterations.append(davidson_iterations)
                 hamiltonian_applications.append(
-                    solution.hamiltonian_applications
+                    davidson_applications
                 )
                 eigen_residuals.append(
                     float(np.max(solution.residual_norms))
