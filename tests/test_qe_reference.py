@@ -79,7 +79,7 @@ def test_qe_diamond_character_classes_use_the_printed_symmetry_indices():
         rendered_indices = "".join(
             f"{index:5d}" for index in point_class.operation_indices
         )
-        assert f"     {point_class.label:<6s}{rendered_indices}" in output
+        assert f"     {point_class.label:<5s}{rendered_indices}" in output
 
 
 @pytest.mark.filterwarnings("ignore:Set OLD_ERROR_HANDLING:DeprecationWarning")

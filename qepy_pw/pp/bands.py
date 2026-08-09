@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
 import io
 from pathlib import Path
 import sys
@@ -14,6 +13,7 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 from ..errors import QEInputError, UnsupportedFeatureError, format_qe_error
+from ..qe_format import format_qe_closing, format_qe_duration, qe_date_and_time
 from ..pw.save import QES_NAMESPACE
 from ..point_group import point_group_character_table
 from ..symmetry import SymmetryOperation, find_space_group
@@ -180,17 +180,13 @@ def _symmetry_matrix(kpoint, miller, coefficients, operation) -> np.ndarray:
 def _format_group_info(table) -> str:
     out = io.StringIO()
     group = f"{table.schoenflies} ({table.international})"
-    print(f"     point group {group}", file=out)
-    print(
-        f"     there are {len(table.classes):d} classes and "
-        f"{len(table.irreps):d} irreducible representations",
-        file=out,
-    )
+    print(f"     point group {group:<11s}", file=out)
+    print(f"     there are{len(table.classes):3d} classes", file=out)
     print("     the character table:\n", file=out)
     print("       " + "".join(f"{item.label:<6s}" for item in table.classes), file=out)
     for name, characters in table.irreps:
         print(
-            f"{name:<7s}" + "".join(f"{value.real:6.2f}" for value in characters),
+            f"{name:<5s}" + "".join(f"{value.real:6.2f}" for value in characters),
             file=out,
         )
     if any(
@@ -201,7 +197,7 @@ def _format_group_info(table) -> str:
         print("     imaginary part", file=out)
         for name, characters in table.irreps:
             print(
-                f"{name:<7s}"
+                f"{name:<5s}"
                 + "".join(f"{value.imag:6.2f}" for value in characters),
                 file=out,
             )
@@ -212,7 +208,7 @@ def _format_group_info(table) -> str:
     )
     for item in table.classes:
         print(
-            f"     {item.label:<6s}"
+            f"     {item.label:<5s}"
             + "".join(f"{index:5d}" for index in item.operation_indices),
             file=out,
         )
@@ -338,8 +334,8 @@ def classify_irreps(
                 else:
                     for _index, name, multiplicity, _dimension in decomposition:
                         representation = (
-                            f"{multiplicity:3d} {name}"
-                            if multiplicity > 1 else name
+                            f"{multiplicity:3d} {name:<15s}"
+                            if multiplicity > 1 else f"{name:<15s}"
                         )
                         reports.append(prefix + representation + "\n")
             start = stop
@@ -553,19 +549,21 @@ def main(argv: list[str] | None = None) -> int:
     started = time.perf_counter()
     cpu_started = time.process_time()
     try:
-        now = datetime.now()
+        cdate, ctime = qe_date_and_time()
         print(
-            f"     Program BANDS-PY v.{__version__} starts on "
-            f"{now:%d%b%Y at %H:%M:%S}\n"
+            f"\n     Program BANDS-PY v.{__version__} starts on "
+            f"{cdate} at {ctime}\n"
         )
         text = Path(args.input_file).read_text(encoding="utf-8") if args.input_file else sys.stdin.read()
         run_bands(parse_namelist(text, "bands"), stdout=sys.stdout)
         elapsed = time.perf_counter() - started
         cpu_elapsed = time.process_time() - cpu_started
         print(
-            f"\n     BANDS        :      {cpu_elapsed:5.2f}s CPU      "
-            f"{elapsed:5.2f}s WALL\n\n   JOB DONE."
+            "\n     BANDS        : "
+            f"{format_qe_duration(cpu_elapsed, 'CPU')} "
+            f"{format_qe_duration(elapsed, 'WALL')}\n"
         )
+        print(format_qe_closing(), end="")
         return 0
     except (QEInputError, UnsupportedFeatureError, OSError, ValueError) as exc:
         print(format_qe_error(exc), end="", file=sys.stderr)

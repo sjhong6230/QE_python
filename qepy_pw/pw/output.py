@@ -6,7 +6,6 @@ branches and gives the CLI and regression-reference generator one formatter.
 
 from __future__ import annotations
 
-from datetime import datetime
 import hashlib
 import io
 from typing import TYPE_CHECKING
@@ -17,6 +16,11 @@ from ..constants import EV_PER_HARTREE
 from .input import PWInput
 from ..memory import format_bytes
 from ..occupations import default_number_of_bands
+from ..qe_format import (
+    format_qe_closing,
+    format_qe_duration,
+    qe_date_and_time,
+)
 from ..upf import read_upf
 from ..xc import canonical_xc_name
 from ..version import __version__
@@ -59,14 +63,18 @@ def _format_symmetry(out: io.StringIO, pw: PWInput) -> None:
     if len(operations) == 1:
         print("\n     No symmetry found", file=out)
     else:
-        inversion = ", with inversion," if has_inversion else ","
+        inversion = ", with inversion," if has_inversion else " (no inversion)"
         suffix = (
-            f" ({fractional:d} have fractional translation)" if fractional else ""
+            f" ({fractional:2d} have fractional translation)" if fractional else ""
         )
-        print(f"\n     {len(operations):d} Sym. Ops.{inversion} found{suffix}", file=out)
+        print(
+            f"\n     {len(operations):2d} Sym. Ops.{inversion} found{suffix}",
+            file=out,
+        )
     if str(pw.control.get("verbosity", "low")).lower() != "high":
+        print(file=out)
         return
-    print("\n\n                                    s                        frac. trans.", file=out)
+    print("\n                                    s                        frac. trans.", file=out)
     inverse_lattice = np.linalg.inv(pw.lattice)
     for index, operation in enumerate(operations, start=1):
         from ..point_group import operation_description
@@ -101,15 +109,16 @@ def _format_symmetry(out: io.StringIO, pw: PWInput) -> None:
 
     table = point_group_character_table(pw, operations)
     print(
-        f"     point group {table.schoenflies} ({table.international})",
+        f"     point group "
+        f"{f'{table.schoenflies} ({table.international})':<11s}",
         file=out,
     )
-    print(f"     there are {len(table.classes):d} classes", file=out)
+    print(f"     there are{len(table.classes):3d} classes", file=out)
     print("     the character table:\n", file=out)
     print("       " + "".join(f"{item.label:<6s}" for item in table.classes), file=out)
     for name, characters in table.irreps:
         print(
-            f"{name:<7s}" + "".join(
+            f"{name:<5s}" + "".join(
                 f"{value.real:6.2f}" for value in characters
             ),
             file=out,
@@ -122,7 +131,7 @@ def _format_symmetry(out: io.StringIO, pw: PWInput) -> None:
         print("     imaginary part", file=out)
         for name, characters in table.irreps:
             print(
-                f"{name:<7s}" + "".join(
+                f"{name:<5s}" + "".join(
                     f"{value.imag:6.2f}" for value in characters
                 ),
                 file=out,
@@ -134,14 +143,18 @@ def _format_symmetry(out: io.StringIO, pw: PWInput) -> None:
     )
     for item in table.classes:
         indices = "".join(f"{index:5d}" for index in item.operation_indices)
-        print(f"     {item.label:<6s}{indices}", file=out)
-        print(f"          {item.description:<55s}", file=out)
+        print(f"     {item.label:<5s}{indices}", file=out)
+        print(f"          {item.description}", file=out)
 
 
 def format_header(pw: PWInput) -> str:
     out = io.StringIO()
-    now = datetime.now()
-    print(f"     Program PWSCF-PY v.{__version__} starts on {now:%d%b%Y at %H:%M:%S}", file=out)
+    cdate, ctime = qe_date_and_time()
+    print(
+        f"\n     Program PWSCF-PY v.{__version__} starts on "
+        f"{cdate} at {ctime}",
+        file=out,
+    )
     print("\n     Python reference port of the scalar SCF path in Quantum ESPRESSO pw.x", file=out)
     print(f"     Reading input from {pw.source}\n", file=out)
     from ..errors import QEWarning, format_qe_warning
@@ -245,15 +258,20 @@ def format_header(pw: PWInput) -> str:
         f"                           (   {xc_indices}   0   0   0)",
         file=out,
     )
-    print(
-        f"\n     celldm(1)= {alat:10.6f}  "
-        + "  ".join(
-            f"celldm({index})= "
-            f"{float(pw.system.get(f'celldm({index})', 0.0)):10.6f}"
-            for index in range(2, 7)
-        ),
-        file=out,
-    )
+    celldm = [alat] + [
+        float(pw.system.get(f"celldm({index})", 0.0))
+        for index in range(2, 7)
+    ]
+    print(file=out)
+    for start in (0, 3):
+        print(
+            "   "
+            + "".join(
+                f"  celldm({index + 1})={celldm[index]:11.6f}"
+                for index in range(start, start + 3)
+            ),
+            file=out,
+        )
     print("\n     crystal axes: (cart. coord. in units of alat)", file=out)
     for index, vector in enumerate(crystal_axes, start=1):
         print(
@@ -265,7 +283,7 @@ def format_header(pw: PWInput) -> str:
     for index, vector in enumerate(reciprocal_axes, start=1):
         print(
             f"               b({index}) = ("
-            f" {vector[0]:10.6f} {vector[1]:10.6f} {vector[2]:10.6f} )",
+            f"{vector[0]:10.6f}{vector[1]:10.6f}{vector[2]:10.6f} )",
             file=out,
         )
     for index, species in enumerate(pw.species, start=1):
@@ -499,7 +517,7 @@ def format_setup(setup: SCFSetup) -> str:
 def _format_force_component(
     out: io.StringIO, title: str, values: np.ndarray, species_types: list[int]
 ) -> None:
-    print(f"\n     {title}\n", file=out)
+    print(f"     {title}", file=out)
     for index, (atom_type, force) in enumerate(
         zip(species_types, values), start=1
     ):
@@ -519,7 +537,7 @@ def _format_stress_component(
         10.0 * 4.3597447222071e-18 / 0.529177210903e-10**3 / 1.0e9
     )
     for row_index, row in enumerate(hartree_kbar * values):
-        prefix = f"     {title:<18s}" if row_index == 0 else " " * 23
+        prefix = f"     {title}" if row_index == 0 else " " * 26
         print(
             prefix
             + "".join(
@@ -527,6 +545,7 @@ def _format_stress_component(
             ),
             file=out,
         )
+    print(file=out)
 
 
 def format_iteration(step: SCFIteration) -> str:
@@ -567,11 +586,11 @@ def format_iteration(step: SCFIteration) -> str:
         f"{step.cpu_seconds:10.1f} secs",
         file=out,
     )
-    print(f"     total energy              = {step.total_energy_ha * 2:18.8f} Ry", file=out)
+    print(f"     total energy              ={step.total_energy_ha * 2:17.8f} Ry", file=out)
     if np.isfinite(step.estimated_accuracy_ha):
         print(
-            f"     estimated scf accuracy    < "
-            f"{step.estimated_accuracy_ha * 2:18.8f} Ry\n",
+            f"     estimated scf accuracy    <"
+            f"{step.estimated_accuracy_ha * 2:17.8f} Ry\n",
             file=out,
         )
     return out.getvalue()
@@ -603,30 +622,6 @@ def _format_timing(result: SCFResult, name: str) -> str:
         f"{entry.wall_seconds:9.2f}s WALL "
         f"({entry.calls:8d} calls)"
     )
-
-
-def _format_qe_duration(seconds: float, label: str) -> str:
-    """Format one side of QE's primary CPU/WALL clock.
-
-    QE's first clock retains seconds below one hour, but deliberately omits
-    seconds once hours or days are present.  Routine-level clocks continue to
-    use plain seconds through :func:`_format_timing`.
-    """
-    elapsed = max(0.0, float(seconds))
-    days = int(elapsed // 86400.0)
-    remainder = elapsed - 86400.0 * days
-    hours = int(remainder // 3600.0)
-    remainder -= 3600.0 * hours
-    minutes = int(remainder // 60.0)
-    remainder -= 60.0 * minutes
-
-    if days:
-        return f" {days:2d}d{hours:2d}h{minutes:2d}m {label}"
-    if hours:
-        return f"    {hours:2d}h{minutes:2d}m {label}"
-    if minutes:
-        return f" {minutes:2d}m{remainder:5.2f}s {label}"
-    return f"    {remainder:5.2f}s {label}"
 
 
 def format_footer(pw: PWInput, result: SCFResult) -> str:
@@ -673,25 +668,34 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
             else 0
         )
         print(
-            f"          k = {cart[0]:8.4f} {cart[1]:8.4f} "
-            f"{cart[2]:8.4f} ({npw:6d} PWs)   bands (ev):",
+            f"          k ={cart[0]:7.4f}{cart[1]:7.4f}"
+            f"{cart[2]:7.4f} ({npw:6d} PWs)   bands (ev):\n",
             file=out,
         )
-        print("    " + " ".join(f"{value * EV_PER_HARTREE:9.4f}" for value in values), file=out)
+        for start in range(0, len(values), 8):
+            print(
+                "  "
+                + "".join(
+                    f"{value * EV_PER_HARTREE:9.4f}"
+                    for value in values[start:start + 8]
+                ),
+                file=out,
+            )
         print("\n     occupation numbers", file=out)
         if index < len(result.occupations):
             displayed_occupations = 0.5 * result.occupations[index]
         else:
             displayed_occupations = np.zeros(len(values))
             displayed_occupations[:occupied] = 1.0
-        print(
-            "    "
-            + " ".join(
-                f"{occupation:9.4f}"
-                for occupation in displayed_occupations
-            ),
-            file=out,
-        )
+        for start in range(0, len(displayed_occupations), 8):
+            print(
+                "  "
+                + "".join(
+                    f"{occupation:9.4f}"
+                    for occupation in displayed_occupations[start:start + 8]
+                ),
+                file=out,
+            )
     if result.fermi_energy_ha is not None:
         print(
             f"\n     the Fermi energy is "
@@ -727,23 +731,23 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
             )
     marker = "!" if result.converged else " "
     if calculation == "scf":
-        print(f"\n{marker}    total energy              = {result.total_energy_ha * 2:18.8f} Ry", file=out)
+        print(f"\n{marker}    total energy              ={result.total_energy_ha * 2:17.8f} Ry", file=out)
     if result.iterations:
         print(
-            f"     estimated scf accuracy    < "
-            f"{2.0 * result.iterations[-1].estimated_accuracy_ha:18.8f} Ry",
+            f"     estimated scf accuracy    <"
+            f"{2.0 * result.iterations[-1].estimated_accuracy_ha:17.8f} Ry",
             file=out,
         )
     if occupations_mode == "smearing" and result.energy_terms is not None:
         smearing_ry = 2.0 * result.energy_terms.smearing_ha
         print(
-            f"     smearing contrib. (-TS)   = "
-            f"{smearing_ry:18.8f} Ry",
+            f"     smearing contrib. (-TS)   ="
+            f"{smearing_ry:17.8f} Ry",
             file=out,
         )
         print(
-            f"     internal energy E=F+TS    = "
-            f"{2.0 * result.total_energy_ha - smearing_ry:18.8f} Ry",
+            f"     internal energy E=F+TS    ="
+            f"{2.0 * result.total_energy_ha - smearing_ry:17.8f} Ry",
             file=out,
         )
     if result.energy_terms is not None:
@@ -760,29 +764,29 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
                 file=out,
             )
         print(
-            f"     one-electron contribution = "
-            f"{2.0 * terms.one_electron_ha:18.8f} Ry",
+            f"     one-electron contribution ="
+            f"{2.0 * terms.one_electron_ha:17.8f} Ry",
             file=out,
         )
         print(
-            f"     hartree contribution      = "
-            f"{2.0 * terms.hartree_ha:18.8f} Ry",
+            f"     hartree contribution      ="
+            f"{2.0 * terms.hartree_ha:17.8f} Ry",
             file=out,
         )
         print(
-            f"     xc contribution           = "
-            f"{2.0 * terms.xc_ha:18.8f} Ry",
+            f"     xc contribution           ="
+            f"{2.0 * terms.xc_ha:17.8f} Ry",
             file=out,
         )
         print(
-            f"     ewald contribution        = "
-            f"{2.0 * terms.ewald_ha:18.8f} Ry",
+            f"     ewald contribution        ="
+            f"{2.0 * terms.ewald_ha:17.8f} Ry",
             file=out,
         )
         if abs(terms.descf_ha) > 1.0e-12:
             print(
-                f"     scf correction            = "
-                f"{2.0 * terms.descf_ha:18.8f} Ry",
+                f"     scf correction            ="
+                f"{2.0 * terms.descf_ha:17.8f} Ry",
                 file=out,
             )
     if result.forces_ha_per_bohr is not None:
@@ -791,6 +795,24 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
             for index, species in enumerate(pw.species, start=1)
         }
         species_types = [species_type_map[atom.label] for atom in pw.atoms]
+        print(
+            "\n     Forces acting on atoms (cartesian axes, Ry/au):\n",
+            file=out,
+        )
+        for index, (atom, force) in enumerate(
+            zip(pw.atoms, result.forces_ha_per_bohr), start=1
+        ):
+            force_ry = 2.0 * force
+            force_ry = np.asarray([
+                _clean_zero(value, 5.0e-9) for value in force_ry
+            ])
+            print(
+                f"     atom {index:4d} type "
+                f"{species_type_map[atom.label]:2d}   force = "
+                f"{force_ry[0]:14.8f}{force_ry[1]:14.8f}"
+                f"{force_ry[2]:14.8f}",
+                file=out,
+            )
         if (
             str(pw.control.get("verbosity", "low")).lower() == "high"
             and result.force_terms is not None
@@ -816,24 +838,6 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
                 out, "The SCF correction term to forces",
                 terms.scf_correction_ha_per_bohr, species_types,
             )
-        print(
-            "\n     Forces acting on atoms (cartesian axes, Ry/au):\n",
-            file=out,
-        )
-        for index, (atom, force) in enumerate(
-            zip(pw.atoms, result.forces_ha_per_bohr), start=1
-        ):
-            force_ry = 2.0 * force
-            force_ry = np.asarray([
-                _clean_zero(value, 5.0e-9) for value in force_ry
-            ])
-            print(
-                f"     atom {index:4d} type "
-                f"{species_type_map[atom.label]:2d}   force = "
-                f"{force_ry[0]:14.8f}{force_ry[1]:14.8f}"
-                f"{force_ry[2]:14.8f}",
-                file=out,
-            )
         total_force_ry = 2.0 * float(
             np.linalg.norm(result.forces_ha_per_bohr)
         )
@@ -857,22 +861,10 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
         stress_ry = 2.0 * result.stress_ha_per_bohr3
         stress_kbar = hartree_kbar * result.stress_ha_per_bohr3
         pressure = float(np.trace(stress_kbar) / 3.0)
-        if (
-            str(pw.control.get("verbosity", "low")).lower() == "high"
-            and result.stress_terms is not None
-        ):
-            terms = result.stress_terms
-            print(file=out)
-            _format_stress_component(out, "kinetic stress (kbar)", terms.kinetic_ha_per_bohr3)
-            _format_stress_component(out, "local   stress (kbar)", terms.local_ha_per_bohr3)
-            _format_stress_component(out, "nonloc. stress (kbar)", terms.nonlocal_ha_per_bohr3)
-            _format_stress_component(out, "hartree stress (kbar)", terms.hartree_ha_per_bohr3)
-            _format_stress_component(out, "exc-cor stress (kbar)", terms.xc_ha_per_bohr3)
-            _format_stress_component(out, "corecor stress (kbar)", terms.core_correction_ha_per_bohr3)
-            _format_stress_component(out, "ewald   stress (kbar)", terms.ewald_ha_per_bohr3)
         print(
-            "\n          total   stress  (Ry/bohr**3)"
-            f"                   (kbar)     P= {pressure:12.2f}",
+            "\n          total   stress  (Ry/bohr**3) "
+            + " " * 18
+            + f"(kbar)     P={pressure:12.2f}",
             file=out,
         )
         for row_ry, row_kbar in zip(stress_ry, stress_kbar):
@@ -883,12 +875,25 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
                 _clean_zero(value, 5.0e-3) for value in row_kbar
             ])
             print(
-                "  "
+                "     "
                 + "".join(f"{value:13.8f}" for value in row_ry)
-                + "   "
+                + "    "
                 + "".join(f"{value:12.2f}" for value in row_kbar),
                 file=out,
             )
+        print(file=out)
+        if (
+            str(pw.control.get("verbosity", "low")).lower() == "high"
+            and result.stress_terms is not None
+        ):
+            terms = result.stress_terms
+            _format_stress_component(out, "kinetic stress (kbar)", terms.kinetic_ha_per_bohr3)
+            _format_stress_component(out, "local   stress (kbar)", terms.local_ha_per_bohr3)
+            _format_stress_component(out, "nonloc. stress (kbar)", terms.nonlocal_ha_per_bohr3)
+            _format_stress_component(out, "hartree stress (kbar)", terms.hartree_ha_per_bohr3)
+            _format_stress_component(out, "exc-cor stress (kbar)", terms.xc_ha_per_bohr3)
+            _format_stress_component(out, "corecor stress (kbar)", terms.core_correction_ha_per_bohr3)
+            _format_stress_component(out, "ewald   stress (kbar)", terms.ewald_ha_per_bohr3)
     if result.converged and calculation == "scf":
         print(
             f"\n     convergence has been achieved in "
@@ -966,11 +971,11 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
     )
     print(
         "\n     PWSCF        : "
-        f"{_format_qe_duration(total_cpu, 'CPU')} "
-        f"{_format_qe_duration(result.wall_seconds, 'WALL')}",
+        f"{format_qe_duration(total_cpu, 'CPU')} "
+        f"{format_qe_duration(result.wall_seconds, 'WALL')}\n",
         file=out,
     )
-    print("\n   JOB DONE." if result.converged else "\n   JOB FAILED.", file=out)
+    print(format_qe_closing(success=result.converged), end="", file=out)
     return out.getvalue()
 
 
