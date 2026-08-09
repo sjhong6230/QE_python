@@ -16,7 +16,7 @@ import numpy as np
 from ..cli_options import add_input_file_argument
 from ..constants import BOHR_PER_ANGSTROM, EV_PER_HARTREE
 from ..errors import QEInputError, UnsupportedFeatureError, emit_qe_error
-from ..occupations import smearing_order, wgauss
+from ..occupations import smearing_density, smearing_order
 from ..pw.save import QES_NAMESPACE
 from ..qe_format import format_qe_closing, format_qe_opening, format_qe_timing
 from ..symmetry import SymmetryOperation
@@ -344,8 +344,7 @@ def _dos_kernel(energies: np.ndarray, grid: np.ndarray, width: float, ngauss: in
     if width <= 0:
         raise QEInputError("projected DOS requires positive degauss")
     x = (grid[:, None, None] - energies[None, :, :]) / width
-    step = 1.0e-5
-    return (wgauss(x + step, ngauss) - wgauss(x - step, ngauss)) / (2.0 * step * width)
+    return smearing_density(x, ngauss) / width
 
 
 def _indexed_box(options: dict[str, object], stem: str, box: int, shape) -> tuple[np.ndarray, ...]:

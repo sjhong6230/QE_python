@@ -953,6 +953,203 @@ def tetrahedron_integrated_sum(cnp.ndarray sorted_energies, double energy):
     return total
 
 
+cdef inline void _tetrahedron_dos_point(
+    double *values,
+    Py_ssize_t count,
+    double energy,
+    double *density_result,
+    double *integrated_result,
+) noexcept nogil:
+    cdef Py_ssize_t index
+    cdef double e1, e2, e3, e4, x, fraction, density
+    cdef double density_total = 0.0
+    cdef double integrated_total = 0.0
+    for index in range(count):
+        e1 = values[4 * index]
+        e2 = values[4 * index + 1]
+        e3 = values[4 * index + 2]
+        e4 = values[4 * index + 3]
+        fraction = 0.0
+        density = 0.0
+        if e4 - e1 < 1.0e-14:
+            if energy >= e1:
+                fraction = 1.0
+        elif energy >= e4:
+            fraction = 1.0
+        elif energy >= e1 and energy < e2:
+            x = energy - e1
+            fraction = x * x * x / (
+                (e2 - e1) * (e3 - e1) * (e4 - e1)
+            )
+            density = 3.0 * x * x / (
+                (e2 - e1) * (e3 - e1) * (e4 - e1)
+            )
+        elif energy >= e3 and energy < e4:
+            x = e4 - energy
+            fraction = 1.0 - x * x * x / (
+                (e4 - e1) * (e4 - e2) * (e4 - e3)
+            )
+            density = 3.0 * x * x / (
+                (e4 - e1) * (e4 - e2) * (e4 - e3)
+            )
+        elif energy >= e2 and energy < e3:
+            x = energy - e2
+            fraction = (
+                (e2 - e1) * (e2 - e1)
+                + 3.0 * (e2 - e1) * x
+                + 3.0 * x * x
+                - (e3 - e1 + e4 - e2)
+                / ((e3 - e2) * (e4 - e2)) * x * x * x
+            ) / ((e3 - e1) * (e4 - e1))
+            density = (
+                3.0 * (e2 - e1)
+                + 6.0 * x
+                - 3.0 * (e3 - e1 + e4 - e2) * x * x
+                / ((e3 - e2) * (e4 - e2))
+            ) / ((e3 - e1) * (e4 - e1))
+        density_total += density
+        integrated_total += fraction
+    density_result[0] = density_total
+    integrated_result[0] = integrated_total
+
+
+def tetrahedron_dos_sums(
+    cnp.ndarray sorted_energies, cnp.ndarray energy_grid
+):
+    """Return unnormalized DOS and integrated sums for many energies."""
+    cdef Py_ssize_t count, energy_count, energy_index
+    cdef double *values
+    cdef double *energies
+    cdef double *density_values
+    cdef double *integrated_values
+    cdef cnp.ndarray density
+    cdef cnp.ndarray integrated
+    if (
+        sorted_energies.dtype != np.float64
+        or not sorted_energies.flags.c_contiguous
+        or sorted_energies.ndim < 2
+        or sorted_energies.shape[sorted_energies.ndim - 1] != 4
+    ):
+        raise ValueError(
+            "sorted_energies must be a contiguous float64 array ending in 4"
+        )
+    if (
+        energy_grid.dtype != np.float64
+        or not energy_grid.flags.c_contiguous
+        or energy_grid.ndim != 1
+    ):
+        raise ValueError("energy_grid must be a contiguous float64 vector")
+    count = sorted_energies.size // 4
+    energy_count = energy_grid.size
+    density = np.empty(energy_count, dtype=np.float64)
+    integrated = np.empty(energy_count, dtype=np.float64)
+    values = <double *>cnp.PyArray_DATA(sorted_energies)
+    energies = <double *>cnp.PyArray_DATA(energy_grid)
+    density_values = <double *>cnp.PyArray_DATA(density)
+    integrated_values = <double *>cnp.PyArray_DATA(integrated)
+    with nogil:
+        for energy_index in prange(
+            energy_count,
+            schedule="static",
+            use_threads_if=energy_count >= 2 and count >= 4096,
+        ):
+            _tetrahedron_dos_point(
+                values,
+                count,
+                energies[energy_index],
+                density_values + energy_index,
+                integrated_values + energy_index,
+            )
+    return density, integrated
+
+
+def tetrahedron_accumulate(
+    cnp.ndarray connectivity,
+    cnp.ndarray vertex_weights,
+    cnp.ndarray interpolation,
+    Py_ssize_t point_count,
+):
+    """Interpolate/scatter tetrahedron weights without large temporaries."""
+    cdef Py_ssize_t tetra_count, band_count, corner_count, vertex_count
+    cdef Py_ssize_t tetra_index, band, corner, vertex, point
+    cdef bint identity_interpolation
+    cdef int32_t *indices
+    cdef double *source
+    cdef double *coefficients
+    cdef double *target
+    cdef double contribution
+    cdef cnp.ndarray result
+    if (
+        connectivity.dtype != np.int32
+        or not connectivity.flags.c_contiguous
+        or connectivity.ndim != 2
+    ):
+        raise ValueError("connectivity must be a contiguous int32 matrix")
+    if (
+        vertex_weights.dtype != np.float64
+        or not vertex_weights.flags.c_contiguous
+        or vertex_weights.ndim != 3
+        or vertex_weights.shape[0] != connectivity.shape[0]
+    ):
+        raise ValueError(
+            "vertex_weights must be a contiguous matching float64 tensor"
+        )
+    if (
+        interpolation.dtype != np.float64
+        or not interpolation.flags.c_contiguous
+        or interpolation.ndim != 2
+        or interpolation.shape[0] != vertex_weights.shape[2]
+        or interpolation.shape[1] != connectivity.shape[1]
+    ):
+        raise ValueError(
+            "interpolation must map vertex weights to connectivity points"
+        )
+    if point_count < 0:
+        raise ValueError("point_count must be nonnegative")
+    if connectivity.size and (
+        np.min(connectivity) < 0 or np.max(connectivity) >= point_count
+    ):
+        raise ValueError("tetrahedron connectivity index is out of range")
+    tetra_count = connectivity.shape[0]
+    band_count = vertex_weights.shape[1]
+    corner_count = connectivity.shape[1]
+    vertex_count = vertex_weights.shape[2]
+    identity_interpolation = (
+        vertex_count == corner_count
+        and np.array_equal(interpolation, np.eye(vertex_count))
+    )
+    result = np.zeros((point_count, band_count), dtype=np.float64)
+    indices = <int32_t *>cnp.PyArray_DATA(connectivity)
+    source = <double *>cnp.PyArray_DATA(vertex_weights)
+    coefficients = <double *>cnp.PyArray_DATA(interpolation)
+    target = <double *>cnp.PyArray_DATA(result)
+    with nogil:
+        for band in prange(
+            band_count,
+            schedule="static",
+            use_threads_if=band_count >= 2 and tetra_count >= 1024,
+        ):
+            for tetra_index in range(tetra_count):
+                for corner in range(corner_count):
+                    point = indices[tetra_index * corner_count + corner]
+                    if identity_interpolation:
+                        contribution = source[
+                            (tetra_index * band_count + band) * vertex_count
+                            + corner
+                        ]
+                    else:
+                        contribution = 0.0
+                        for vertex in range(vertex_count):
+                            contribution += coefficients[
+                                vertex * corner_count + corner
+                            ] * source[
+                                (tetra_index * band_count + band) * vertex_count
+                                + vertex
+                            ]
+                    target[point * band_count + band] += contribution
+    return result
+
+
 def column_squared_norms(cnp.ndarray vectors):
     """Return rank-local column norms using QE-style PW-row threading."""
     cdef Py_ssize_t nrows = vectors.shape[0]

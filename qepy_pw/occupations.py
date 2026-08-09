@@ -75,6 +75,7 @@ _OPTIMIZED_TETRA_WEIGHTS = np.asarray(
     ],
     dtype=float,
 ) / 1260.0
+_IDENTITY_TETRA_INTERPOLATION = np.eye(4)
 
 
 def _build_tetrahedra(
@@ -142,17 +143,31 @@ def _build_tetrahedra(
             )
         ]
         stencil_weights = np.eye(4)
-    tetrahedra: list[np.ndarray] = []
-    modulo = np.asarray(grid, dtype=int)
-    for i in range(nx):
-        for j in range(ny):
-            for k in range(nz):
-                cell = np.asarray((i, j, k))
-                for stencil in stencils:
-                    points = (cell + stencil) % modulo
-                    flat = points[:, 2] + nz * (points[:, 1] + ny * points[:, 0])
-                    tetrahedra.append(mapping[flat])
-    return np.asarray(tetrahedra, dtype=np.int32), stencil_weights
+    cells = np.indices((nx, ny, nz), dtype=np.int32).reshape(3, -1).T
+    modulo = np.asarray(grid, dtype=np.int32)
+    corner_count = len(stencils[0])
+    tetrahedra = np.empty(
+        (len(cells), len(stencils), corner_count), dtype=np.int32
+    )
+    # Cap the temporary coordinate block near 24 MiB even for the optimized
+    # 20-point stencil. The final connectivity itself is retained and cached.
+    cell_block = max(1, 6_000_000 // (3 * corner_count))
+    stencil_arrays = [
+        np.asarray(stencil, dtype=np.int32) for stencil in stencils
+    ]
+    for start in range(0, len(cells), cell_block):
+        stop = min(len(cells), start + cell_block)
+        selected_cells = cells[start:stop]
+        for stencil_index, stencil_array in enumerate(stencil_arrays):
+            points = (
+                selected_cells[:, None, :] + stencil_array[None, :, :]
+            ) % modulo
+            flat = (
+                points[..., 2]
+                + nz * (points[..., 1] + ny * points[..., 0])
+            )
+            tetrahedra[start:stop, stencil_index, :] = mapping[flat]
+    return tetrahedra.reshape(-1, corner_count), stencil_weights
 
 
 @lru_cache(maxsize=16)
@@ -192,6 +207,35 @@ def _tetrahedra(
         shortest_diagonal,
         optimized_weights,
     )
+
+
+def _tetrahedron_effective_energies(
+    band_energies: np.ndarray,
+    tetrahedra: np.ndarray,
+    interpolation: np.ndarray,
+) -> np.ndarray:
+    """Gather/interpolate vertices without a full optimized-stencil temporary."""
+    if interpolation.shape == (4, 4) and np.array_equal(
+        interpolation, _IDENTITY_TETRA_INTERPOLATION
+    ):
+        return np.transpose(band_energies[tetrahedra], (0, 2, 1))
+    tetra_count = len(tetrahedra)
+    band_count = band_energies.shape[1]
+    point_count = tetrahedra.shape[1]
+    effective = np.empty((tetra_count, band_count, 4), dtype=float)
+    # The optimized method has a 20-point stencil. Gather it in bounded
+    # blocks instead of materializing tetra_count*20*nbnd values at once.
+    tetra_block = max(1, 4_000_000 // max(1, point_count * band_count))
+    for start in range(0, tetra_count, tetra_block):
+        stop = min(tetra_count, start + tetra_block)
+        point_energies = band_energies[tetrahedra[start:stop]]
+        np.einsum(
+            "cp,tpb->tbc",
+            interpolation,
+            point_energies,
+            out=effective[start:stop],
+        )
+    return effective
 
 
 def _integrated_tetra_fraction(sorted_energies: np.ndarray, energy: float) -> np.ndarray:
@@ -415,8 +459,9 @@ def tetrahedron_occupations(
         optimized,
     )
     matrix = np.stack([np.asarray(values, dtype=float) for values in eigenvalues])
-    point_energies = matrix[tetra]
-    effective = np.einsum("cp,tpb->tbc", interpolation, point_energies)
+    effective = _tetrahedron_effective_energies(
+        matrix, tetra, interpolation
+    )
     sorted_effective = np.ascontiguousarray(
         np.sort(effective, axis=-1), dtype=np.float64
     )
@@ -458,18 +503,15 @@ def tetrahedron_occupations(
             * (np.sum(sorted_e, axis=-1)[..., None] - 4.0 * effective)
             / 40.0
         )
-        weights_at_points = unsorted + correction
+        vertex_weights = unsorted + correction
     else:
-        weights_at_points = np.einsum(
-            "cp,tbc->tbp", interpolation, unsorted
-        )
-    integrated = np.zeros_like(matrix)
-    for corner in range(tetra.shape[1]):
-        np.add.at(
-            integrated,
-            tetra[:, corner],
-            weights_at_points[:, :, corner],
-        )
+        vertex_weights = unsorted
+    integrated = native.tetrahedron_accumulate(
+        np.ascontiguousarray(tetra, dtype=np.int32),
+        np.ascontiguousarray(vertex_weights, dtype=np.float64),
+        np.ascontiguousarray(interpolation, dtype=np.float64),
+        len(matrix),
+    )
     integrated *= 2.0 / ntetra
     point_weights = np.asarray(irreducible_weights, dtype=float)
     if np.any(point_weights <= 0.0):
@@ -524,6 +566,32 @@ def wgauss(x: np.ndarray | float, order: int) -> np.ndarray:
         hp = 2.0 * values * hd - 2.0 * hermite_order * hp
         hermite_order += 1
     return result
+
+
+def smearing_density(x: np.ndarray | float, order: int) -> np.ndarray:
+    """Analytic derivative of QE's supported broadened step functions."""
+    values = np.asarray(x, dtype=float)
+    if order == -99:
+        result = np.zeros_like(values)
+        middle = np.abs(values) <= 36.0
+        result[middle] = 1.0 / (
+            2.0 + np.exp(-values[middle]) + np.exp(values[middle])
+        )
+        return result
+    if order == -1:
+        shifted = values - 1.0 / np.sqrt(2.0)
+        gaussian = np.exp(-np.minimum(200.0, shifted * shifted)) / np.sqrt(
+            np.pi
+        )
+        return gaussian * (1.0 - np.sqrt(2.0) * shifted)
+    gaussian = np.exp(-np.minimum(200.0, values * values)) / np.sqrt(np.pi)
+    if order == 0:
+        return gaussian
+    if order == 1:
+        return gaussian * (1.5 - values * values)
+    raise QEInputError(
+        "analytic smearing density supports ngauss=0, 1, -1, or -99"
+    )
 
 
 def w1gauss(x: np.ndarray | float, order: int) -> np.ndarray:

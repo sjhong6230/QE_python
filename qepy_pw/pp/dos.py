@@ -16,7 +16,12 @@ import numpy as np
 from ..cli_options import add_input_file_argument
 from ..constants import EV_PER_HARTREE
 from ..errors import QEInputError, emit_qe_error
-from ..occupations import _linear_tetra_moments_block, _tetrahedra, smearing_order, wgauss
+from ..occupations import (
+    _tetrahedra,
+    _tetrahedron_effective_energies,
+    smearing_density,
+    smearing_order,
+)
 from ..pw.save import QES_NAMESPACE
 from ..qe_format import format_qe_closing, format_qe_opening, format_qe_timing
 from ..version import __version__
@@ -85,28 +90,38 @@ def smearing_dos(energies_ev, weights, grid_ev, width_ev, ngauss):
     if width_ev <= 0:
         raise QEInputError("smearing DOS requires positive degauss")
     x = (grid_ev[:, None, None] - np.asarray(energies_ev)[None, :, :]) / width_ev
-    step = 1.0e-5
-    kernel = (wgauss(x + step, ngauss) - wgauss(x - step, ngauss)) / (2 * step * width_ev)
+    kernel = smearing_density(x, ngauss) / width_ev
     return 2.0 * np.einsum("ekb,k->e", kernel, weights)
 
 
-def tetrahedron_dos(data: DOSData, grid_ev: np.ndarray, method: str) -> tuple[np.ndarray, np.ndarray]:
+def tetrahedron_dos(
+    data: DOSData, grid_ev: np.ndarray, method: str
+) -> tuple[np.ndarray, np.ndarray]:
     if data.grid is None or data.mapping is None or data.reciprocal is None:
         raise QEInputError("tetrahedron DOS requires saved automatic k-grid metadata")
     normalized = method.lower().replace("-", "_")
     optimized_connectivity = normalized in {"tetrahedra_lin", "tetrahedra_opt"}
     optimized = normalized == "tetrahedra_opt"
-    tetra, interpolation = _tetrahedra(data.grid, data.mapping, data.reciprocal, optimized_connectivity, optimized)
-    point_energies = data.eigenvalues_ev[tetra]
-    effective = np.einsum("cp,tpb->tbc", interpolation, point_energies)
-    sorted_e = np.sort(effective, axis=-1)
-    dos, integrated = [], []
+    tetra, interpolation = _tetrahedra(
+        data.grid,
+        data.mapping,
+        data.reciprocal,
+        optimized_connectivity,
+        optimized,
+    )
+    effective = _tetrahedron_effective_energies(
+        data.eigenvalues_ev, tetra, interpolation
+    )
+    sorted_e = np.ascontiguousarray(
+        np.sort(effective, axis=-1), dtype=np.float64
+    )
+    energy_grid = np.ascontiguousarray(grid_ev, dtype=np.float64)
+    from ..basis import _load_native_fft
+
+    native = _load_native_fft()
+    dos, integrated = native.tetrahedron_dos_sums(sorted_e, energy_grid)
     ntetra = len(tetra)
-    for energy in grid_ev:
-        moments, density = _linear_tetra_moments_block(sorted_e, float(energy))
-        dos.append(2.0 * float(np.sum(density)) / ntetra)
-        integrated.append(2.0 * float(np.sum(moments)) / ntetra)
-    return np.asarray(dos), np.asarray(integrated)
+    return 2.0 * dos / ntetra, 2.0 * integrated / ntetra
 
 
 def run_dos(
