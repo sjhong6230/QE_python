@@ -30,6 +30,12 @@ def test_io_directories_are_created_and_wfcdir_defaults_to_outdir(
     assert resolved_wfcdir == outdir.resolve()
     assert resolve_outdir(defaulted).is_dir()
 
+    # The default is resolved dynamically, so programmatic outdir changes
+    # made after input parsing are inherited unless wfcdir was explicit.
+    moved_outdir = tmp_path / "moved-output"
+    defaulted.control["outdir"] = str(moved_outdir)
+    assert resolve_wfcdir(defaulted) == moved_outdir.resolve()
+
     separate = tmp_path / "scratch" / "wfc"
     explicit = _pw({
         "outdir": str(outdir), "wfcdir": str(separate), "prefix": "si"

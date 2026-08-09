@@ -11,7 +11,9 @@ from qepy_pw.pp.bands import _format_group_info
 from qepy_pw.pw.output import (
     _format_force_component,
     _format_stress_component,
+    format_progress,
 )
+from qepy_pw.pw.scf import KPointProgress
 from qepy_pw.qe_format import (
     format_qe_closing,
     format_qe_duration,
@@ -40,6 +42,17 @@ def test_qe_primary_clock_duration_fields() -> None:
     assert format_qe_duration(64.2, "WALL") == "  1m 4.20s WALL"
     assert format_qe_duration(3664.2, "CPU") == "     1h 1m CPU"
     assert format_qe_duration(90064.2, "WALL") == "  1d 1h 1m WALL"
+
+
+def test_nscf_kpoint_progress_uses_qe_9001_and_9000_formats() -> None:
+    assert format_progress(
+        "kpoint_start", KPointProgress(17)
+    ) == "\n     Computing kpt #:    17\n"
+    assert format_progress(
+        "kpoint_end", KPointProgress(17, 123.45)
+    ) == (
+        "     total cpu time spent up to now is      123.5 secs\n"
+    )
 
 
 def test_force_component_uses_qe_9035_layout_without_extra_blank_lines() -> None:

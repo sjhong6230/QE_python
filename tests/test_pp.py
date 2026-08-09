@@ -20,6 +20,7 @@ from qepy_pw.pp.bands import (
 )
 from qepy_pw.input import read_pw_input
 from qepy_pw.output import format_footer
+from qepy_pw.pw.output import format_progress
 from qepy_pw.pw.buffers import WavefunctionBuffer
 from qepy_pw.pw.save import write_qe_save
 from qepy_pw.scf import run_scf
@@ -226,7 +227,22 @@ def test_scf_nscf_save_order_and_bands_inp_integration(
         "wfcdir": str(tmp_path / "working-wfc"),
         "disk_io": "medium", "verbosity": "high", "tstress": False,
     })
-    nscf_result = run_scf(nscf_pw)
+    progress_chunks: list[str] = []
+    nscf_result = run_scf(
+        nscf_pw,
+        progress=lambda kind, payload: progress_chunks.append(
+            format_progress(kind, payload)
+        ),
+    )
+    progress_output = "".join(progress_chunks)
+    assert progress_output.count("     Computing kpt #:") == len(
+        nscf_pw.kpoints
+    )
+    assert progress_output.count(
+        "     total cpu time spent up to now is"
+    ) == len(nscf_pw.kpoints)
+    for index in range(1, len(nscf_pw.kpoints) + 1):
+        assert f"\n     Computing kpt #: {index:5d}\n" in progress_output
     write_qe_save(nscf_pw, nscf_result)
     assert hashlib.sha256(density_path.read_bytes()).digest() == density_before
     nscf_output = format_footer(nscf_pw, nscf_result)

@@ -602,12 +602,21 @@ def format_progress(kind: ProgressKind, payload: ProgressPayload) -> str:
     The local import preserves the package's lightweight import path while
     the explicit checks turn a mismatched callback event into a useful error.
     """
-    from .scf import SCFIteration, SCFSetup
+    from .scf import KPointProgress, SCFIteration, SCFSetup
 
     if kind == "setup" and isinstance(payload, SCFSetup):
         return format_setup(payload)
     if kind == "iteration" and isinstance(payload, SCFIteration):
         return format_iteration(payload)
+    if kind == "kpoint_start" and isinstance(payload, KPointProgress):
+        return f"\n     Computing kpt #: {payload.number:5d}\n"
+    if kind == "kpoint_end" and isinstance(payload, KPointProgress):
+        if payload.cpu_seconds is None:
+            raise TypeError("kpoint_end progress requires a CPU time")
+        return (
+            "     total cpu time spent up to now is "
+            f"{payload.cpu_seconds:10.1f} secs\n"
+        )
     raise TypeError(
         f"progress event {kind!r} does not match {type(payload).__name__}"
     )

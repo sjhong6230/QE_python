@@ -213,6 +213,14 @@ class SCFSetup:
     calculation: str = "scf"
 
 
+@dataclass(frozen=True)
+class KPointProgress:
+    """Progress of one k point in a non-self-consistent band loop."""
+
+    number: int
+    cpu_seconds: float | None = None
+
+
 @dataclass
 class SCFResult:
     """Physical result and restart/reporting data returned by :func:`run_scf`."""
@@ -242,8 +250,10 @@ class SCFResult:
     wavefunctions_distributed: bool = False
 
 
-ProgressKind = Literal["setup", "iteration"]
-ProgressPayload = SCFSetup | SCFIteration
+ProgressKind = Literal[
+    "setup", "iteration", "kpoint_start", "kpoint_end"
+]
+ProgressPayload = SCFSetup | SCFIteration | KPointProgress
 ProgressCallback = Callable[[ProgressKind, ProgressPayload], None]
 _PACKED_PROJECTOR_CHANNEL_LIMIT = 64
 
@@ -1732,6 +1742,11 @@ def _run_scf(
         pw.control.get("calculation", "scf")
     ).strip().lower()
     fixed_potential = calculation in {"nscf", "bands"}
+    report_kpoints = (
+        fixed_potential
+        and str(pw.control.get("verbosity", "low")).strip().lower()
+        == "high"
+    )
     ecut = float(pw.system.get("ecutwfc", 0.0))
     if ecut <= 0:
         raise QEInputError("ecutwfc not set", routine="set_cutoff")
@@ -2893,6 +2908,10 @@ def _run_scf(
         ) + max(sizes) * maximum_block * 16 // mpi.size
         bands_started = timers.start()
         for kpoint_index, compact_basis in enumerate(bases):
+            if report_kpoints and progress is not None:
+                progress(
+                    "kpoint_start", KPointProgress(kpoint_index + 1)
+                )
             basis = compact_basis.materialize()
             local_workspace = local_workspaces[kpoint_index]
             if diagonalization == "dense":
@@ -3154,6 +3173,16 @@ def _run_scf(
                     trial_vectors,
                     trial_eigenvalues,
                     trial_applied,
+                )
+            if report_kpoints and progress is not None:
+                # QE reports completion after save_buffer and flushes stdout,
+                # so the displayed CPU time means this k point is durable.
+                progress(
+                    "kpoint_end",
+                    KPointProgress(
+                        kpoint_index + 1,
+                        time.process_time() - cpu_start,
+                    ),
                 )
         if starting_local_workspaces is not None:
             # The last temporary Hamiltonian/workspace was deleted above;

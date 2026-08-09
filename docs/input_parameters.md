@@ -45,7 +45,7 @@ K_POINTS automatic
 |---|---|---|
 | `title` | string, empty | Printed and written to save metadata. |
 | `calculation` | string, `'scf'` | `'scf'`, `'nscf'`, or `'bands'`. The latter two read the converged density from `<outdir>/<prefix>.save`, diagonalize the resulting fixed Kohn--Sham potential at the requested `K_POINTS`, and do not mix a new density. |
-| `verbosity` | string, `'low'` | `'high'` enables additional QE-shaped structural output; other strings behave as low verbosity. |
+| `verbosity` | string, `'low'` | `'high'` enables additional QE-shaped structural output. During NSCF/bands calculations it also prints QE's `Computing kpt #` and cumulative CPU-time records for every completed k point. Other strings behave as low verbosity. |
 | `restart_mode` | string, `'from_scratch'` | `'from_scratch'` or `'restart'`. Restart requires compatible saved density and wavefunctions. |
 | `tstress` | logical, `.false.` | Compute and print the implemented analytic stress contributions. |
 | `tprnfor` | logical, `.false.` | Compute and print implemented ionic forces. |
