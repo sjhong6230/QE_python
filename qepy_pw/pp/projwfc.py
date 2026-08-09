@@ -571,7 +571,9 @@ def run_projwfc(
             stream.write("# ik E (eV) DOS(E) PDOS(E)\n")
             for ik in range(len(data.weights)):
                 dos_k = 2.0 * np.sum(kernel[:, ik, :], axis=1)
-                pdos_k = 2.0 * np.einsum("eb,bo->e", kernel[:, ik, :], data.projections[ik]).sum(axis=1)
+                pdos_k = 2.0 * np.einsum(
+                    "eb,bo->e", kernel[:, ik, :], data.projections[ik]
+                )
                 for energy, dos, pdos in zip(grid, dos_k, pdos_k):
                     stream.write(f"{ik + 1:6d} {energy:12.6f} {dos:14.6e} {pdos:14.6e}\n")
         else:
@@ -629,7 +631,7 @@ def _format_projection_summary(data: ProjectionData, *, diag_basis: bool = False
     ]
     for index, orbital in enumerate(data.orbitals, start=1):
         lines.append(
-            f"     state #{index:4d}: atom {orbital.atom:3d} ({orbital.symbol:>3}), "
+            f"     state #{index:4d}: atom {orbital.atom:3d} ({orbital.symbol:<3}), "
             f"wfc {orbital.wfc:2d} (l={orbital.l:d} m={orbital.m + 1:2d})"
         )
 
@@ -658,7 +660,7 @@ def _format_projection_summary(data: ProjectionData, *, diag_basis: bool = False
             angular_charge = float(np.sum(charges[component_indices]))
             line = (
                 f"     Atom # {atom:3d}: total charge = {total:8.4f}, "
-                f"{label} ={angular_charge:8.4f}"
+                f"{label} ={angular_charge:8.4f}, "
             )
             if angular_momentum:
                 labels = (
@@ -721,7 +723,7 @@ def main(argv=None) -> int:
         print(format_qe_closing(), end="")
         return 0
     except (QEInputError, UnsupportedFeatureError, OSError, ValueError, ET.ParseError) as exc:
-        emit_qe_error(exc)
+        emit_qe_error(exc, routine="projwfc.py")
         return 1
 
 

@@ -223,7 +223,7 @@ def main(argv=None) -> int:
         print(format_qe_closing(), end="")
         return 0
     except (QEInputError, OSError, ValueError, ET.ParseError) as exc:
-        emit_qe_error(exc)
+        emit_qe_error(exc, routine="dos.py")
         return 1
 
 

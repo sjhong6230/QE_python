@@ -64,6 +64,13 @@ def test_qe_error_is_emitted_to_stdout_and_stderr() -> None:
     assert "Error in routine c_bands (1):" in stdout.getvalue()
 
 
+def test_qe_error_can_use_executable_routine_name() -> None:
+    rendered = format_qe_error(
+        ValueError("bad projection shape"), routine="projwfc.py"
+    )
+    assert "Error in routine projwfc.py (1):" in rendered
+
+
 def test_cutoff_warning_and_silent_fixed_degauss_reset_match_qe() -> None:
     pw = _read(_input("ecutrho = 60.0, degauss = 0.01"))
     messages = [(item.routine, item.message) for item in pw.warnings]

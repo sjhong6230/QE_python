@@ -104,6 +104,33 @@ def test_projwfc_end_to_end_on_saved_scalar_wavefunctions(
     ) in report
 
 
+def test_kresolved_projwfc_writes_each_energy_and_k_point(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = Path(__file__).parent / "qe_reference" / "upstream" / "pseudo" / "pwscf.save"
+    shutil.copytree(source, tmp_path / "pwscf.save")
+    monkeypatch.chdir(tmp_path)
+    data, _paths = run_projwfc({
+        "prefix": "pwscf",
+        "outdir": ".",
+        "filpdos": "si-k",
+        "emin": -1.0,
+        "emax": 1.0,
+        "deltae": 1.0,
+        "degauss": 0.02,
+        "kresolveddos": True,
+    })
+
+    lines = (tmp_path / "si-k.pdos_tot").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert lines[0] == "# ik E (eV) DOS(E) PDOS(E)"
+    assert len(lines) == 1 + len(data.weights) * 3
+    assert {int(line.split()[0]) for line in lines[1:]} == set(
+        range(1, len(data.weights) + 1)
+    )
+
+
 def test_box_ldos_full_grid_has_unit_state_weights(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -156,9 +183,9 @@ def test_projwfc_main_uses_qe_projection_summary(
     output = capsys.readouterr().out
     assert output.startswith("\n     Program PROJWFC-PY v.")
     assert "     Atomic states used for projection\n" in output
-    assert "     state #   1: atom   1 ( Si), wfc  1 (l=0 m= 1)" in output
+    assert "     state #   1: atom   1 (Si ), wfc  1 (l=0 m= 1)" in output
     assert "\nLowdin Charges: \n" in output
-    assert "     Atom #   1: total charge =   1.8000, s =  1.8000" in output
+    assert "     Atom #   1: total charge =   1.8000, s =  1.8000, " in output
     assert "     Spilling Parameter:   0.1000" in output
     assert "\n     PROJWFC      : " in output
     assert "\n   JOB DONE.\n" in output

@@ -641,7 +641,7 @@ def main(argv: list[str] | None = None) -> int:
         print(format_qe_closing(), end="")
         return 0
     except (QEInputError, UnsupportedFeatureError, OSError, ValueError) as exc:
-        emit_qe_error(exc)
+        emit_qe_error(exc, routine="bands.py")
         return 1
 
 

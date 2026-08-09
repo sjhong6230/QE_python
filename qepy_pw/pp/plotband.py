@@ -551,7 +551,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"bands in PostScript format written to file {ps_file}")
         return 0
     except (QEInputError, OSError, ValueError) as exc:
-        emit_qe_error(exc)
+        emit_qe_error(exc, routine="plotband.py")
         return 1
 
 
