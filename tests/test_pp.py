@@ -225,8 +225,12 @@ def test_scf_nscf_save_order_and_bands_inp_integration(
         "calculation": "nscf", "prefix": "integ",
         "outdir": str(tmp_path), "pseudo_dir": str(pseudo_dir),
         "wfcdir": str(tmp_path / "working-wfc"),
-        "disk_io": "medium", "verbosity": "high", "tstress": False,
+        "verbosity": "high", "tstress": False,
     })
+    # The source file was SCF and therefore parsed with its default 'low'.
+    # Removing that canonicalized value exercises the calculation-dependent
+    # library default after changing the calculation programmatically.
+    nscf_pw.control.pop("disk_io")
     progress_chunks: list[str] = []
     nscf_result = run_scf(
         nscf_pw,
@@ -234,6 +238,7 @@ def test_scf_nscf_save_order_and_bands_inp_integration(
             format_progress(kind, payload)
         ),
     )
+    assert isinstance(nscf_result.wavefunctions, WavefunctionBuffer)
     progress_output = "".join(progress_chunks)
     assert progress_output.count("     Computing kpt #:") == len(
         nscf_pw.kpoints

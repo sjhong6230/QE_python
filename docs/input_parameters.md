@@ -53,7 +53,7 @@ K_POINTS automatic
 | `wfcdir` | string, `outdir` | Directory for processor-local binary working wavefunction files. It is created at calculation initialization and may be placed on local scratch storage. |
 | `prefix` | string, `'pwscf'` | Save-directory prefix. It must be a filename component, not a path. |
 | `pseudo_dir` | string, `.` | UPF directory. A relative path is resolved relative to the input file. |
-| `disk_io` | string, `'low'` | One of `none`, `low`, `medium`, or `high`. `none` disables the final persistent output; the other levels write QE-shaped XML/HDF5 save data. `low` keeps working wavefunctions in memory, `medium` uses `wfcdir` when a process has more than one k point, and `high` always uses it. |
+| `disk_io` | string, `'low'` for SCF, `'medium'` otherwise | One of `none`, `low`, `medium`, or `high`. `none` disables the final persistent output; the other levels write QE-shaped XML/HDF5 save data. `low` keeps working wavefunctions in memory, `medium` uses `wfcdir` when a process has more than one k point, and `high` always uses it. |
 | `iprint` | integer, `100000` in saved metadata | Accepted for QE compatibility. It does not introduce ionic-step printing because ionic dynamics are not implemented. |
 
 `tprfor` is not an alias for `tprnfor`; it is diagnosed as an unknown variable,

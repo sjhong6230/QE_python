@@ -132,7 +132,9 @@ def main(argv: list[str] | None = None) -> int:
         progress = _root_progress_reporter() if mpi.is_root else None
         result = run_scf(pw, progress=progress, mpi=mpi)
         save_directory = None
-        if str(pw.control.get("disk_io", "low")).strip().lower() != "none":
+        from .save import saving_enabled
+
+        if saving_enabled(pw):
             from .save import resolve_save_directory, write_qe_save
 
             if mpi.is_root:

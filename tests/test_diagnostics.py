@@ -106,11 +106,13 @@ def test_fixed_potential_calculations_select_saved_density(
         )
     )
     assert pw.control["calculation"] == calculation
+    assert pw.control["disk_io"] == "medium"
     assert pw.electrons["startingpot"] == "file"
     assert pw.electrons.get("startingwfc", "atomic+random") == "atomic+random"
 
 
 def test_disk_io_medium_and_known_levels_are_accepted() -> None:
+    assert _read(_input()).control["disk_io"] == "low"
     for level in ("none", "low", "medium", "high"):
         text = _input().replace(
             "calculation = 'scf'",

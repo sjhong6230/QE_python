@@ -1065,7 +1065,13 @@ def read_pw_input(source: str | Path | TextIO) -> PWInput:
             not_implemented(f"calculation {calculation}"), routine="iosys"
         )
     control["calculation"] = calculation
-    disk_io = str(control.get("disk_io", "low")).strip().lower()
+    # QE defaults to memory-oriented I/O for SCF, but selects medium for
+    # non-self-consistent calculations because their k-point sets can be
+    # large. Explicit user input always takes precedence.
+    default_disk_io = "low" if calculation == "scf" else "medium"
+    disk_io = str(
+        control.get("disk_io", default_disk_io)
+    ).strip().lower()
     if disk_io not in {"none", "low", "medium", "high"}:
         raise QEInputError(
             f"unknown disk_io {disk_io}", routine="iosys"

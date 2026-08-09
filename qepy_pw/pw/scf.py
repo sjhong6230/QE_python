@@ -43,6 +43,7 @@ from ..ewald import ewald_energy, ewald_forces, ewald_stress
 from .buffers import (
     WavefunctionBuffer,
     prepare_io_directories,
+    resolve_disk_io,
     resolve_prefix,
     resolve_wfcdir,
     uses_disk_wavefunction_buffer,
@@ -1791,7 +1792,7 @@ def _run_scf(
     if fixed_potential:
         starting_potential = "file"
     starting_messages: list[str] = []
-    disk_io = str(pw.control.get("disk_io", "low")).strip().lower()
+    disk_io = resolve_disk_io(pw)
     save_wavefunctions = disk_io != "none"
     retain_occupied_states = (
         calculate_forces or calculate_stress or save_wavefunctions

@@ -19,7 +19,7 @@ import xml.etree.ElementTree as ET
 import numpy as np
 
 from ..errors import QEInputError
-from .buffers import resolve_outdir, resolve_prefix
+from .buffers import resolve_disk_io, resolve_outdir, resolve_prefix
 from .input import PWInput
 from ..mpi import MPIContext
 from .scf import SCFResult
@@ -48,7 +48,7 @@ def resolve_save_directory(pw: PWInput) -> Path:
 def saving_enabled(pw: PWInput) -> bool:
     """Whether CONTROL/disk_io permits persistent output."""
 
-    return str(pw.control.get("disk_io", "low")).strip().lower() != "none"
+    return resolve_disk_io(pw) != "none"
 
 
 def _text(parent: ET.Element, tag: str, value: Any) -> ET.Element:
@@ -148,7 +148,7 @@ def _input_xml(root: ET.Element, pw: PWInput, result: SCFResult) -> None:
         ("stress", pw.control.get("tstress", False)),
         ("forces", pw.control.get("tprnfor", False)),
         ("wf_collect", False),
-        ("disk_io", pw.control.get("disk_io", "low")),
+        ("disk_io", resolve_disk_io(pw)),
         ("max_seconds", pw.control.get("max_seconds", 1.0e7)),
         ("etot_conv_thr", pw.control.get("etot_conv_thr", 1.0e-4)),
         ("forc_conv_thr", pw.control.get("forc_conv_thr", 1.0e-3)),

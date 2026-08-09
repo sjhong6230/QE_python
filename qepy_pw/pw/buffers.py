@@ -60,6 +60,16 @@ def resolve_wfcdir(pw: PWInput) -> Path:
     return _resolve_directory(raw_wfcdir)
 
 
+def resolve_disk_io(pw: PWInput) -> str:
+    """Return QE's explicit or calculation-dependent ``disk_io`` level."""
+
+    calculation = str(
+        pw.control.get("calculation", "scf")
+    ).strip().lower()
+    default = "low" if calculation == "scf" else "medium"
+    return str(pw.control.get("disk_io", default)).strip().lower()
+
+
 def prepare_io_directories(
     pw: PWInput, mpi: MPIContext | None = None
 ) -> tuple[Path, Path]:
@@ -214,6 +224,7 @@ class WavefunctionBuffer(Sequence[np.ndarray]):
 __all__ = [
     "WavefunctionBuffer",
     "prepare_io_directories",
+    "resolve_disk_io",
     "resolve_outdir",
     "resolve_prefix",
     "resolve_wfcdir",
