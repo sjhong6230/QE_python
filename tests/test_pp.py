@@ -39,6 +39,7 @@ from qepy_pw.pp.plotband import (
     main as plotband_main,
     parse_plotband_input,
     run_interactive_plotband,
+    write_postscript,
 )
 from qepy_pw.pp.p_matrix import momentum_matrices, write_p_avg
 from qepy_pw.qe_format import format_qe_opening
@@ -248,6 +249,40 @@ def test_plotband_interactive_dialogue_matches_qe(tmp_path) -> None:
     assert "output file (gnuplot/xmgr) > " in dialogue
     assert "output file (ps) > Efermi > " in dialogue
     assert "deltaE, reference E (for tics) " in dialogue
+
+
+def test_plotband_postscript_uses_qe_dialect_and_spline(tmp_path) -> None:
+    data = BandData(
+        np.array([
+            [0.0, 0.0, 0.0],
+            [0.25, 0.0, 0.0],
+            [0.50, 0.0, 0.0],
+            [0.75, 0.0, 0.0],
+        ]),
+        np.array([
+            [-0.5, 0.5],
+            [-0.25, 0.75],
+            [0.25, 0.25],
+            [0.5, 0.0],
+        ]),
+    )
+
+    path = write_postscript(
+        tmp_path / "bands.ps", data, -1.0, 1.0, 0.0, 0.5, 0.0
+    )
+    text = path.read_text(encoding="ascii")
+
+    assert text.startswith(
+        "%! PS-Adobe-1.0\n"
+        " /localdict 100 dict def\n"
+        " localdict begin\n"
+    )
+    assert "/Times-Roman findfont 12 scalefont setfont" in text
+    assert "90 rotate 0 21 neg 28.451 mul translate 1.5 1.5 scale" in text
+    assert text.count("  dot\n") == data.nks * data.nbnd
+    assert text.count("   6 banda\n") == data.nbnd
+    assert "EPSF" not in text
+    assert "Helvetica" not in text
 
 
 def test_plotband_main_without_input_file_uses_interactive_stdin(

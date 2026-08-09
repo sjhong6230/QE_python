@@ -14,6 +14,11 @@ from ..errors import QEInputError, emit_qe_error
 from .band_data import BandData, read_band_file, write_gnuplot
 
 
+_RAP_HEADER = re.compile(
+    r"nbnd_rap\s*=\s*(\d+).*nks_rap\s*=\s*(\d+)", re.IGNORECASE
+)
+
+
 def _meaningful_lines(text: str) -> list[str]:
     return [line.strip() for line in text.splitlines() if line.strip() and not line.lstrip().startswith(("#", "!"))]
 
@@ -49,24 +54,184 @@ def parse_plotband_input(text: str) -> dict[str, object]:
     }
 
 
-def high_symmetry_indices(data: BandData, tolerance: float = 1.0e-7) -> list[int]:
-    """Locate path endpoints, repeated vertices, and direction changes."""
-    if data.nks <= 2:
-        return list(range(data.nks))
-    steps = np.diff(data.kpoints, axis=0)
-    indices = {0, data.nks - 1}
-    for index in range(1, data.nks - 1):
-        if float(np.dot(data.kpoints[index], data.kpoints[index])) < 1.0e-9:
-            indices.add(index)
-        left, right = steps[index - 1], steps[index]
-        left_norm, right_norm = np.linalg.norm(left), np.linalg.norm(right)
-        if left_norm <= tolerance or right_norm <= tolerance:
-            indices.add(index)
-            continue
-        cosine = float(np.dot(left, right) / (left_norm * right_norm))
-        if not np.isclose(cosine, 1.0, atol=tolerance):
-            indices.add(index)
-    return sorted(indices)
+def _qe_plot_geometry(
+    data: BandData,
+    inherited_high_symmetry: np.ndarray | None = None,
+    tolerance: float = 1.0e-4,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return QE plotband.x path coordinates and high-symmetry flags."""
+    points = np.asarray(data.kpoints, dtype=np.float32)
+    high_symmetry = (
+        np.zeros(data.nks, dtype=bool)
+        if inherited_high_symmetry is None
+        else np.asarray(inherited_high_symmetry, dtype=bool).copy()
+    )
+    if high_symmetry.shape != (data.nks,):
+        raise QEInputError("invalid plotband high-symmetry flags")
+    coordinate = np.zeros(data.nks, dtype=np.float32)
+    if data.nks == 0:
+        return coordinate, high_symmetry
+    high_symmetry[0] = True
+    high_symmetry[-1] = True
+    if data.nks > 2:
+        for index in range(1, data.nks - 1):
+            left = points[index] - points[index - 1]
+            right = points[index + 1] - points[index]
+            left_norm = np.float32(np.sqrt(np.sum(left * left)))
+            right_norm = np.float32(np.sqrt(np.sum(right * right)))
+            if left_norm == 0.0 or right_norm == 0.0:
+                high_symmetry[index] = True
+            else:
+                cosine = np.float32(
+                    np.sum(left * right) / (left_norm * right_norm)
+                )
+                high_symmetry[index] |= abs(float(cosine) - 1.0) > tolerance
+            if np.sum(points[index] * points[index]) < np.float32(1.0e-9):
+                high_symmetry[index] = True
+    if data.nks > 1:
+        first_step = points[1] - points[0]
+        typical = np.float32(np.sqrt(np.sum(first_step * first_step)))
+        for index in range(1, data.nks):
+            step = points[index] - points[index - 1]
+            distance = np.float32(np.sqrt(np.sum(step * step)))
+            if typical > 0.0 and distance > np.float32(10.0) * typical:
+                coordinate[index] = coordinate[index - 1]
+            else:
+                coordinate[index] = np.float32(
+                    coordinate[index - 1] + distance
+                )
+    return coordinate, high_symmetry
+
+
+def high_symmetry_indices(data: BandData, tolerance: float = 1.0e-4) -> list[int]:
+    """Locate the path vertices identified by QE ``plotband.x``."""
+    _coordinate, high_symmetry = _qe_plot_geometry(
+        data, tolerance=tolerance
+    )
+    return np.flatnonzero(high_symmetry).tolist()
+
+
+def _read_rap_high_symmetry(
+    band_file: str | Path, data: BandData
+) -> np.ndarray | None:
+    """Read the optional ``bands.x`` .rap high-symmetry markers."""
+    path = Path(f"{band_file}.rap")
+    if not path.is_file():
+        return None
+    try:
+        lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        match = _RAP_HEADER.search(lines[0])
+        if match is None:
+            return None
+        nbnd, nks = map(int, match.groups())
+        if nbnd != data.nbnd or nks != data.nks:
+            return None
+        flags = np.zeros(nks, dtype=bool)
+        cursor = 1
+        for index in range(nks):
+            fields = lines[cursor].split()
+            cursor += 1
+            if len(fields) < 4:
+                return None
+            point = np.asarray([float(value) for value in fields[:3]])
+            if np.sum(np.abs(point - data.kpoints[index])) > 1.0e-4:
+                return None
+            flags[index] = fields[3].strip(".").upper() in {"T", "TRUE"}
+            count = 0
+            while count < nbnd:
+                count += len(lines[cursor].split())
+                cursor += 1
+        return flags
+    except (IndexError, OSError, ValueError):
+        return None
+
+
+def _qe_spline_interpolate(
+    x: np.ndarray, y: np.ndarray, xout: np.ndarray
+) -> np.ndarray:
+    """Reproduce plotband.x's single-precision natural-end spline."""
+    x = np.asarray(x, dtype=np.float32)
+    y = np.asarray(y, dtype=np.float32)
+    xout = np.asarray(xout, dtype=np.float32)
+    count = len(x)
+    second = np.empty(count, dtype=np.float32)
+    work = np.empty(count, dtype=np.float32)
+    first_derivative = np.float32((y[1] - y[0]) / (x[1] - x[0]))
+    last_derivative = np.float32(0.0)
+    second[0] = np.float32(-0.5)
+    work[0] = np.float32(
+        np.float32(3.0) / (x[1] - x[0])
+        * ((y[1] - y[0]) / (x[1] - x[0]) - first_derivative)
+    )
+    for index in range(1, count - 1):
+        sigma = np.float32(
+            (x[index] - x[index - 1]) / (x[index + 1] - x[index - 1])
+        )
+        p = np.float32(sigma * second[index - 1] + np.float32(2.0))
+        second[index] = np.float32((sigma - np.float32(1.0)) / p)
+        slope_change = np.float32(
+            (y[index + 1] - y[index]) / (x[index + 1] - x[index])
+            - (y[index] - y[index - 1]) / (x[index] - x[index - 1])
+        )
+        work[index] = np.float32(
+            (
+                np.float32(6.0) * slope_change
+                / (x[index + 1] - x[index - 1])
+                - sigma * work[index - 1]
+            )
+            / p
+        )
+    qn = np.float32(0.5)
+    un = np.float32(
+        np.float32(3.0) / (x[-1] - x[-2])
+        * (last_derivative - (y[-1] - y[-2]) / (x[-1] - x[-2]))
+    )
+    second[-1] = np.float32(
+        (un - qn * work[-2]) / (qn * second[-2] + np.float32(1.0))
+    )
+    for index in range(count - 2, -1, -1):
+        second[index] = np.float32(
+            second[index] * second[index + 1] + work[index]
+        )
+    output = np.empty(len(xout), dtype=np.float32)
+    lower = 0
+    for output_index, value in enumerate(xout):
+        upper = lower + 1
+        while upper < count and x[upper] < value:
+            upper += 1
+        if upper >= count:
+            upper = count - 1
+            lower = upper - 1
+        else:
+            lower = max(0, upper - 1)
+        width = np.float32(x[upper] - x[lower])
+        a = np.float32((x[upper] - value) / width)
+        b = np.float32((value - x[lower]) / width)
+        output[output_index] = np.float32(
+            a * y[lower]
+            + b * y[upper]
+            + (
+                (a**3 - a) * second[lower]
+                + (b**3 - b) * second[upper]
+            )
+            * width
+            * width
+            / np.float32(6.0)
+        )
+    return output
+
+
+def _write_fortran_reals(
+    stream: TextIO, values: list[np.float32], per_record: int = 9
+) -> None:
+    for start in range(0, len(values), per_record):
+        stream.write(
+            " ".join(
+                f"{float(value):8.3f}"
+                for value in values[start:start + per_record]
+            )
+            + "\n"
+        )
 
 
 def write_postscript(
@@ -77,45 +242,137 @@ def write_postscript(
     fermi: float,
     delta: float,
     reference: float,
+    high_symmetry: np.ndarray | None = None,
 ) -> Path:
-    """Write a compact dependency-free PostScript band plot."""
+    """Write the PostScript program emitted by QE ``plotband.x``."""
     output = Path(path)
-    coordinate = data.path_coordinate()
-    xmax = max(float(coordinate[-1]), 1.0)
-    left, bottom, width, height = 72.0, 72.0, 468.0, 648.0
-    def xmap(value: float) -> float:
-        return left + width * value / xmax
-    def ymap(value: float) -> float:
-        return bottom + height * (value - emin) / (emax - emin)
+    coordinate, high_symmetry_flags = _qe_plot_geometry(data, high_symmetry)
+    if data.nks < 2 or coordinate[-1] <= 0.0:
+        raise QEInputError("plotband requires a nonzero k-point path")
+    energies = np.asarray(data.energies_ev, dtype=np.float32)
+    emin32 = np.float32(emin)
+    emax32 = np.float32(emax)
+    fermi32 = np.float32(fermi)
+    delta32 = np.float32(delta)
+    reference32 = np.float32(reference)
+    cm = np.float32(28.453)
+    xdim = np.float32(15.0) * cm
+    ydim = np.float32(10.0) * cm
+    x0 = np.float32(2.0) * cm
+    y0 = np.float32(2.0) * cm
+    energy_span = np.float32(emax32 - emin32)
+    in_range = np.any(
+        (energies >= emin32) & (energies <= emax32), axis=0
+    )
+    vertices = np.flatnonzero(high_symmetry_flags)
+    segments = list(zip(vertices[:-1], vertices[1:]))
+
+    def xmap(value: np.float32) -> np.float32:
+        return np.float32(value * xdim / coordinate[-1])
+
+    def ymap(value: np.float32) -> np.float32:
+        return np.float32((value - emin32) * ydim / energy_span)
+
+    def nint(value: np.float32) -> int:
+        number = float(value)
+        return int(np.floor(number + 0.5) if number >= 0.0 else np.ceil(number - 0.5))
+
     with output.open("w", encoding="ascii", newline="\n") as stream:
-        stream.write("%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 50 50 560 750\n")
-        stream.write("/Helvetica findfont 9 scalefont setfont\n0 setgray 0.6 setlinewidth\n")
-        stream.write(f"newpath {left} {bottom} moveto {left + width} {bottom} lineto {left + width} {bottom + height} lineto {left} {bottom + height} lineto closepath stroke\n")
-        for index in high_symmetry_indices(data):
-            x = xmap(float(coordinate[index]))
-            stream.write(f"0.85 setgray newpath {x:.3f} {bottom} moveto {x:.3f} {bottom + height} lineto stroke 0 setgray\n")
-        first_tick = np.ceil((emin - reference) / delta) * delta + reference
-        for energy in np.arange(first_tick, emax + 0.5 * delta, delta):
-            y = ymap(float(energy))
-            stream.write(f"newpath {left - 4} {y:.3f} moveto {left} {y:.3f} lineto stroke {left - 42} {y - 3:.3f} moveto ({energy:g}) show\n")
-        if emin <= fermi <= emax:
-            y = ymap(fermi)
-            stream.write(f"[4 3] 0 setdash newpath {left} {y:.3f} moveto {left + width} {y:.3f} lineto stroke [] 0 setdash\n")
-        stream.write("0.8 setlinewidth\n")
-        for band in range(data.nbnd):
-            visible = [(xmap(float(x)), ymap(float(e))) for x, e in zip(coordinate, data.energies_ev[:, band])]
-            if not visible:
+        stream.write("%! PS-Adobe-1.0\n")
+        stream.write(" /localdict 100 dict def\n localdict begin\n")
+        stream.write(" % delete next line for insertion in a LaTeX file\n")
+        stream.write("  0 0 moveto\n gsave\n")
+        stream.write(" /nm  {newpath moveto} def\n")
+        stream.write(" /riga {newpath moveto lineto stroke} def\n")
+        stream.write(" /banda {3 1 roll moveto {lineto} repeat stroke} def\n")
+        stream.write(" /dot {newpath  1 0 360 arc fill} def\n")
+        stream.write(" /Times-Roman findfont 12 scalefont setfont\n")
+        stream.write(" currentpoint translate\n")
+        stream.write(" % Landscape: uncomment next line\n")
+        stream.write("  90 rotate 0 21 neg 28.451 mul translate 1.5 1.5 scale\n")
+        stream.write(" % Landscape:   comment next line\n")
+        stream.write(" % 1.2 1.2 scale\n")
+        stream.write(f"{float(x0):8.3f} {float(y0):8.3f}  translate\n")
+        stream.write(" 0 setgray 0.5 setlinewidth\n")
+        ni = nint(np.float32((reference32 - emin32) / delta32)) + 1
+        nf = nint(np.float32((emax32 - reference32) / delta32)) + 1
+        for index in range(-ni, nf + 1):
+            tick = np.float32(reference32 + np.float32(index) * delta32)
+            if tick < emin32 or tick > emax32:
                 continue
-            stream.write(f"newpath {visible[0][0]:.3f} {visible[0][1]:.3f} moveto\n")
-            for x, y in visible[1:]:
-                stream.write(f"{x:.3f} {y:.3f} lineto\n")
-            stream.write("stroke\n")
-        stream.write("showpage\n%%EOF\n")
+            y = ymap(tick)
+            stream.write(
+                f"{0.0:8.3f} {float(y):8.3f}  moveto -5 0 rlineto stroke\n"
+            )
+            stream.write(
+                f"{-30.0:8.3f} {float(y):8.3f}  moveto "
+                f"({float(np.float32(tick - reference32)):5.1f}) show\n"
+            )
+        if fermi32 > emin32 and fermi32 < emax32:
+            y = ymap(fermi32)
+            stream.write(
+                f"[2 4] 0 setdash newpath {0.0:8.3f} {float(y):8.3f}  moveto \n"
+            )
+            stream.write(
+                f"{float(xdim):8.3f} {float(y):8.3f}  lineto stroke [] 0 setdash\n"
+            )
+        stream.write(" 1 setlinewidth\n")
+        _write_fortran_reals(
+            stream,
+            [
+                np.float32(0.0), np.float32(0.0), np.float32(0.0), ydim,
+                xdim, ydim, xdim, np.float32(0.0),
+            ],
+            per_record=8,
+        )
+        stream.write(" newpath moveto lineto lineto lineto closepath clip stroke\n")
+        stream.write(" 0.5 setlinewidth\n")
+        for point_index in range(data.nks):
+            x = xmap(coordinate[point_index])
+            if high_symmetry_flags[point_index]:
+                stream.write(
+                    f"{float(x):8.3f} {0.0:8.3f} {float(x):8.3f} "
+                    f"{float(ydim):8.3f}  riga\n"
+                )
+            for band in range(data.nbnd):
+                if in_range[band]:
+                    stream.write(
+                        f"{float(x):8.3f} {float(ymap(energies[point_index, band])):8.3f}  dot\n"
+                    )
+        for band in range(data.nbnd):
+            if not in_range[band]:
+                continue
+            for start, end in segments:
+                interpolation_count = 2 * (end - start) + 1
+                if interpolation_count < 7:
+                    continue
+                interpolation_x = np.linspace(
+                    coordinate[start], coordinate[end], interpolation_count,
+                    dtype=np.float32,
+                )
+                interpolation_energy = _qe_spline_interpolate(
+                    coordinate[start:end + 1],
+                    energies[start:end + 1, band],
+                    interpolation_x,
+                )
+                flattened: list[np.float32] = []
+                for index in range(interpolation_count - 1, -1, -1):
+                    flattened.extend(
+                        [xmap(interpolation_x[index]), ymap(interpolation_energy[index])]
+                    )
+                _write_fortran_reals(stream, flattened)
+                stream.write(f"{interpolation_count - 1:4d} banda\n")
+        stream.write(" grestore\n")
+        stream.write(" % delete next lines for insertion in a tex file\n")
+        stream.write("%%Page\n")
+        stream.write(" showpage\n")
     return output
 
 
 def run_plotband(options: dict[str, object]) -> tuple[Path, Path]:
-    data = read_band_file(str(options["band_file"]))
+    band_file = str(options["band_file"])
+    data = read_band_file(band_file)
+    rap_high_symmetry = _read_rap_high_symmetry(band_file, data)
     plot_file = write_gnuplot(
         str(options["plot_file"]), data
     )
@@ -124,6 +381,7 @@ def run_plotband(options: dict[str, object]) -> tuple[Path, Path]:
         float(options["emin"]), float(options["emax"]),
         float(options["fermi"]), float(options["delta"]),
         float(options["reference"]),
+        high_symmetry=rap_high_symmetry,
     )
     return plot_file, ps_file
 
@@ -183,9 +441,15 @@ def _interactive_energy_range(
     return emin, emax
 
 
-def _print_high_symmetry_points(data: BandData, stdout: TextIO) -> None:
-    coordinate = data.path_coordinate()
-    for index in high_symmetry_indices(data):
+def _print_high_symmetry_points(
+    data: BandData,
+    stdout: TextIO,
+    inherited_high_symmetry: np.ndarray | None = None,
+) -> None:
+    coordinate, high_symmetry = _qe_plot_geometry(
+        data, inherited_high_symmetry
+    )
+    for index in np.flatnonzero(high_symmetry):
         point = data.kpoints[index]
         if index == 0:
             suffix = "   x coordinate   0.0000"
@@ -207,9 +471,10 @@ def run_interactive_plotband(
     """Run the prompt-by-prompt terminal dialogue of QE ``plotband.x``."""
     input_stream = sys.stdin if stdin is None else stdin
     output_stream = sys.stdout if stdout is None else stdout
-    _filename, data = _interactive_band_file(
+    filename, data = _interactive_band_file(
         stdin=input_stream, stdout=output_stream
     )
+    rap_high_symmetry = _read_rap_high_symmetry(filename, data)
     print(
         f"Reading {data.nbnd:4d} bands at {data.nks:6d} k-points",
         file=output_stream,
@@ -218,7 +483,7 @@ def run_interactive_plotband(
     emin, emax = _interactive_energy_range(
         data, stdin=input_stream, stdout=output_stream
     )
-    _print_high_symmetry_points(data, output_stream)
+    _print_high_symmetry_points(data, output_stream, rap_high_symmetry)
 
     plot_name = _read_response(
         "output file (gnuplot/xmgr) > ",
@@ -260,7 +525,8 @@ def run_interactive_plotband(
     if delta <= 0.0:
         raise QEInputError("plotband requires deltaE > 0")
     ps_file = write_postscript(
-        ps_name, data, emin, emax, fermi, delta, reference
+        ps_name, data, emin, emax, fermi, delta, reference,
+        high_symmetry=rap_high_symmetry,
     )
     print(
         f"bands in PostScript format written to file {ps_file}",
