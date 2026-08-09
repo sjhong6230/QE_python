@@ -10,6 +10,7 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 
+from ..cli_options import add_input_file_argument
 from ..constants import EV_PER_HARTREE
 from ..errors import QEInputError, emit_qe_error
 from ..occupations import _linear_tetra_moments_block, _tetrahedra, smearing_order, wgauss
@@ -149,7 +150,7 @@ def run_dos(options: dict[str, object]) -> Path:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="dos.py")
-    parser.add_argument("-i", "-in", "--input", dest="input_file")
+    add_input_file_argument(parser)
     args = parser.parse_args(argv)
     try:
         text = Path(args.input_file).read_text(encoding="utf-8") if args.input_file else sys.stdin.read()

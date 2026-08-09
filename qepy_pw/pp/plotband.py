@@ -10,6 +10,7 @@ from typing import TextIO
 
 import numpy as np
 
+from ..cli_options import add_input_file_argument
 from ..errors import QEInputError, emit_qe_error
 from .band_data import BandData, read_band_file, write_gnuplot
 
@@ -538,9 +539,7 @@ def run_interactive_plotband(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="plotband.py")
-    parser.add_argument(
-        "-i", "-in", "-inp", "-input", "--input", dest="input_file"
-    )
+    add_input_file_argument(parser)
     args = parser.parse_args(argv)
     try:
         if args.input_file is None:

@@ -13,6 +13,7 @@ import xml.etree.ElementTree as ET
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
+from ..cli_options import add_input_file_argument
 from ..errors import QEInputError, UnsupportedFeatureError, emit_qe_error
 from ..qe_format import format_qe_closing, format_qe_duration, format_qe_opening
 from ..point_group import point_group_character_table
@@ -626,7 +627,7 @@ def run_bands(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="bands.py")
-    parser.add_argument("-i", "-in", "-inp", "--input", dest="input_file")
+    add_input_file_argument(parser)
     args = parser.parse_args(argv)
     started = time.perf_counter()
     cpu_started = time.process_time()

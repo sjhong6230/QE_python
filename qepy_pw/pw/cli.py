@@ -5,6 +5,8 @@ from __future__ import annotations
 import sys
 from typing import TYPE_CHECKING, TextIO
 
+from ..cli_options import INPUT_FILE_OPTIONS, INPUT_FILE_OPTION_SET
+
 if TYPE_CHECKING:
     from .input import PWInput
     from ..mpi import MPIContext
@@ -35,14 +37,22 @@ class _Parser:
                     + "\n\nPython scalar pw.x port (SCF, NSCF, bands)\n\n"
                     + "options:\n"
                     + "  -h, --help            show this help message and exit\n"
-                    + "  -in, -inp, --input INPUT_FILE"
+                    + "  -i, -in, -inp, -input, --input INPUT_FILE"
                 )
                 raise SystemExit(0)
-            if token.startswith("--input="):
+            option_with_value = next(
+                (
+                    option
+                    for option in INPUT_FILE_OPTIONS
+                    if token.startswith(f"{option}=")
+                ),
+                None,
+            )
+            if option_with_value is not None:
                 input_file = token.split("=", 1)[1]
                 index += 1
                 continue
-            if token in {"-in", "-inp", "--input"}:
+            if token in INPUT_FILE_OPTION_SET:
                 if index + 1 >= len(tokens):
                     print(
                         self._usage
