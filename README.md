@@ -1,4 +1,4 @@
-# qepy-pw
+_# qepy-pw
 
 `qepy-pw` is a Python implementation of the scalar, nonmagnetic SCF path of
 Quantum ESPRESSO `pw.x`. It reads QE-style input files and norm-conserving UPF
@@ -104,3 +104,7 @@ execution guide, validation/performance methodology, architecture, and
 QE-compatible diagnostics.
 
 See [PORTING.md](PORTING.md) for the compact runtime and memory notes.
+
+## Generative AI
+
+Generative AI was used for the production of the code.
