@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
+from typing import TextIO
 
 import numpy as np
 
@@ -49,6 +50,8 @@ def high_symmetry_indices(data: BandData, tolerance: float = 1.0e-7) -> list[int
     steps = np.diff(data.kpoints, axis=0)
     indices = {0, data.nks - 1}
     for index in range(1, data.nks - 1):
+        if float(np.dot(data.kpoints[index], data.kpoints[index])) < 1.0e-9:
+            indices.add(index)
         left, right = steps[index - 1], steps[index]
         left_norm, right_norm = np.linalg.norm(left), np.linalg.norm(right)
         if left_norm <= tolerance or right_norm <= tolerance:
@@ -108,7 +111,7 @@ def write_postscript(
 def run_plotband(options: dict[str, object]) -> tuple[Path, Path]:
     data = read_band_file(str(options["band_file"]))
     plot_file = write_gnuplot(
-        str(options["plot_file"]), data, reference_ev=float(options["fermi"])
+        str(options["plot_file"]), data
     )
     ps_file = write_postscript(
         str(options["ps_file"]), data,
@@ -119,15 +122,166 @@ def run_plotband(options: dict[str, object]) -> tuple[Path, Path]:
     return plot_file, ps_file
 
 
+def _read_response(
+    prompt: str,
+    *,
+    stdin: TextIO,
+    stdout: TextIO,
+) -> str:
+    """Print and flush one QE prompt before waiting for its response."""
+    print(prompt, end="", file=stdout, flush=True)
+    response = stdin.readline()
+    if response == "":
+        raise QEInputError("end of file while reading plotband input")
+    return response.rstrip("\r\n")
+
+
+def _interactive_band_file(
+    *,
+    stdin: TextIO,
+    stdout: TextIO,
+) -> tuple[str, BandData]:
+    while True:
+        filename = _read_response(
+            "     Input file > ", stdin=stdin, stdout=stdout
+        ).strip()
+        if not filename:
+            continue
+        if not Path(filename).is_file():
+            print(f"{filename}: file not found", file=stdout, flush=True)
+            continue
+        return filename, read_band_file(filename)
+
+
+def _interactive_energy_range(
+    data: BandData,
+    *,
+    stdin: TextIO,
+    stdout: TextIO,
+) -> tuple[float, float]:
+    minimum = float(np.min(data.energies_ev))
+    maximum = float(np.max(data.energies_ev))
+    response = _read_response(
+        f"Range:{minimum:10.4f}{maximum:10.4f}eV  "
+        "Emin, Emax, [firstk, lastk] > ",
+        stdin=stdin,
+        stdout=stdout,
+    )
+    try:
+        fields = response.replace("d", "e").replace("D", "E").split()
+        emin, emax = float(fields[0]), float(fields[1])
+    except (ValueError, IndexError) as exc:
+        raise QEInputError("invalid Emin/Emax in plotband input") from exc
+    if emax <= emin:
+        raise QEInputError("plotband requires Emax > Emin")
+    return emin, emax
+
+
+def _print_high_symmetry_points(data: BandData, stdout: TextIO) -> None:
+    coordinate = data.path_coordinate()
+    for index in high_symmetry_indices(data):
+        point = data.kpoints[index]
+        if index == 0:
+            suffix = "   x coordinate   0.0000"
+        else:
+            suffix = f"   x coordinate{coordinate[index]:9.4f}"
+        print(
+            "high-symmetry point: "
+            f"{point[0]:7.4f}{point[1]:7.4f}{point[2]:7.4f}{suffix}",
+            file=stdout,
+            flush=True,
+        )
+
+
+def run_interactive_plotband(
+    *,
+    stdin: TextIO | None = None,
+    stdout: TextIO | None = None,
+) -> tuple[Path | None, Path | None]:
+    """Run the prompt-by-prompt terminal dialogue of QE ``plotband.x``."""
+    input_stream = sys.stdin if stdin is None else stdin
+    output_stream = sys.stdout if stdout is None else stdout
+    _filename, data = _interactive_band_file(
+        stdin=input_stream, stdout=output_stream
+    )
+    print(
+        f"Reading {data.nbnd:4d} bands at {data.nks:6d} k-points",
+        file=output_stream,
+        flush=True,
+    )
+    emin, emax = _interactive_energy_range(
+        data, stdin=input_stream, stdout=output_stream
+    )
+    _print_high_symmetry_points(data, output_stream)
+
+    plot_name = _read_response(
+        "output file (gnuplot/xmgr) > ",
+        stdin=input_stream,
+        stdout=output_stream,
+    ).strip()
+    plot_file: Path | None = None
+    if plot_name:
+        plot_file = write_gnuplot(plot_name, data)
+        print(
+            "bands in gnuplot/xmgr format written to file "
+            f"{plot_file}",
+            file=output_stream,
+            flush=True,
+        )
+    else:
+        print("skipping ...", file=output_stream, flush=True)
+
+    ps_name = _read_response(
+        "output file (ps) > ", stdin=input_stream, stdout=output_stream
+    ).strip()
+    if not ps_name:
+        print("stopping ...", file=output_stream, flush=True)
+        return plot_file, None
+    fermi_response = _read_response(
+        "Efermi > ", stdin=input_stream, stdout=output_stream
+    )
+    tick_response = _read_response(
+        "deltaE, reference E (for tics) ",
+        stdin=input_stream,
+        stdout=output_stream,
+    )
+    try:
+        fermi = float(
+            fermi_response.replace("d", "e").replace("D", "E").split()[0]
+        )
+        tick_fields = (
+            tick_response.replace("d", "e").replace("D", "E").split()
+        )
+        delta, reference = float(tick_fields[0]), float(tick_fields[1])
+    except (ValueError, IndexError) as exc:
+        raise QEInputError("invalid numeric value in plotband input") from exc
+    if delta <= 0.0:
+        raise QEInputError("plotband requires deltaE > 0")
+    ps_file = write_postscript(
+        ps_name, data, emin, emax, fermi, delta, reference
+    )
+    print(
+        f"bands in PostScript format written to file {ps_file}",
+        file=output_stream,
+        flush=True,
+    )
+    return plot_file, ps_file
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="plotband.py")
-    parser.add_argument("-i", "-in", "--input", dest="input_file")
+    parser.add_argument(
+        "-i", "-in", "-inp", "-input", "--input", dest="input_file"
+    )
     args = parser.parse_args(argv)
     try:
-        text = Path(args.input_file).read_text(encoding="utf-8") if args.input_file else sys.stdin.read()
+        if args.input_file is None:
+            run_interactive_plotband()
+            return 0
+        text = Path(args.input_file).read_text(encoding="utf-8")
         plot_file, ps_file = run_plotband(parse_plotband_input(text))
-        print(f"     Bands in gnuplot/xmgr format written to file {plot_file}")
-        print(f"     PostScript plot written to file {ps_file}")
+        print(f"bands in gnuplot/xmgr format written to file {plot_file}")
+        print(f"bands in PostScript format written to file {ps_file}")
         return 0
     except (QEInputError, OSError, ValueError) as exc:
         print(format_qe_error(exc), end="", file=sys.stderr)

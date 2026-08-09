@@ -6,6 +6,7 @@ import h5py
 import hashlib
 from pathlib import Path
 import shutil
+import sys
 import pytest
 
 from qepy_pw.errors import QEInputError
@@ -32,7 +33,12 @@ from qepy_pw.pw.output import format_progress
 from qepy_pw.pw.buffers import WavefunctionBuffer
 from qepy_pw.pw.save import write_qe_save
 from qepy_pw.scf import run_scf
-from qepy_pw.pp.plotband import high_symmetry_indices, parse_plotband_input
+from qepy_pw.pp.plotband import (
+    high_symmetry_indices,
+    main as plotband_main,
+    parse_plotband_input,
+    run_interactive_plotband,
+)
 from qepy_pw.pp.p_matrix import momentum_matrices, write_p_avg
 from qepy_pw.qe_format import format_qe_opening
 
@@ -199,6 +205,52 @@ def test_plotband_six_line_input_and_vertices() -> None:
     )
     assert options["fermi"] == 0.5
     assert high_symmetry_indices(_data()) == [0, 1, 2]
+
+
+def test_plotband_interactive_dialogue_matches_qe(tmp_path) -> None:
+    band_file = write_band_file(tmp_path / "bands.out", _data())
+    plot_file = tmp_path / "bands.plot"
+    ps_file = tmp_path / "bands.ps"
+    stdin = io.StringIO(
+        f"{band_file}\n-3 3\n{plot_file}\n{ps_file}\n0.5\n1.0 0.0\n"
+    )
+    stdout = io.StringIO()
+
+    written_plot, written_ps = run_interactive_plotband(
+        stdin=stdin, stdout=stdout
+    )
+
+    assert written_plot == plot_file
+    assert written_ps == ps_file
+    assert plot_file.is_file()
+    assert ps_file.is_file()
+    dialogue = stdout.getvalue()
+    assert dialogue.startswith(
+        f"     Input file > Reading    2 bands at      3 k-points\n"
+        "Range:   -2.0000    2.5000eV  Emin, Emax, "
+        "[firstk, lastk] > "
+    )
+    assert "high-symmetry point:  0.0000 0.0000 0.0000" in dialogue
+    assert "output file (gnuplot/xmgr) > " in dialogue
+    assert "output file (ps) > Efermi > " in dialogue
+    assert "deltaE, reference E (for tics) " in dialogue
+
+
+def test_plotband_main_without_input_file_uses_interactive_stdin(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    band_file = write_band_file(tmp_path / "bands.out", _data())
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO(f"{band_file}\n-3 3\n\n\n"),
+    )
+
+    assert plotband_main([]) == 0
+    output = capsys.readouterr().out
+    assert output.startswith("     Input file > Reading")
+    assert "output file (gnuplot/xmgr) > skipping ..." in output
+    assert "output file (ps) > stopping ..." in output
 
 
 def test_bands_reads_pw_save_and_performs_scalar_irrep_analysis(
