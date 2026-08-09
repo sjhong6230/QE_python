@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import re
 import sys
 from typing import TextIO
 
@@ -17,6 +18,12 @@ def _meaningful_lines(text: str) -> list[str]:
     return [line.strip() for line in text.splitlines() if line.strip() and not line.lstrip().startswith(("#", "!"))]
 
 
+def _numeric_fields(text: str) -> list[str]:
+    """Split a Fortran list-directed numeric record on blanks or commas."""
+    normalized = text.replace("d", "e").replace("D", "E").strip()
+    return [field for field in re.split(r"[\s,]+", normalized) if field]
+
+
 def parse_plotband_input(text: str) -> dict[str, object]:
     """Parse QE's six-line interactive ``plotband.x`` input stream."""
     lines = _meaningful_lines(text)
@@ -26,11 +33,10 @@ def parse_plotband_input(text: str) -> dict[str, object]:
             "PostScript file, Fermi energy, and deltaE/reference energy"
         )
     try:
-        emin, emax = (float(value.replace("d", "e").replace("D", "E")) for value in lines[1].split()[:2])
-        fermi = float(lines[4].split()[0].replace("d", "e").replace("D", "E"))
+        emin, emax = (float(value) for value in _numeric_fields(lines[1])[:2])
+        fermi = float(_numeric_fields(lines[4])[0])
         delta, reference = (
-            float(value.replace("d", "e").replace("D", "E"))
-            for value in lines[5].split()[:2]
+            float(value) for value in _numeric_fields(lines[5])[:2]
         )
     except (ValueError, IndexError) as exc:
         raise QEInputError("invalid numeric value in plotband input") from exc
@@ -168,7 +174,7 @@ def _interactive_energy_range(
         stdout=stdout,
     )
     try:
-        fields = response.replace("d", "e").replace("D", "E").split()
+        fields = _numeric_fields(response)
         emin, emax = float(fields[0]), float(fields[1])
     except (ValueError, IndexError) as exc:
         raise QEInputError("invalid Emin/Emax in plotband input") from exc
@@ -246,12 +252,8 @@ def run_interactive_plotband(
         stdout=output_stream,
     )
     try:
-        fermi = float(
-            fermi_response.replace("d", "e").replace("D", "E").split()[0]
-        )
-        tick_fields = (
-            tick_response.replace("d", "e").replace("D", "E").split()
-        )
+        fermi = float(_numeric_fields(fermi_response)[0])
+        tick_fields = _numeric_fields(tick_response)
         delta, reference = float(tick_fields[0]), float(tick_fields[1])
     except (ValueError, IndexError) as exc:
         raise QEInputError("invalid numeric value in plotband input") from exc

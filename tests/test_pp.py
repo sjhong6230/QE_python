@@ -211,8 +211,12 @@ def test_upstream_qe_interleaved_wavefunction_dataset_is_read(tmp_path) -> None:
 
 def test_plotband_six_line_input_and_vertices() -> None:
     options = parse_plotband_input(
-        "bands.out\n-5 5\nbands.plot\nbands.ps\n0.5\n1.0 0.0\n"
+        "bands.out\n-5, 5\nbands.plot\nbands.ps\n0.5\n1.0,0.0\n"
     )
+    assert options["emin"] == -5.0
+    assert options["emax"] == 5.0
+    assert options["delta"] == 1.0
+    assert options["reference"] == 0.0
     assert options["fermi"] == 0.5
     assert high_symmetry_indices(_data()) == [0, 1, 2]
 
@@ -222,7 +226,7 @@ def test_plotband_interactive_dialogue_matches_qe(tmp_path) -> None:
     plot_file = tmp_path / "bands.plot"
     ps_file = tmp_path / "bands.ps"
     stdin = io.StringIO(
-        f"{band_file}\n-3 3\n{plot_file}\n{ps_file}\n0.5\n1.0 0.0\n"
+        f"{band_file}\n-3,3\n{plot_file}\n{ps_file}\n0.5\n1.0, 0.0\n"
     )
     stdout = io.StringIO()
 
