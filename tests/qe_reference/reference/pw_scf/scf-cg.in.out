@@ -1,5 +1,5 @@
 
-     Program PWSCF-PY v.1.0.0 starts on  9Aug2026 at 12: 4:25
+     Program PWSCF-PY v.1.0.0 starts on  9Aug2026 at 15: 9: 9
 
      Python reference port of the scalar SCF path in Quantum ESPRESSO pw.x
      Reading input from ./tests/qe_reference/upstream/pw_scf/scf-cg.in
@@ -98,77 +98,77 @@
        CG workspace                       37.78 KiB
        FFT/MPI workspace                  66.91 KiB
        nonlocal-projector workspace       52.31 KiB
-     Estimated total RAM, all ranks > 57.40 MiB
+     Estimated total RAM, all ranks > 67.66 MiB
 
      iteration #   1     ecut=    12.00 Ry     beta= 0.70
      CG style diagonalization
      ethr =  1.00E-05,  avg # of iterations =  5.5
      avg # of Hpsi vectors =  17.5, max residual =  1.53E-03 Ha
      total cpu time spent up to now is        0.1 secs
-     total energy              =     -15.78766653 Ry
-     estimated scf accuracy    <       0.08069413 Ry
+     total energy              =     -15.79071041 Ry
+     estimated scf accuracy    <       0.06487029 Ry
 
      iteration #   2     ecut=    12.00 Ry     beta= 0.70
      CG style diagonalization
-     ethr =  1.01E-03,  avg # of iterations =  2.0
-     avg # of Hpsi vectors =   8.0, max residual =  6.17E-03 Ha
+     ethr =  8.11E-04,  avg # of iterations =  2.0
+     avg # of Hpsi vectors =   8.0, max residual =  5.76E-03 Ha
      total cpu time spent up to now is        0.1 secs
-     total energy              =     -15.79089662 Ry
-     estimated scf accuracy    <       0.00351661 Ry
+     total energy              =     -15.79400688 Ry
+     estimated scf accuracy    <       0.00223507 Ry
 
      iteration #   3     ecut=    12.00 Ry     beta= 0.70
      CG style diagonalization
-     ethr =  4.40E-05,  avg # of iterations =  2.5
-     avg # of Hpsi vectors =  10.5, max residual =  1.82E-03 Ha
+     ethr =  2.79E-05,  avg # of iterations =  3.0
+     avg # of Hpsi vectors =  11.5, max residual =  1.32E-03 Ha
      total cpu time spent up to now is        0.1 secs
-     total energy              =     -15.79136170 Ry
-     estimated scf accuracy    <       0.00008878 Ry
+     total energy              =     -15.79450005 Ry
+     estimated scf accuracy    <       0.00006005 Ry
 
      iteration #   4     ecut=    12.00 Ry     beta= 0.70
      CG style diagonalization
-     ethr =  1.11E-06,  avg # of iterations =  3.0
-     avg # of Hpsi vectors =  12.0, max residual =  2.34E-04 Ha
+     ethr =  7.51E-07,  avg # of iterations =  3.0
+     avg # of Hpsi vectors =  12.0, max residual =  2.14E-04 Ha
      total cpu time spent up to now is        0.1 secs
-     total energy              =     -15.79138097 Ry
-     estimated scf accuracy    <       0.00000464 Ry
+     total energy              =     -15.79451386 Ry
+     estimated scf accuracy    <       0.00000445 Ry
 
      iteration #   5     ecut=    12.00 Ry     beta= 0.70
      CG style diagonalization
-     ethr =  5.80E-08,  avg # of iterations =  3.0
-     avg # of Hpsi vectors =  11.5, max residual =  8.51E-05 Ha
+     ethr =  5.57E-08,  avg # of iterations =  3.0
+     avg # of Hpsi vectors =  11.5, max residual =  1.15E-04 Ha
      total cpu time spent up to now is        0.1 secs
-     total energy              =     -15.79138169 Ry
-     estimated scf accuracy    <       0.00000006 Ry
+     total energy              =     -15.79451452 Ry
+     estimated scf accuracy    <       0.00000004 Ry
 
      End of self-consistent calculation
 
           k = 0.2500 0.2500 0.2500 (   180 PWs)   bands (ev):
 
-    -4.8576   2.4099   5.5501   5.5859
+    -4.8701   2.3792   5.5371   5.5371
 
      occupation numbers
      1.0000   1.0000   1.0000   1.0000
           k = 0.2500 0.2500 0.7500 (   186 PWs)   bands (ev):
 
-    -2.9145  -0.0334   2.7283   4.0549
+    -2.9165  -0.0653   2.6795   4.0355
 
      occupation numbers
      1.0000   1.0000   1.0000   1.0000
 
-     highest occupied level (ev):     5.5859
+     highest occupied level (ev):     5.5371
 
-!    total energy              =     -15.79138169 Ry
-     estimated scf accuracy    <       0.00000006 Ry
+!    total energy              =     -15.79451452 Ry
+     estimated scf accuracy    <       0.00000004 Ry
 
      The total energy is the sum of the following terms:
-     one-electron contribution =       4.83314252 Ry
-     hartree contribution      =       1.10083231 Ry
-     xc contribution           =      -4.82557897 Ry
+     one-electron contribution =       4.83378216 Ry
+     hartree contribution      =       1.08429875 Ry
+     xc contribution           =      -4.81281787 Ry
      ewald contribution        =     -16.89977755 Ry
 
      convergence has been achieved in   5 iterations
 
-     Measured peak RAM, all ranks = 56.42 MiB (aggregate PSS, sampled)
+     Measured peak RAM, all ranks = 66.68 MiB (aggregate PSS, sampled)
 
      init_run     :      0.05s CPU      0.06s WALL (       1 calls)
      electrons    :      0.06s CPU      0.06s WALL (       1 calls)
@@ -180,7 +180,7 @@
      sym_rho:init :      0.01s CPU      0.01s WALL (       1 calls)
 
      Called by electrons:
-     c_bands      :      0.04s CPU      0.04s WALL (       5 calls)
+     c_bands      :      0.05s CPU      0.05s WALL (       5 calls)
      sum_band     :      0.00s CPU      0.00s WALL (       5 calls)
      v_of_rho     :      0.00s CPU      0.00s WALL (       6 calls)
      v_h          :      0.00s CPU      0.00s WALL (       1 calls)
@@ -191,7 +191,7 @@
      sum_band:wfc    :      0.00s CPU      0.00s WALL (      10 calls)
      sum_band:rho    :      0.00s CPU      0.00s WALL (       0 calls)
      sum_band:collect:      0.00s CPU      0.00s WALL (       0 calls)
-     sum_band:sym    :      0.00s CPU      0.00s WALL (       0 calls)
+     sum_band:sym    :      0.00s CPU      0.00s WALL (       5 calls)
 
      Called by c_bands:
      init_us_2    :      0.01s CPU      0.01s WALL (      10 calls)
@@ -203,17 +203,17 @@
      g_psi        :      0.00s CPU      0.00s WALL (       0 calls)
 
      Called by h_psi:
-     h_psi        :      0.01s CPU      0.01s WALL (      97 calls)
-     h_psi:calbec :      0.00s CPU      0.00s WALL (      97 calls)
-     vloc_psi     :      0.01s CPU      0.01s WALL (      97 calls)
-     add_vuspsi   :      0.00s CPU      0.00s WALL (      97 calls)
-     fftw         :      0.01s CPU      0.01s WALL (     150 calls)
-     calbec       :      0.00s CPU      0.00s WALL (      97 calls)
+     h_psi        :      0.01s CPU      0.01s WALL (      99 calls)
+     h_psi:calbec :      0.00s CPU      0.00s WALL (      99 calls)
+     vloc_psi     :      0.01s CPU      0.01s WALL (      99 calls)
+     add_vuspsi   :      0.00s CPU      0.00s WALL (      99 calls)
+     fftw         :      0.01s CPU      0.01s WALL (     157 calls)
+     calbec       :      0.00s CPU      0.00s WALL (      99 calls)
 
-     PWSCF        :      0.11s CPU      0.12s WALL
+     PWSCF        :      0.12s CPU      0.13s WALL
 
 
-   This run was terminated on:  12: 4:25  9Aug2026
+   This run was terminated on:  15: 9: 9  9Aug2026
 
 =------------------------------------------------------------------------------=
    JOB DONE.

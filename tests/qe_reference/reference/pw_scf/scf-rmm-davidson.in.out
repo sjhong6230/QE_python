@@ -1,5 +1,5 @@
 
-     Program PWSCF-PY v.1.0.0 starts on  9Aug2026 at 12: 4:25
+     Program PWSCF-PY v.1.0.0 starts on  9Aug2026 at 15: 9: 9
 
      Python reference port of the scalar SCF path in Quantum ESPRESSO pw.x
      Reading input from ./tests/qe_reference/upstream/pw_scf/scf-rmm-davidson.in
@@ -98,87 +98,87 @@
        RMM/Davidson workspace            151.12 KiB
        FFT/MPI workspace                  66.91 KiB
        nonlocal-projector workspace       52.31 KiB
-     Estimated total RAM, all ranks > 57.86 MiB
+     Estimated total RAM, all ranks > 67.79 MiB
 
      iteration #   1     ecut=    12.00 Ry     beta= 0.70
      Davidson diagonalization with overlap
-     ethr =  9.36E-04,  avg # of iterations =  1.0
+     ethr =  7.29E-04,  avg # of iterations =  1.0
      avg # of Hpsi vectors =   8.0, max residual =  7.79E-03 Ha
      total cpu time spent up to now is        0.1 secs
-     total energy              =     -15.78785863 Ry
-     estimated scf accuracy    <       0.07957679 Ry
+     total energy              =     -15.79100648 Ry
+     estimated scf accuracy    <       0.06343428 Ry
 
      iteration #   2     ecut=    12.00 Ry     beta= 0.70
      Davidson diagonalization with overlap
-     ethr =  9.95E-04,  avg # of iterations =  1.0
-     avg # of Hpsi vectors =   8.0, max residual =  5.53E-03 Ha
+     ethr =  7.93E-04,  avg # of iterations =  1.0
+     avg # of Hpsi vectors =   8.0, max residual =  5.20E-03 Ha
      total cpu time spent up to now is        0.1 secs
-     total energy              =     -15.79098662 Ry
-     estimated scf accuracy    <       0.00363374 Ry
+     total energy              =     -15.79410923 Ry
+     estimated scf accuracy    <       0.00233073 Ry
 
      iteration #   3     ecut=    12.00 Ry     beta= 0.70
      RMM-DIIS diagonalization
-     ethr =  4.54E-05,  avg # of iterations =  1.1
-     avg # of Hpsi vectors =   8.5, max residual =  3.03E-03 Ha
+     ethr =  2.91E-05,  avg # of iterations =  1.5
+     avg # of Hpsi vectors =  10.0, max residual =  2.41E-03 Ha
      total cpu time spent up to now is        0.1 secs
-     total energy              =     -15.79126708 Ry
-     estimated scf accuracy    <       0.00006727 Ry
+     total energy              =     -15.79444324 Ry
+     estimated scf accuracy    <       0.00005562 Ry
 
      iteration #   4     ecut=    12.00 Ry     beta= 0.70
      RMM-DIIS diagonalization
-     ethr =  8.41E-07,  avg # of iterations =  3.5
-     avg # of Hpsi vectors =  18.0, max residual =  1.74E-04 Ha
+     ethr =  6.95E-07,  avg # of iterations =  3.1
+     avg # of Hpsi vectors =  16.5, max residual =  1.91E-04 Ha
      total cpu time spent up to now is        0.1 secs
-     total energy              =     -15.79138195 Ry
-     estimated scf accuracy    <       0.00002368 Ry
+     total energy              =     -15.79451462 Ry
+     estimated scf accuracy    <       0.00000300 Ry
 
      iteration #   5     ecut=    12.00 Ry     beta= 0.70
      Davidson diagonalization with overlap
-     ethr =  2.96E-07,  avg # of iterations =  1.0
-     avg # of Hpsi vectors =   8.0, max residual =  9.77E-05 Ha
+     ethr =  3.75E-08,  avg # of iterations =  2.0
+     avg # of Hpsi vectors =  12.0, max residual =  7.18E-05 Ha
      total cpu time spent up to now is        0.1 secs
-     total energy              =     -15.79138103 Ry
-     estimated scf accuracy    <       0.00000455 Ry
+     total energy              =     -15.79451420 Ry
+     estimated scf accuracy    <       0.00000437 Ry
 
      iteration #   6     ecut=    12.00 Ry     beta= 0.70
      RMM-DIIS diagonalization
-     ethr =  5.69E-08,  avg # of iterations =  1.6
-     avg # of Hpsi vectors =  10.5, max residual =  1.04E-04 Ha
+     ethr =  3.75E-08,  avg # of iterations =  1.2
+     avg # of Hpsi vectors =   9.0, max residual =  6.35E-05 Ha
      total cpu time spent up to now is        0.1 secs
-     total energy              =     -15.79138164 Ry
-     estimated scf accuracy    <       0.00000002 Ry
+     total energy              =     -15.79451448 Ry
+     estimated scf accuracy    <       0.00000001 Ry
 
      End of self-consistent calculation
 
           k = 0.2500 0.2500 0.2500 (   180 PWs)   bands (ev):
 
-    -4.8577   2.4097   5.5497   5.5858
+    -4.8704   2.3789   5.5367   5.5367
 
      occupation numbers
      1.0000   1.0000   1.0000   1.0000
           k = 0.2500 0.2500 0.7500 (   186 PWs)   bands (ev):
 
-    -2.9147  -0.0337   2.7283   4.0547
+    -2.9168  -0.0657   2.6793   4.0352
 
      occupation numbers
      1.0000   1.0000   1.0000   1.0000
 
-     highest occupied level (ev):     5.5858
+     highest occupied level (ev):     5.5367
 
-!    total energy              =     -15.79138164 Ry
-     estimated scf accuracy    <       0.00000002 Ry
+!    total energy              =     -15.79451448 Ry
+     estimated scf accuracy    <       0.00000001 Ry
 
      The total energy is the sum of the following terms:
-     one-electron contribution =       4.83321858 Ry
-     hartree contribution      =       1.10070898 Ry
-     xc contribution           =      -4.82553165 Ry
+     one-electron contribution =       4.83353764 Ry
+     hartree contribution      =       1.08468403 Ry
+     xc contribution           =      -4.81295860 Ry
      ewald contribution        =     -16.89977755 Ry
 
      convergence has been achieved in   6 iterations
 
-     Measured peak RAM, all ranks = 56.76 MiB (aggregate PSS, sampled)
+     Measured peak RAM, all ranks = 66.69 MiB (aggregate PSS, sampled)
 
-     init_run     :      0.05s CPU      0.06s WALL (       1 calls)
+     init_run     :      0.06s CPU      0.07s WALL (       1 calls)
      electrons    :      0.07s CPU      0.07s WALL (       1 calls)
 
      Called by init_run:
@@ -199,29 +199,29 @@
      sum_band:wfc    :      0.00s CPU      0.00s WALL (      14 calls)
      sum_band:rho    :      0.00s CPU      0.00s WALL (       0 calls)
      sum_band:collect:      0.00s CPU      0.00s WALL (       0 calls)
-     sum_band:sym    :      0.00s CPU      0.00s WALL (       0 calls)
+     sum_band:sym    :      0.00s CPU      0.00s WALL (       7 calls)
 
      Called by c_bands:
      init_us_2    :      0.01s CPU      0.01s WALL (      14 calls)
      cegterg      :      0.01s CPU      0.01s WALL (       8 calls)
-     cdiaghg      :      0.00s CPU      0.00s WALL (      14 calls)
-     cegterg:over :      0.00s CPU      0.00s WALL (      18 calls)
-     cegterg:upda :      0.00s CPU      0.00s WALL (      14 calls)
-     cegterg:last :      0.00s CPU      0.00s WALL (       2 calls)
-     g_psi        :      0.00s CPU      0.00s WALL (      10 calls)
+     cdiaghg      :      0.00s CPU      0.00s WALL (      16 calls)
+     cegterg:over :      0.00s CPU      0.00s WALL (      20 calls)
+     cegterg:upda :      0.00s CPU      0.00s WALL (      16 calls)
+     cegterg:last :      0.00s CPU      0.00s WALL (       4 calls)
+     g_psi        :      0.00s CPU      0.00s WALL (      12 calls)
 
      Called by h_psi:
-     h_psi        :      0.01s CPU      0.01s WALL (      39 calls)
-     h_psi:calbec :      0.00s CPU      0.00s WALL (      39 calls)
-     vloc_psi     :      0.01s CPU      0.01s WALL (      39 calls)
-     add_vuspsi   :      0.00s CPU      0.00s WALL (      39 calls)
-     fftw         :      0.01s CPU      0.01s WALL (     111 calls)
-     calbec       :      0.00s CPU      0.00s WALL (      39 calls)
+     h_psi        :      0.01s CPU      0.01s WALL (      42 calls)
+     h_psi:calbec :      0.00s CPU      0.00s WALL (      42 calls)
+     vloc_psi     :      0.01s CPU      0.01s WALL (      42 calls)
+     add_vuspsi   :      0.00s CPU      0.00s WALL (      42 calls)
+     fftw         :      0.01s CPU      0.01s WALL (     121 calls)
+     calbec       :      0.00s CPU      0.00s WALL (      42 calls)
 
-     PWSCF        :      0.12s CPU      0.13s WALL
+     PWSCF        :      0.13s CPU      0.14s WALL
 
 
-   This run was terminated on:  12: 4:25  9Aug2026
+   This run was terminated on:  15: 9:10  9Aug2026
 
 =------------------------------------------------------------------------------=
    JOB DONE.

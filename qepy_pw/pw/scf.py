@@ -3294,7 +3294,11 @@ def _run_scf(
         )
         if not retain_occupied_states:
             del eigenvectors
-        if pw.full_kpoint_count > len(pw.kpoints):
+        # QE calls sym_rho from sum_band for every nontrivial crystal space
+        # group.  K-point reduction is independent of this projection: a
+        # Gamma-only calculation has a single full/irreducible k point but
+        # may still carry multidimensional little-group representations.
+        if len(pw.symmetry_operations) > 1:
             symmetry_started = timers.start()
             rho_out = density_symmetrizer.apply(rho_out)
             total_density = mpi.sum_scalar(float(np.sum(rho_out)))
