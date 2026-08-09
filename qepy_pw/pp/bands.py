@@ -206,12 +206,13 @@ def _symmetry_matrix(kpoint, miller, coefficients, operation) -> np.ndarray:
         destination = np.asarray([lookup[tuple(row)] for row in target], dtype=int)
     except KeyError as exc:
         raise QEInputError("symmetry-transformed plane wave is absent from saved basis") from exc
-    # For x' = x S + t, the scalar-wavefunction action is
-    # (U psi)(x') = psi((x' - t) S^-1).  A source plane wave q therefore
-    # lands at q' = q S^-T with phase exp(-i 2pi q'.t).  The sign is invisible
-    # for symmorphic operations, but the opposite sign mixes distinct
-    # diamond Gamma irreps for operations that exchange the two atoms.
-    phase = np.exp(-2j * np.pi * (transformed @ operation.translation))
+    # QE's rotate_all_psi acts on the lattice-periodic part u_k, not on the
+    # complete Bloch function.  After q=k+G is rotated back into the same
+    # little-group k point, ``target`` is the destination G index.  Its
+    # translation phase is exp(-i 2pi G'.t); using q' instead adds an
+    # operation-dependent Bloch phase and corrupts general-k irreps whenever
+    # the little-group operation carries a reciprocal shift.
+    phase = np.exp(-2j * np.pi * (target @ operation.translation))
     transformed_coefficients = np.empty_like(coefficients)
     transformed_coefficients[destination] = phase[:, None] * coefficients
     return coefficients.conj().T @ transformed_coefficients
@@ -446,6 +447,7 @@ def write_irrep_file(
             f" &plot_rap nbnd_rap={data.nbnd:4d}, nks_rap={len(points):4d} /\n"
         )
         for index, (point, labels) in enumerate(zip(points, labels_by_point)):
+            point = np.where(np.abs(point) < 5.0e-7, 0.0, point)
             stream.write(
                 "          "
                 + "".join(f"{value:10.6f}" for value in point)

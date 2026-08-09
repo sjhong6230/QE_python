@@ -20,6 +20,7 @@ from qepy_pw.pp.band_data import (
 )
 from qepy_pw.pp.bands import (
     _read_wavefunctions,
+    _symmetry_matrix,
     classify_irreps,
     main as bands_main,
     reorder_by_overlap,
@@ -41,6 +42,7 @@ from qepy_pw.pp.plotband import (
 )
 from qepy_pw.pp.p_matrix import momentum_matrices, write_p_avg
 from qepy_pw.qe_format import format_qe_opening
+from qepy_pw.symmetry import SymmetryOperation
 
 
 def _data() -> BandData:
@@ -152,6 +154,14 @@ def test_irrep_file_applies_first_and_last_k_range(tmp_path) -> None:
         "            0.500000  0.000000  0.000000    T\n"
         "       1       1\n"
     )
+
+
+def test_irrep_file_formats_roundoff_zero_like_qe(tmp_path) -> None:
+    data = BandData(np.array([[-1.0e-14, 0.0, 0.0]]), np.array([[0.0]]))
+    path = write_irrep_file(
+        tmp_path / "bands.out.rap", data, np.ones((1, 1), dtype=int)
+    )
+    assert "-0.000000" not in path.read_text(encoding="utf-8")
 
 
 def test_bands_header_contains_qe_environment_opening() -> None:
@@ -342,6 +352,19 @@ def test_irrep_analysis_uses_qe_fractional_translation_phase(tmp_path) -> None:
     data = BandData(np.zeros((1, 3)), np.array([[0.0, 1.0]]))
     labels = classify_irreps(data, [(miller, coefficients)], save)
     np.testing.assert_array_equal(labels, [[2, 1]])
+
+
+def test_general_k_symmetry_rotates_qe_periodic_part_not_full_bloch_wave() -> None:
+    kpoint = np.array([0.25, 0.0, 0.0])
+    miller = np.array([[0, 1, 0], [0, -1, 0]], dtype=np.int32)
+    coefficients = np.eye(2, dtype=complex)
+    glide = SymmetryOperation(
+        np.diag([1, -1, 1]), np.array([0.5, 0.0, 0.0])
+    )
+    matrix = _symmetry_matrix(kpoint, miller, coefficients, glide)
+    # The periodic G indices carry no x component, so QE's translation phase
+    # is one. Applying it to k+G instead would add exp(-i*pi/4) globally.
+    np.testing.assert_allclose(matrix, [[0.0, 1.0], [1.0, 0.0]])
 
 
 def test_scf_nscf_save_order_and_bands_inp_integration(

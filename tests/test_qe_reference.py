@@ -84,6 +84,27 @@ def test_qe_diamond_character_classes_use_the_printed_symmetry_indices():
         assert f"     {point_class.label:<5s}{rendered_indices}" in output
 
 
+def test_c2v_mirror_classes_follow_qe_double_group_axis_order():
+    """QE fixes B1/B2 by mirror normals, not discovery order."""
+    operations = (
+        SymmetryOperation(np.eye(3, dtype=int), np.zeros(3)),
+        SymmetryOperation(np.diag([-1, -1, 1]), np.zeros(3)),
+        # Deliberately provide the y-normal mirror before the x-normal one.
+        SymmetryOperation(np.diag([1, -1, 1]), np.zeros(3)),
+        SymmetryOperation(np.diag([-1, 1, 1]), np.zeros(3)),
+    )
+    table = point_group_character_table(
+        SimpleNamespace(lattice=np.eye(3)), operations
+    )
+    assert table.schoenflies == "C_2v"
+    assert [item.label for item in table.classes] == [
+        "E", "C2", "s_v", "s_v'",
+    ]
+    # For principal z, QE is_c2v orders normal x before normal y.
+    assert table.classes[2].operation_indices == (4,)
+    assert table.classes[3].operation_indices == (3,)
+
+
 def test_gamma_only_scf_still_projects_density_onto_crystal_symmetry(
     monkeypatch,
 ):
