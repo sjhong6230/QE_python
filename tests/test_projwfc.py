@@ -13,7 +13,10 @@ from qepy_pw.pp.projwfc import (
     Orbital,
     ProjectionData,
     _dos_kernel,
+    _format_projection_summary,
     _lowdin_basis,
+    _qe_projection_order,
+    _qe_e11_3,
     run_projwfc,
     symmetrize_projection_weights,
 )
@@ -94,7 +97,7 @@ def test_projwfc_end_to_end_on_saved_scalar_wavefunctions(
     assert np.max(np.sum(data.projections, axis=2)) <= 1.0 + 1.0e-10
     assert all(path.is_file() and path.stat().st_size > 0 for path in paths)
     total = (tmp_path / "si.pdos_tot").read_text(encoding="utf-8").splitlines()
-    assert total[0] == "# E (eV) DOS(E) PDOS(E)"
+    assert total[0] == "# E (eV)  dos(E)    pdos(E)"
     assert (tmp_path / "pwscf.save" / "atomic_proj.xml").is_file()
     report = stdout.getvalue()
     assert "     Reading xml data from directory:\n\n" in report
@@ -102,6 +105,8 @@ def test_projwfc_end_to_end_on_saved_scalar_wavefunctions(
         "     Gaussian broadening (read from input): "
         "ngauss,degauss=   0    0.020000\n"
     ) in report
+    assert "     IMPORTANT: XC functional enforced from input :\n" in report
+    assert "     Exchange-correlation= PZ\n" in report
 
 
 def test_kresolved_projwfc_writes_each_energy_and_k_point(
@@ -124,11 +129,23 @@ def test_kresolved_projwfc_writes_each_energy_and_k_point(
     lines = (tmp_path / "si-k.pdos_tot").read_text(
         encoding="utf-8"
     ).splitlines()
-    assert lines[0] == "# ik E (eV) DOS(E) PDOS(E)"
-    assert len(lines) == 1 + len(data.weights) * 3
-    assert {int(line.split()[0]) for line in lines[1:]} == set(
+    assert lines[0] == "# ik    E (eV)  dos(E)    pdos(E)"
+    data_lines = [line for line in lines[1:] if line]
+    assert len(data_lines) % len(data.weights) == 0
+    assert {int(line.split()[0]) for line in data_lines} == set(
         range(1, len(data.weights) + 1)
     )
+
+
+def test_qe_pdos_exponent_format() -> None:
+    assert _qe_e11_3(5.12e-4) == "  0.512E-03"
+    assert _qe_e11_3(-5.12e-4) == " -0.512E-03"
+    assert _qe_e11_3(0.0) == "  0.000E+00"
+
+
+def test_qe_projection_order_preserves_state_order_for_numerical_ties() -> None:
+    weights = np.asarray([0.16000, 0.15995, 0.16003, 0.20, 0.01])
+    assert _qe_projection_order(weights).tolist() == [3, 0, 1, 2, 4]
 
 
 def test_box_ldos_full_grid_has_unit_state_weights(
@@ -172,17 +189,32 @@ def test_projwfc_main_uses_qe_projection_summary(
         orbitals=(Orbital(1, "Si", 1, 0, 0, "3S"),),
         overlaps=(np.eye(1),),
         fermi_ev=0.0,
+        kpoints=np.zeros((1, 3)),
+        plane_waves=np.asarray([123]),
+        nkb=4,
     )
+    def fake_run(_options, stdout=None):
+        if stdout is not None:
+            print("\n     Calling projwave .... ", file=stdout)
+            print(_format_projection_summary(data), file=stdout)
+        return data, []
+
     monkeypatch.setattr(
         projwfc_module,
         "run_projwfc",
-        lambda _options, stdout=None: (data, []),
+        fake_run,
     )
 
     assert projwfc_module.main(["-inp", str(source)]) == 0
     output = capsys.readouterr().out
     assert output.startswith("\n     Program PROJWFC-PY v.")
     assert "     Atomic states used for projection\n" in output
+    assert "     Calling projwave .... " in output
+    assert "  Problem Sizes \n" in output
+    assert "  natomwfc =            1\n" in output
+    assert "  npwx     =          123\n" in output
+    assert "==== e(   1) =     0.00000 eV ==== " in output
+    assert "    |psi|^2 = 0.900" in output
     assert "     state #   1: atom   1 (Si ), wfc  1 (l=0 m= 1)" in output
     assert "\nLowdin Charges: \n" in output
     assert "     Atom #   1: total charge =   1.8000, s =  1.8000, " in output

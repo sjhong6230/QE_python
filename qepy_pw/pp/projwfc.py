@@ -28,6 +28,14 @@ from .namelist import parse_namelist
 
 
 _L_NAMES = "spdfgh"
+_SAVED_XC_OUTPUT = {
+    "SLA PZ NOGX NOGC": ("PZ", "1   1   0   0"),
+    "SLA PW NOGX NOGC": ("PW", "1   4   0   0"),
+    "SLA PW PBX PBC": ("PBE", "1   4   3   4"),
+    "SLA PW PSX PSC": ("PBEsol", "1   4  10   8"),
+    "SLA PW REVX PBC": ("revPBE", "1   4   4   4"),
+    "SLA PW HHNX PBC": ("RPBE", "1   4  44   4"),
+}
 _ALLOWED = {
     "prefix", "outdir", "ngauss", "degauss", "emin", "emax", "deltae",
     "lsym", "diag_basis", "pawproj", "filpdos", "filproj",
@@ -57,6 +65,9 @@ class ProjectionData:
     orbitals: tuple[Orbital, ...]
     overlaps: tuple[np.ndarray, ...]
     fermi_ev: float | None
+    kpoints: np.ndarray | None = None
+    plane_waves: np.ndarray | None = None
+    nkb: int = 0
 
 
 @dataclass(frozen=True)
@@ -113,6 +124,30 @@ def _saved_geometry(directory: Path):
     if not operations:
         operations.append(SymmetryOperation(np.eye(3, dtype=int), np.zeros(3)))
     return lattice, reciprocal, atoms, species_files, tuple(operations)
+
+
+def _saved_xc_notice(directory: Path) -> str | None:
+    """Return the XC-enforcement notice emitted while QE reads its XML."""
+    try:
+        root = ET.parse(directory / "data-file-schema.xml").getroot()
+    except (OSError, ET.ParseError):
+        return None
+    functional = root.findtext(
+        "qes:input/qes:dft/qes:functional",
+        default="",
+        namespaces={"qes": QES_NAMESPACE},
+    ).strip()
+    output = _SAVED_XC_OUTPUT.get(functional)
+    if output is None:
+        return None
+    name, indices = output
+    return (
+        "     IMPORTANT: XC functional enforced from input :\n"
+        f"     Exchange-correlation= {name}\n"
+        f"                           (   {indices}   0   0   0)\n"
+        "     Any further DFT definition will be discarded\n"
+        "     Please, verify this is what you really want"
+    )
 
 
 def _orbital_basis(
@@ -287,6 +322,10 @@ def compute_projections(
         raise QEInputError(f"cannot read saved occupations: {exc}") from exc
     ns = {"qes": QES_NAMESPACE}
     records = root.findall("qes:output/qes:band_structure/qes:ks_energies", ns)
+    structure = root.find("qes:output/qes:atomic_structure", ns)
+    if structure is None or "alat" not in structure.attrib:
+        raise QEInputError("saved data contains no lattice parameter")
+    alat = float(structure.attrib["alat"])
     occupations = np.vstack([
         np.fromstring(record.findtext("qes:occupations", default="", namespaces=ns), sep=" ")
         for record in records
@@ -294,6 +333,7 @@ def compute_projections(
     if occupations.shape != saved.eigenvalues_ev.shape:
         raise QEInputError("saved occupations do not match the eigenvalues")
     all_amplitudes, overlaps = [], []
+    kpoints, plane_wave_counts = [], []
     orbitals = None
     geometry = _saved_geometry(directory)
     pseudo_cache = {}
@@ -317,6 +357,10 @@ def compute_projections(
         amplitudes = orthogonal.conj().T @ wavefunctions
         all_amplitudes.append(amplitudes.T)
         overlaps.append(overlap)
+        # Wavefunction files store Cartesian k in bohr^-1, whereas QE reports
+        # projwfc k points in units of 2 pi / alat.
+        kpoints.append(kpoint * alat / (2.0 * np.pi))
+        plane_wave_counts.append(len(miller))
     assert orbitals is not None
     amplitudes_array = np.asarray(all_amplitudes)
     lattice, _reciprocal, atoms, _species, operations = geometry
@@ -335,16 +379,46 @@ def compute_projections(
         if symmetrize or diag_basis
         else np.abs(amplitudes_array) ** 2
     )
-    return ProjectionData(saved.eigenvalues_ev, saved.weights, projections, amplitudes_array, occupations, orbitals, tuple(overlaps), saved.fermi_ev)
+    nkb = sum(
+        pseudo_cache[symbol].number_of_projector_channels
+        for symbol, _position in atoms
+    )
+    return ProjectionData(
+        saved.eigenvalues_ev,
+        saved.weights,
+        projections,
+        amplitudes_array,
+        occupations,
+        orbitals,
+        tuple(overlaps),
+        saved.fermi_ev,
+        np.asarray(kpoints),
+        np.asarray(plane_wave_counts, dtype=np.int32),
+        nkb,
+    )
 
 
-def _dos_kernel(energies: np.ndarray, grid: np.ndarray, width: float, ngauss: int) -> np.ndarray:
+def _dos_kernel(
+    energies: np.ndarray,
+    grid: np.ndarray,
+    width: float,
+    ngauss: int,
+    delta: float | None = None,
+) -> np.ndarray:
     if ngauss not in {0, 1, -1, -99}:
         raise QEInputError("ngauss must be 0, 1, -1, or -99")
     if width <= 0:
         raise QEInputError("projected DOS requires positive degauss")
     x = (grid[:, None, None] - energies[None, :, :]) / width
-    return smearing_density(x, ngauss) / width
+    kernel = smearing_density(x, ngauss) / width
+    if delta is not None:
+        centers = np.floor(
+            (energies - float(grid[0])) / delta + 0.5
+        ).astype(np.int64)
+        radius = int(5.0 * width / delta) + 1
+        indices = np.arange(len(grid), dtype=np.int64)[:, None, None]
+        kernel[np.abs(indices - centers[None, :, :]) > radius] = 0.0
+    return kernel
 
 
 def _indexed_box(options: dict[str, object], stem: str, box: int, shape) -> tuple[np.ndarray, ...]:
@@ -509,6 +583,51 @@ def _smearing_parameters(
     return delta / (0.5 * EV_PER_HARTREE), 0, "default values"
 
 
+def _projection_grid(
+    data: ProjectionData, options: dict[str, object], width: float, delta: float
+) -> np.ndarray:
+    lower = float(np.min(data.energies_ev)) - 3.0 * width
+    upper = float(np.max(data.energies_ev)) + 3.0 * width
+    emin = max(float(options.get("emin", lower)), lower)
+    emax = min(float(options.get("emax", upper)), upper)
+    if emax < emin:
+        raise QEInputError("Emax must be greater than or equal to Emin")
+    last_index = int(np.floor((emax - emin) / delta + 1.000001))
+    return emin + np.arange(last_index + 1) * delta
+
+
+def _qe_e11_3(value: float) -> str:
+    """Format one value like Fortran ``E11.3`` used by ``partialdos``."""
+    number = float(value)
+    if number == 0.0:
+        return "  0.000E+00"
+    # Python's normalized E format performs the rounding in C. Moving its
+    # leading digit behind the decimal point then gives Fortran's 0.xxx form
+    # without an expensive log10/power calculation for every PDOS value.
+    mantissa, raw_exponent = f"{abs(number):.2E}".split("E")
+    digits = mantissa.replace(".", "")
+    exponent = int(raw_exponent) + 1
+    sign = "-" if number < 0.0 else ""
+    return f"{sign}0.{digits}E{exponent:+03d}".rjust(11)
+
+
+def _write_qe_pdos_block(
+    stream: TextIO,
+    grid: np.ndarray,
+    values: np.ndarray,
+    *,
+    kpoint: int | None = None,
+) -> None:
+    prefix = "" if kpoint is None else f"{kpoint:5d} "
+    lines = [
+        prefix
+        + f"{energy:8.3f}"
+        + "".join(map(_qe_e11_3, row))
+        for energy, row in zip(grid, values)
+    ]
+    stream.write("\n".join(lines) + "\n")
+
+
 def run_projwfc(
     options: dict[str, object], stdout: TextIO | None = None
 ) -> tuple[ProjectionData | BoxData, list[Path]]:
@@ -532,6 +651,9 @@ def run_projwfc(
             f"     {directory}{os.sep}",
             file=stdout,
         )
+        xc_notice = _saved_xc_notice(directory)
+        if xc_notice is not None:
+            print(f"\n{xc_notice}\n", file=stdout)
     saved = read_saved_dos(prefix, outdir)
     input_degauss = float(options.get("degauss", 0.0))
     if saved.occupations_kind.lower().startswith("tetra") and input_degauss == 0.0:
@@ -548,55 +670,90 @@ def run_projwfc(
         )
     if bool(options.get("tdosinboxes", False)):
         return _run_boxes(options, prefix, outdir)
+    if stdout is not None:
+        print("\n     Calling projwave .... ", file=stdout)
     data = compute_projections(
         prefix, outdir, symmetrize=bool(options.get("lsym", True)),
         diag_basis=bool(options.get("diag_basis", False)),
     )
+    if stdout is not None:
+        print(
+            _format_projection_summary(
+                data, diag_basis=bool(options.get("diag_basis", False))
+            ),
+            file=stdout,
+        )
     width = 0.5 * degauss_ry * EV_PER_HARTREE
-    emin = float(options.get("emin", np.min(data.energies_ev) - 3.0 * width))
-    emax = float(options.get("emax", np.max(data.energies_ev) + 3.0 * width))
-    if emax < emin:
-        raise QEInputError("Emax must be greater than or equal to Emin")
-    grid = emin + np.arange(int(np.floor((emax - emin) / delta + 1.000001))) * delta
-    kernel = _dos_kernel(data.energies_ev, grid, width, ngauss)
+    grid = _projection_grid(data, options, width, delta)
+    kernel = _dos_kernel(data.energies_ev, grid, width, ngauss, delta)
     kresolved = bool(options.get("kresolveddos", False))
-    weights = np.ones_like(data.weights) if kresolved else data.weights
-    total = 2.0 * np.einsum("ekb,k->e", kernel, weights)
-    projected = 2.0 * np.einsum("ekb,k,kbo->eo", kernel, weights, data.projections)
+    if kresolved:
+        dos_by_k = np.sum(kernel, axis=2)
+        projected_by_k = np.einsum(
+            "ekb,kbo->eko", kernel, data.projections
+        )
+    else:
+        total = 2.0 * np.einsum("ekb,k->e", kernel, data.weights)
+        projected = 2.0 * np.einsum(
+            "ekb,k,kbo->eo", kernel, data.weights, data.projections
+        )
     base = str(options.get("filpdos", prefix))
     paths = []
     total_path = Path(f"{base}.pdos_tot")
     with total_path.open("w", encoding="utf-8", newline="\n") as stream:
         if kresolved:
-            stream.write("# ik E (eV) DOS(E) PDOS(E)\n")
+            stream.write("# ik    E (eV)  dos(E)    pdos(E)\n")
             for ik in range(len(data.weights)):
-                dos_k = 2.0 * np.sum(kernel[:, ik, :], axis=1)
-                pdos_k = 2.0 * np.einsum(
-                    "eb,bo->e", kernel[:, ik, :], data.projections[ik]
+                _write_qe_pdos_block(
+                    stream,
+                    grid,
+                    np.column_stack(
+                        (dos_by_k[:, ik], np.sum(projected_by_k[:, ik], axis=1))
+                    ),
+                    kpoint=ik + 1,
                 )
-                for energy, dos, pdos in zip(grid, dos_k, pdos_k):
-                    stream.write(f"{ik + 1:6d} {energy:12.6f} {dos:14.6e} {pdos:14.6e}\n")
+                stream.write("\n")
         else:
-            stream.write("# E (eV) DOS(E) PDOS(E)\n")
-            for energy, dos, pdos in zip(grid, total, np.sum(projected, axis=1)):
-                stream.write(f"{energy:12.6f} {dos:14.6e} {pdos:14.6e}\n")
+            stream.write("# E (eV)  dos(E)    pdos(E)\n")
+            _write_qe_pdos_block(
+                stream, grid, np.column_stack((total, np.sum(projected, axis=1)))
+            )
     paths.append(total_path)
     lnames = _L_NAMES
     for orbital, columns in _groups(data.orbitals):
         label = lnames[orbital.l] if orbital.l < len(lnames) else f"l{orbital.l}"
         path = Path(f"{base}.pdos_atm#{orbital.atom}({orbital.symbol})_wfc#{orbital.wfc}({label})")
-        components = projected[:, columns]
+        component_count = columns.stop - columns.start
         with path.open("w", encoding="utf-8", newline="\n") as stream:
-            prefix_header = "# ik E (eV) LDOS(E)" if kresolved else "# E (eV) LDOS(E)"
-            stream.write(prefix_header + "".join(f" PDOS_{m + 1}(E)" for m in range(components.shape[1])) + "\n")
             if kresolved:
+                stream.write(
+                    "# ik    E (eV)   ldos(E)  "
+                    + " pdos(E)   " * component_count
+                    + "\n"
+                )
                 for ik in range(len(data.weights)):
-                    components_k = 2.0 * np.einsum("eb,bo->eo", kernel[:, ik, :], data.projections[ik][:, columns])
-                    for energy, values in zip(grid, components_k):
-                        stream.write(f"{ik + 1:6d} {energy:12.6f} {np.sum(values):14.6e}" + "".join(f" {value:14.6e}" for value in values) + "\n")
+                    components_k = projected_by_k[:, ik, columns]
+                    _write_qe_pdos_block(
+                        stream,
+                        grid,
+                        np.column_stack(
+                            (np.sum(components_k, axis=1), components_k)
+                        ),
+                        kpoint=ik + 1,
+                    )
+                    stream.write("\n")
             else:
-                for energy, values in zip(grid, components):
-                    stream.write(f"{energy:12.6f} {np.sum(values):14.6e}" + "".join(f" {value:14.6e}" for value in values) + "\n")
+                components = projected[:, columns]
+                stream.write(
+                    "# E (eV)   ldos(E)  "
+                    + " pdos(E)   " * component_count
+                    + "\n"
+                )
+                _write_qe_pdos_block(
+                    stream,
+                    grid,
+                    np.column_stack((np.sum(components, axis=1), components)),
+                )
         paths.append(path)
     directory = resolve_save_directory(prefix, outdir)
     atomic_proj = directory / "atomic_proj.xml"
@@ -621,9 +778,41 @@ _M_LABELS = {
 }
 
 
+def _qe_projection_order(values: np.ndarray, tolerance: float = 1.0e-4) -> np.ndarray:
+    """Sort weights as QE does, preserving state order for numerical ties."""
+    values = np.asarray(values, dtype=float)
+    order = np.argsort(-values, kind="stable")
+    grouped: list[int] = []
+    start = 0
+    while start < len(order):
+        stop = start + 1
+        reference = values[order[start]]
+        while stop < len(order) and abs(values[order[stop]] - reference) < tolerance:
+            stop += 1
+        grouped.extend(sorted(int(index) for index in order[start:stop]))
+        start = stop
+    return np.asarray(grouped, dtype=np.int64)
+
+
 def _format_projection_summary(data: ProjectionData, *, diag_basis: bool = False) -> str:
     """Render the atomic-state and Lowdin-charge blocks printed by ``projwfc.x``."""
+    plane_waves = (
+        np.asarray([], dtype=int)
+        if data.plane_waves is None
+        else np.asarray(data.plane_waves, dtype=int)
+    )
     lines = [
+        "     Subspace diagonalization in iterative solution of the eigenvalue problem:",
+        "     a serial algorithm will be used",
+        "",
+        "",
+        "  Problem Sizes ",
+        f"  natomwfc = {len(data.orbitals):12d}",
+        f"  nbnd     = {data.energies_ev.shape[1]:12d}",
+        f"  nkstot   = {data.energies_ev.shape[0]:12d}",
+        f"  npwx     = {int(np.max(plane_waves)) if len(plane_waves) else 0:12d}",
+        f"  nkb      = {data.nkb:12d}",
+        "",
         "",
         "     Atomic states used for projection",
         "     (read from pseudopotential files):",
@@ -634,6 +823,36 @@ def _format_projection_summary(data: ProjectionData, *, diag_basis: bool = False
             f"     state #{index:4d}: atom {orbital.atom:3d} ({orbital.symbol:<3}), "
             f"wfc {orbital.wfc:2d} (l={orbital.l:d} m={orbital.m + 1:2d})"
         )
+
+    if data.kpoints is not None:
+        for kpoint, energies, projections in zip(
+            data.kpoints, data.energies_ev, data.projections
+        ):
+            lines.append(
+                "\n k = " + "".join(f"{value:14.10f}" for value in kpoint)
+            )
+            for band, (energy, values) in enumerate(
+                zip(energies, projections), start=1
+            ):
+                lines.append(f"==== e({band:4d}) = {energy:11.5f} eV ==== ")
+                order = _qe_projection_order(values)
+                selected = [
+                    int(index) for index in order if abs(values[index]) >= 0.001
+                ]
+                if selected:
+                    current = "     psi = "
+                    for position, index in enumerate(selected, start=1):
+                        separator = "" if position == 1 else "+"
+                        current += (
+                            f"{separator}{values[index]:5.3f}*[#{index + 1:4d}]"
+                        )
+                        if position % 5 == 0 and position < len(selected):
+                            lines.append(current)
+                            current = "          "
+                    lines.append(current)
+                else:
+                    lines.append("")
+                lines.append(f"    |psi|^2 = {float(np.sum(values)):5.3f}")
 
     charges = np.einsum(
         "k,kb,kbo->o", data.weights, data.occupations, data.projections
@@ -686,7 +905,7 @@ def _format_projection_summary(data: ProjectionData, *, diag_basis: bool = False
 
     electrons = float(np.einsum("k,kb->", data.weights, data.occupations))
     spilling = 1.0 - float(np.sum(charges)) / max(1.0e-14, electrons)
-    lines.extend(("", f"     Spilling Parameter: {spilling:8.4f}", ""))
+    lines.extend((f"     Spilling Parameter: {spilling:8.4f}", ""))
     return "\n".join(lines)
 
 
@@ -707,12 +926,6 @@ def main(argv=None) -> int:
             )
             for box, charge in enumerate(charges, start=1):
                 print(f"     box # {box:4d}: integrated occupied weight = {charge:11.6f}")
-        else:
-            print(
-                _format_projection_summary(
-                    data, diag_basis=bool(options.get("diag_basis", False))
-                )
-            )
         print(
             format_qe_timing(
                 "PROJWFC",
