@@ -49,10 +49,11 @@ K_POINTS automatic
 | `restart_mode` | string, `'from_scratch'` | `'from_scratch'` or `'restart'`. Restart requires compatible saved density and wavefunctions. |
 | `tstress` | logical, `.false.` | Compute and print the implemented analytic stress contributions. |
 | `tprnfor` | logical, `.false.` | Compute and print implemented ionic forces. |
-| `outdir` | string, `ESPRESSO_TMPDIR` or `.` | Parent of `<prefix>.save`; environment variables and `~` are expanded. |
+| `outdir` | string, `ESPRESSO_TMPDIR` or `.` | Temporary/output directory and parent of `<prefix>.save`; created at calculation initialization. Environment variables and `~` are expanded. |
+| `wfcdir` | string, `outdir` | Directory for processor-local binary working wavefunction files. It is created at calculation initialization and may be placed on local scratch storage. |
 | `prefix` | string, `'pwscf'` | Save-directory prefix. It must be a filename component, not a path. |
 | `pseudo_dir` | string, `.` | UPF directory. A relative path is resolved relative to the input file. |
-| `disk_io` | string, `'low'` | One of `none`, `low`, `medium`, or `high`. `none` disables persistent output; the other levels write the QE-shaped XML/HDF5 save data. `medium` is suitable for an SCF → NSCF/bands workflow. Checkpoint frequency differences between the three persistent levels are not yet distinguished. |
+| `disk_io` | string, `'low'` | One of `none`, `low`, `medium`, or `high`. `none` disables the final persistent output; the other levels write QE-shaped XML/HDF5 save data. `low` keeps working wavefunctions in memory, `medium` uses `wfcdir` when a process has more than one k point, and `high` always uses it. |
 | `iprint` | integer, `100000` in saved metadata | Accepted for QE compatibility. It does not introduce ionic-step printing because ionic dynamics are not implemented. |
 
 `tprfor` is not an alias for `tprnfor`; it is diagnosed as an unknown variable,

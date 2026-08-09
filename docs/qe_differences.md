@@ -199,10 +199,14 @@ evaluation it writes schema metadata, writes charge density only for SCF,
 copies pseudopotentials, and finally writes collected wavefunctions. Thus an
 NSCF or bands run does not replace the converged SCF charge density.
 
-QE has several disk-I/O levels controlling wavefunction retention and
-frequency. qepy-pw currently keeps active wavefunctions in memory and treats
-all non-`none` values as one save policy. `disk_io='none'` skips persistent
-output but does not change the mathematical SCF state.
+The QE working-buffer distinction is implemented separately from the final
+save. `low` keeps active wavefunctions in memory; `medium` uses the binary
+direct-record `<wfcdir>/<prefix>.wfc[rank]` buffer when a process handles more
+than one k point; and `high` always uses it. Every freshly diagonalized k point
+is written to that buffer and later density, force, stress, and save consumers
+read it back. `outdir` and `wfcdir` are created during initialization, including
+when `disk_io='none'`. The final non-`none` save remains the collected,
+portable HDF5 representation under `<prefix>.save`.
 
 ## 12. Output and diagnostics
 

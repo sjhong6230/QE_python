@@ -127,6 +127,14 @@ def test_disk_io_medium_and_known_levels_are_accepted() -> None:
         )
 
 
+def test_wfcdir_is_an_implemented_control_variable() -> None:
+    text = _input().replace(
+        "calculation = 'scf'",
+        "calculation = 'scf', wfcdir = './wavefunctions'",
+    )
+    assert _read(text).control["wfcdir"] == "./wavefunctions"
+
+
 def test_unported_qe_variable_is_never_silently_ignored() -> None:
     with pytest.raises(UnsupportedFeatureError) as caught:
         _read(_input(system_extra="assume_isolated='mt'"))

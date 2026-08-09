@@ -39,7 +39,7 @@ _CARDS = {"ATOMIC_SPECIES", "ATOMIC_POSITIONS", "K_POINTS", "CELL_PARAMETERS", "
 _IMPLEMENTED_NAMELIST_VARIABLES = {
     "control": {
         "title", "calculation", "verbosity", "restart_mode", "tstress",
-        "tprnfor", "outdir", "prefix", "pseudo_dir", "disk_io", "iprint",
+        "tprnfor", "outdir", "wfcdir", "prefix", "pseudo_dir", "disk_io", "iprint",
     },
     "system": {
         "ibrav", "celldm", "a", "b", "c", "cosab", "cosac", "cosbc",

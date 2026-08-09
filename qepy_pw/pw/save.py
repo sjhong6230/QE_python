@@ -19,6 +19,7 @@ import xml.etree.ElementTree as ET
 import numpy as np
 
 from ..errors import QEInputError
+from .buffers import resolve_outdir, resolve_prefix
 from .input import PWInput
 from ..mpi import MPIContext
 from .scf import SCFResult
@@ -41,22 +42,7 @@ def _qes(name: str) -> str:
 def resolve_save_directory(pw: PWInput) -> Path:
     """Return QE's ``<outdir>/<prefix>.save`` path for an input."""
 
-    prefix = str(pw.control.get("prefix", "pwscf")).strip() or "pwscf"
-    if (
-        prefix in {".", ".."}
-        or "/" in prefix
-        or "\\" in prefix
-        or Path(prefix).name != prefix
-    ):
-        raise QEInputError("CONTROL prefix must be a file-name prefix, not a path")
-    raw_outdir = pw.control.get("outdir")
-    if raw_outdir is None or not str(raw_outdir).strip():
-        raw_outdir = os.environ.get("ESPRESSO_TMPDIR", ".")
-    expanded = os.path.expandvars(os.path.expanduser(str(raw_outdir)))
-    outdir = Path(expanded)
-    if not outdir.is_absolute():
-        outdir = Path.cwd() / outdir
-    return outdir.resolve() / f"{prefix}.save"
+    return resolve_outdir(pw) / f"{resolve_prefix(pw)}.save"
 
 
 def saving_enabled(pw: PWInput) -> bool:

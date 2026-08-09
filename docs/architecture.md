@@ -286,10 +286,13 @@ PSS apportions those pages rather than counting a full copy in each rank.
 
 ## 15. Save and restart architecture
 
-When saving is enabled, rank-local wavefunction rows are gathered or serialized
-into QE-shaped HDF5 datasets and the root writes XML metadata. Save-only full
-arrays are created after major SCF temporaries have been released where
-possible. `disk_io='none'` skips this phase entirely.
+For `medium` with multiple local k points, and always for `high`, each rank
+stores fixed binary records in `<wfcdir>/<prefix>.wfc[rank]`. The SCF k loop,
+density construction, derivatives, and final serializer access this object as
+a lazy sequence, so only one k-point matrix need be resident at a time outside
+the eigensolver. At final save, rank-local rows are gathered or streamed into
+QE-shaped collected HDF5 datasets and the root writes XML metadata.
+`disk_io='none'` skips this final phase entirely.
 
 Restart reads density directly onto the current compact reciprocal basis and
 maps saved wavefunctions onto compatible current G rows. Geometry, cutoff,

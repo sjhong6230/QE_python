@@ -20,6 +20,7 @@ from qepy_pw.pp.bands import (
 )
 from qepy_pw.input import read_pw_input
 from qepy_pw.output import format_footer
+from qepy_pw.pw.buffers import WavefunctionBuffer
 from qepy_pw.pw.save import write_qe_save
 from qepy_pw.scf import run_scf
 from qepy_pw.pp.plotband import high_symmetry_indices, parse_plotband_input
@@ -204,9 +205,15 @@ def test_scf_nscf_save_order_and_bands_inp_integration(
     scf_pw = read_pw_input(source)
     scf_pw.control.update({
         "prefix": "integ", "outdir": str(tmp_path),
+        "wfcdir": str(tmp_path / "working-wfc"),
         "pseudo_dir": str(pseudo_dir), "disk_io": "medium",
     })
     scf_result = run_scf(scf_pw)
+    assert isinstance(scf_result.wavefunctions, WavefunctionBuffer)
+    assert scf_result.wavefunctions.path == (
+        tmp_path / "working-wfc" / "integ.wfc"
+    )
+    assert scf_result.wavefunctions.path.is_file()
     save_directory = write_qe_save(scf_pw, scf_result)
     assert save_directory is not None
     density_path = save_directory / "charge-density.hdf5"
@@ -216,6 +223,7 @@ def test_scf_nscf_save_order_and_bands_inp_integration(
     nscf_pw.control.update({
         "calculation": "nscf", "prefix": "integ",
         "outdir": str(tmp_path), "pseudo_dir": str(pseudo_dir),
+        "wfcdir": str(tmp_path / "working-wfc"),
         "disk_io": "medium", "verbosity": "high", "tstress": False,
     })
     nscf_result = run_scf(nscf_pw)

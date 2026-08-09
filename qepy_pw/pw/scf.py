@@ -40,6 +40,13 @@ from ..diagonalization import (
 )
 from ..errors import QEInputError, UnsupportedFeatureError, not_implemented
 from ..ewald import ewald_energy, ewald_forces, ewald_stress
+from .buffers import (
+    WavefunctionBuffer,
+    prepare_io_directories,
+    resolve_prefix,
+    resolve_wfcdir,
+    uses_disk_wavefunction_buffer,
+)
 from .input import PWInput
 from ..mixing import (
     DistributedBroydenMixer,
@@ -229,7 +236,7 @@ class SCFResult:
     occupations: list[np.ndarray] = field(default_factory=list)
     fermi_energy_ha: float | None = None
     mpi_processes: int = 1
-    wavefunctions: list[np.ndarray] = field(default_factory=list)
+    wavefunctions: Sequence[np.ndarray] = field(default_factory=list)
     wavefunction_miller_indices: list[np.ndarray] = field(default_factory=list)
     wavefunction_row_indices: list[np.ndarray] = field(default_factory=list)
     wavefunctions_distributed: bool = False
@@ -368,7 +375,7 @@ class _LazyWorkspaceSequence(Sequence[LocalPotentialWorkspace]):
 
 
 def _collect_wavefunctions_root(
-    eigenvectors: list[np.ndarray],
+    eigenvectors: Sequence[np.ndarray],
     bases: list[PlaneWaveBasis],
     workspaces: Sequence[LocalPotentialWorkspace],
     mpi: MPIContext,
@@ -393,18 +400,18 @@ def _collect_wavefunctions_root(
 
 
 def _final_wavefunction_payload(
-    eigenvectors: list[np.ndarray],
+    eigenvectors: Sequence[np.ndarray],
     bases: list[PlaneWaveBasis],
     workspaces: Sequence[LocalPotentialWorkspace],
     mpi: MPIContext,
-) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], bool]:
+) -> tuple[Sequence[np.ndarray], list[np.ndarray], list[np.ndarray], bool]:
     """Return serial wavefunctions or rank-local rows for streaming MPI I/O."""
     if mpi.size == 1:
         # The serial eigenvectors already use the global basis order.  They
         # are no longer mutated after this point, so returning the existing
         # matrices avoids a second all-k resident copy for disk_io != 'none'.
         return (
-            list(eigenvectors),
+            eigenvectors,
             [np.asarray(basis.indices, dtype=np.int32) for basis in bases],
             [],
             False,
@@ -423,7 +430,7 @@ def _final_wavefunction_payload(
         np.asarray(workspaces[index].local_plane_wave_indices, dtype=np.int32)
         for index in range(len(bases))
     ]
-    return list(eigenvectors), miller, rows, True
+    return eigenvectors, miller, rows, True
 
 
 class _QERandom:
@@ -1708,6 +1715,10 @@ def _run_scf(
     mpi: MPIContext | None = None,
 ) -> SCFResult:
     mpi = mpi if mpi is not None else MPIContext()
+    # QE validates/creates tmp_dir (outdir) and wfc_dir during iosys, before
+    # any wavefunction or restart I/O.  Library callers receive the same
+    # initialization as the command-line entry point.
+    prepare_io_directories(pw, mpi)
     threads_per_process = hybrid_thread_count()
     baseline_rss_per_rank = int(mpi.max_scalar(current_rss_bytes()))
     baseline_pss_all_ranks = int(mpi.sum_scalar(current_pss_bytes()))
@@ -1765,9 +1776,8 @@ def _run_scf(
     if fixed_potential:
         starting_potential = "file"
     starting_messages: list[str] = []
-    save_wavefunctions = (
-        str(pw.control.get("disk_io", "low")).strip().lower() != "none"
-    )
+    disk_io = str(pw.control.get("disk_io", "low")).strip().lower()
+    save_wavefunctions = disk_io != "none"
     retain_occupied_states = (
         calculate_forces or calculate_stress or save_wavefunctions
     )
@@ -1855,6 +1865,9 @@ def _run_scf(
         mpi=mpi,
     )
     sizes = [len(basis) for basis in bases]
+    disk_wavefunction_io = uses_disk_wavefunction_buffer(
+        disk_io, len(bases)
+    )
     if min(sizes) < nbnd:
         raise QEInputError(
             f"nbnd={nbnd} exceeds the smallest plane-wave basis "
@@ -2146,9 +2159,14 @@ def _run_scf(
                 + workspace.local_stick_positions.nbytes
                 for workspace in local_workspaces
             )
+    resident_wavefunction_rows = (
+        local_plane_waves
+        if disk_wavefunction_io
+        else sum(local_plane_wave_counts)
+    )
     starting_and_saved_wfc_bytes = (
         (
-            sum(local_plane_wave_counts) * nbnd
+            resident_wavefunction_rows * nbnd
             + local_plane_waves * maximum_block
         )
         * 16
@@ -2646,6 +2664,18 @@ def _run_scf(
     fermi_energy: float | None = None
     smearing_energy = 0.0
     previous_eigenvectors: list[np.ndarray | None] = [None] * len(bases)
+    wavefunction_buffer = (
+        WavefunctionBuffer(
+            resolve_wfcdir(pw),
+            resolve_prefix(pw),
+            local_plane_wave_counts,
+            nbnd,
+            rank=mpi.rank,
+            processes=mpi.size,
+        )
+        if disk_wavefunction_io
+        else None
+    )
     loaded_wavefunctions = starting_wavefunctions == "file"
     if loaded_wavefunctions:
         from .save import read_saved_wavefunction
@@ -2653,7 +2683,7 @@ def _run_scf(
         for kpoint_index, (basis, workspace) in enumerate(
             zip(bases, local_workspaces)
         ):
-            previous_eigenvectors[kpoint_index] = read_saved_wavefunction(
+            loaded = read_saved_wavefunction(
                 pw,
                 kpoint_index,
                 basis.indices,
@@ -2663,6 +2693,12 @@ def _run_scf(
                     if mpi.size > 1 else None
                 ),
             )
+            if wavefunction_buffer is not None:
+                # wfcinit reads the portable collected restart one k point at
+                # a time and repopulates QE's processor-local working buffer.
+                wavefunction_buffer.write(kpoint_index, loaded)
+            else:
+                previous_eigenvectors[kpoint_index] = loaded
             # HDF5 selection and Miller-order work arrays are one-k-point
             # temporaries. Return them before loading the next persistent
             # wavefunction block so they do not stack at the restart peak.
@@ -2811,7 +2847,10 @@ def _run_scf(
             v_eff_g = np.asarray([potential_average], dtype=complex)
         if potential_started is not None:
             timers.stop("v_of_rho", potential_started)
-        eigenvalues, eigenvectors = [], []
+        eigenvalues = []
+        eigenvectors: Sequence[np.ndarray] | list[np.ndarray] = (
+            wavefunction_buffer if wavefunction_buffer is not None else []
+        )
         diagonalization_iterations: list[int] = []
         hamiltonian_applications: list[int] = []
         eigen_residuals: list[float] = []
@@ -2906,7 +2945,12 @@ def _run_scf(
                     # potential used by H|psi>.
                     potential_average=v_ion_average,
                 )
-                trial_vectors = previous_eigenvectors[kpoint_index]
+                trial_vectors = (
+                    wavefunction_buffer[kpoint_index]
+                    if wavefunction_buffer is not None
+                    and wavefunction_buffer.has_record(kpoint_index)
+                    else previous_eigenvectors[kpoint_index]
+                )
                 trial_eigenvalues = None
                 trial_applied = None
                 if trial_vectors is None:
@@ -3085,7 +3129,6 @@ def _run_scf(
                     solution.eigenvalues,
                     solution.eigenvectors,
                 )
-                previous_eigenvectors[kpoint_index] = vectors
                 diagonalization_iterations.append(davidson_iterations)
                 hamiltonian_applications.append(
                     solution.hamiltonian_applications
@@ -3094,7 +3137,15 @@ def _run_scf(
                     float(np.max(solution.residual_norms))
                 )
             eigenvalues.append(values)
-            eigenvectors.append(vectors)
+            if wavefunction_buffer is not None:
+                # c_bands saves every freshly diagonalized k point
+                # immediately. Subsequent consumers obtain it through
+                # get_buffer instead of retaining every k point in RAM.
+                wavefunction_buffer.write(kpoint_index, vectors)
+            else:
+                assert isinstance(eigenvectors, list)
+                eigenvectors.append(vectors)
+                previous_eigenvectors[kpoint_index] = vectors
             if diagonalization != "dense":
                 del (
                     operator,
