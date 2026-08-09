@@ -388,6 +388,71 @@ def _order_classes(
     return ordered
 
 
+def _which_c2_axis(matrix: np.ndarray, eigenvalue: float) -> int:
+    """Return QE ``which_c2``'s Cartesian direction code (1 through 13)."""
+    _u, _s, vh = np.linalg.svd(
+        np.asarray(matrix, dtype=float) - eigenvalue * np.eye(3)
+    )
+    axis = vh[-1]
+    axis /= max(float(np.max(np.abs(axis))), 1.0e-15)
+    x, y, z = axis
+    tolerance = 1.0e-7
+    if abs(y) < tolerance and abs(z) < tolerance:
+        return 1
+    if abs(x) < tolerance and abs(z) < tolerance:
+        return 2
+    if abs(x) < tolerance and abs(y) < tolerance:
+        return 3
+    if abs(x) < tolerance:
+        if abs(y - z) < tolerance:
+            return 4
+        if abs(y + z) < tolerance:
+            return 5
+    elif abs(y) < tolerance:
+        if abs(x - z) < tolerance:
+            return 6
+        if abs(x + z) < tolerance:
+            return 7
+    elif abs(z) < tolerance:
+        sqrt_three = math.sqrt(3.0)
+        tests = (
+            (8, x - y),
+            (9, x + y),
+            (10, x - y / sqrt_three),
+            (11, x + y / sqrt_three),
+            (12, x - y * sqrt_three),
+            (13, x + y * sqrt_three),
+        )
+        for code, residual in tests:
+            if abs(residual) < tolerance:
+                return code
+    raise ValueError("C2 or mirror axis is not in QE's crystallographic list")
+
+
+_QE_C2V_AXIS_ORDERS = {
+    (1, 2, 3), (1, 4, 5), (2, 3, 1), (2, 7, 6),
+    (3, 1, 2), (3, 8, 9), (4, 5, 1), (5, 1, 4),
+    (6, 2, 7), (7, 6, 2), (8, 3, 9), (9, 8, 3),
+    (3, 11, 12), (3, 13, 10), (12, 3, 11), (13, 10, 3),
+    (10, 3, 13), (11, 12, 3),
+}
+
+
+def _order_c2v_mirrors(
+    classes: list[list[int]], cartesian: list[np.ndarray]
+) -> list[list[int]]:
+    """Order C2v mirrors as QE ``is_c2v`` does for B1/B2 labels."""
+    principal = _which_c2_axis(cartesian[classes[1][0]], 1.0)
+    first = _which_c2_axis(cartesian[classes[2][0]], -1.0)
+    second = _which_c2_axis(cartesian[classes[3][0]], -1.0)
+    if (principal, first, second) in _QE_C2V_AXIS_ORDERS:
+        return classes
+    if (principal, second, first) in _QE_C2V_AXIS_ORDERS:
+        classes[2], classes[3] = classes[3], classes[2]
+        return classes
+    raise ValueError("cannot order C2v mirror classes using QE convention")
+
+
 def _axis(matrix: np.ndarray, eigenvalue: float) -> tuple[int, int, int]:
     _u, _s, vh = np.linalg.svd(matrix - eigenvalue * np.eye(3))
     axis = vh[-1]
@@ -413,6 +478,16 @@ def _description(matrix: np.ndarray) -> str:
     axis = _axis(proper, 1.0)
     prefix = "inv. " if improper else ""
     return f"{prefix}{angle:3d} deg rotation - cart. axis [{axis[0]},{axis[1]},{axis[2]}]"
+
+
+def operation_description(lattice: np.ndarray, operation) -> str:
+    """Return QE's human-readable name for a crystal symmetry operation."""
+    cartesian = (
+        np.linalg.inv(np.asarray(lattice, dtype=float))
+        @ np.asarray(operation.matrix, dtype=float)
+        @ np.asarray(lattice, dtype=float)
+    )
+    return _description(cartesian)
 
 
 def _irrep_sort_key(item, inversion_slot: int | None, mirror_slot: int | None):
@@ -509,11 +584,15 @@ def point_group_character_table(pw, operations) -> PointGroupTable:
     fractional_matrices = [np.asarray(operation.matrix, dtype=int) for operation in operations]
     group_name = _identify_group(fractional_matrices)
     international, _labels, _dimensions = _GROUPS[group_name]
+    inverse_lattice = np.linalg.inv(pw.lattice)
+    cartesian = [inverse_lattice @ matrix @ pw.lattice for matrix in fractional_matrices]
     raw_classes = _order_classes(
         group_name,
         fractional_matrices,
         _conjugacy_classes(fractional_matrices),
     )
+    if group_name == "C_2v":
+        raw_classes = _order_c2v_mirrors(raw_classes, cartesian)
     characters = _class_characters(fractional_matrices, raw_classes)
 
     inversion_slot = next((i for i, members in enumerate(raw_classes) if _operation_kind(fractional_matrices[members[0]]) == "inversion"), None)
@@ -523,8 +602,6 @@ def point_group_character_table(pw, operations) -> PointGroupTable:
         group_name, characters, inversion_slot, mirror_slot
     )
 
-    inverse_lattice = np.linalg.inv(pw.lattice)
-    cartesian = [inverse_lattice @ matrix @ pw.lattice for matrix in fractional_matrices]
     class_names = _CLASS_LABELS[group_name]
     classes = tuple(
         PointGroupClass(
@@ -543,5 +620,5 @@ oh_character_table = point_group_character_table
 
 __all__ = [
     "PointGroupClass", "PointGroupTable", "point_group_character_table",
-    "oh_character_table",
+    "oh_character_table", "operation_description",
 ]

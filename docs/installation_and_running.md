@@ -232,9 +232,13 @@ implemented restart path. To suppress persistent output:
 /
 ```
 
-Active wavefunctions remain in memory in both cases. `disk_io='none'` removes
-serialization and retained output payloads; it does not select a different
-electronic algorithm.
+As in QE, `outdir` and `wfcdir` are created when the calculation is initialized.
+`wfcdir` defaults to `outdir`. With `disk_io='medium'`, a calculation having
+more than one local k point uses the processor working file
+`<wfcdir>/<prefix>.wfc[rank]`; `disk_io='high'` uses it even for one k point.
+These direct-record binary files are distinct from the portable collected
+HDF5 wavefunctions in `<prefix>.save`. `low` and `none` retain active
+wavefunctions in memory, while `none` also suppresses the final save.
 
 For restart:
 
@@ -320,4 +324,3 @@ kernel regression.
 Every rank is a Python process. Reduce ranks and try two threads per rank while
 keeping total physical cores fixed. Compare aggregate PSS, not summed RSS,
 because shared libraries and shared windows otherwise appear multiple times.
-

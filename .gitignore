@@ -18,5 +18,9 @@ qepy_pw/_native_fft*.so
 # Quantum ESPRESSO runtime/restart directories
 *.save/
 
+# Small, deterministic projwfc fixture required by clean CI checkouts
+!tests/qe_reference/upstream/pseudo/pwscf.save/
+!tests/qe_reference/upstream/pseudo/pwscf.save/**
+
 # Files attached to a local Codex task are not project sources.
 .codex-remote-attachments/

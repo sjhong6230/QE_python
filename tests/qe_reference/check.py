@@ -165,7 +165,14 @@ def generate_references(case_ids: set[str] | None = None) -> None:
         output, _ = run_case(case)
         target = reference_path(case)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(output, encoding="utf-8")
+        # Keep checked-in snapshots friendly to whitespace linters.  The
+        # executable output itself intentionally retains QE's trailing A60
+        # padding on the termination line and is covered byte-for-byte by
+        # ``test_qe_whitespace``.
+        snapshot = "\n".join(line.rstrip() for line in output.splitlines())
+        if output.endswith("\n"):
+            snapshot += "\n"
+        target.write_text(snapshot, encoding="utf-8")
         print(f"updated {target.relative_to(ROOT)}", flush=True)
 
 

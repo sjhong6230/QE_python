@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import sys
+from typing import TextIO
 
 
 @dataclass(frozen=True)
@@ -40,19 +42,42 @@ def not_implemented(feature: str) -> str:
     return f"{feature} is not implemented in PWSCF-PY"
 
 
-def format_qe_error(error: BaseException) -> str:
+def format_qe_error(
+    error: BaseException, *, routine: str | None = None
+) -> str:
     """Render an exception using QE 7.5 ``error_handler.f90`` formatting."""
 
-    routine = getattr(error, "routine", "pw.py")
+    routine_name = routine or getattr(error, "routine", "pw.py")
     code = int(getattr(error, "code", 1))
     border = " %" + "%" * 77
     return (
         f"\n{border}\n"
-        f"     Error in routine {routine} ({code}):\n"
+        f"     Error in routine {routine_name} ({code}):\n"
         f"     {error}\n"
         f"{border}\n\n"
         "     stopping ...\n"
     )
+
+
+def emit_qe_error(
+    error: BaseException,
+    *,
+    routine: str | None = None,
+    stdout: TextIO | None = None,
+    stderr: TextIO | None = None,
+) -> None:
+    """Emit a QE error block to both the redirected output and stderr.
+
+    QE users conventionally redirect program stdout to an ``*.out`` file and
+    expect the fatal ``errore`` block to be present there.  Retaining stderr
+    as well preserves shell/CI diagnostics when stdout is not collected.
+    """
+    output_stream = sys.stdout if stdout is None else stdout
+    error_stream = sys.stderr if stderr is None else stderr
+    rendered = format_qe_error(error, routine=routine)
+    print(rendered, end="", file=output_stream, flush=True)
+    if error_stream is not output_stream:
+        print(rendered, end="", file=error_stream, flush=True)
 
 
 def format_qe_warning(warning: QEWarning) -> str:

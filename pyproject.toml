@@ -27,7 +27,11 @@ dependencies = [
 ]
 
 [project.scripts]
-"pw.py" = "qepy_pw.launcher:main"
+"pw.py" = "qepy_pw.pw.launcher:main"
+"bands.py" = "qepy_pw.pp.bands:main"
+"plotband.py" = "qepy_pw.pp.plotband:main"
+"dos.py" = "qepy_pw.pp.dos:main"
+"projwfc.py" = "qepy_pw.pp.projwfc:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

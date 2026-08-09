@@ -1,4 +1,4 @@
-from .launcher import main
+from .pw.launcher import main
 
 raise SystemExit(main())
 

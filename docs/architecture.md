@@ -21,9 +21,9 @@ latency-sensitive inner work.
 
 | Module | Responsibility |
 |---|---|
-| `launcher.py` | Re-executes the process with allocator and thread-pool controls before NumPy is imported. |
-| `cli.py` | MPI-aware input distribution, QE-shaped progress/output, save dispatch, and exit status. |
-| `input.py` | Namelist/card parser, lattice construction, k-point generation, symmetry setup, and input validation. |
+| `pw/launcher.py` | Re-executes the process with allocator and thread-pool controls before NumPy is imported. |
+| `pw/cli.py` | MPI-aware input distribution, QE-shaped progress/output, save dispatch, and exit status. |
+| `pw/input.py` | Namelist/card parser, lattice construction, k-point generation, symmetry setup, and input validation. |
 | `qe_input_schema.py` | QE 7.5 variable-name catalog used to distinguish unknown names from valid but unimplemented options. |
 | `upf.py` | UPF parsing, radial interpolation/transforms, local/nonlocal data, atomic orbitals/densities, and NLCC. |
 | `basis.py` | Global plane-wave catalogs, per-k bases, FFT grids, stick ownership, transpose descriptors, scratch pools, and local-potential/density FFT workspaces. |
@@ -35,9 +35,14 @@ latency-sensitive inner work.
 | `xc.py` | LDA and PBE-family physical formulas with memory-bounded point blocks. |
 | `symmetry.py`, `point_group.py` | Space-group/star mappings and scalar-density, force, and stress symmetrization. |
 | `ewald.py` | Ewald ion–ion energy, force, and stress. |
-| `scf.py` | Top-level setup, SCF loop, potentials, energies, derivatives, memory model, and result construction. |
-| `save.py` | QE-shaped XML/HDF5 save and restart data. |
-| `output.py` | QE-shaped human-readable setup, iteration, timing, energy, force, stress, and memory reports. |
+| `pw/scf.py` | Top-level setup, SCF/fixed-potential loop, potentials, energies, derivatives, memory model, and result construction. |
+| `pw/save.py` | QE-shaped XML/HDF5 save and restart data. |
+| `pw/output.py` | QE-shaped human-readable setup, iteration, timing, energy, force, stress, and memory reports. |
+| `pp/bands.py` | `bands.x`-style eigenvalue extraction, overlap ordering, scalar little-group irrep classification, and `.rap`/`.gnu` output. |
+| `pp/plotband.py` | `plotband.x`-style path conversion and PostScript generation. |
+| `pp/dos.py` | `dos.x`-style Gaussian or tetrahedron total-DOS integration. |
+| `pp/projwfc.py` | `projwfc.x`-style Löwdin atomic-orbital projections, populations, and PDOS. |
+| `pp/band_data.py` | Shared QE XML, `&plot`, and gnuplot band-data formats. |
 | `errors.py` | Structured QE-style errors and warnings. |
 | `memory.py`, `timing.py`, `threads.py` | Runtime instrumentation and hybrid controls. |
 
@@ -281,10 +286,13 @@ PSS apportions those pages rather than counting a full copy in each rank.
 
 ## 15. Save and restart architecture
 
-When saving is enabled, rank-local wavefunction rows are gathered or serialized
-into QE-shaped HDF5 datasets and the root writes XML metadata. Save-only full
-arrays are created after major SCF temporaries have been released where
-possible. `disk_io='none'` skips this phase entirely.
+For `medium` with multiple local k points, and always for `high`, each rank
+stores fixed binary records in `<wfcdir>/<prefix>.wfc[rank]`. The SCF k loop,
+density construction, derivatives, and final serializer access this object as
+a lazy sequence, so only one k-point matrix need be resident at a time outside
+the eigensolver. At final save, rank-local rows are gathered or streamed into
+QE-shaped collected HDF5 datasets and the root writes XML metadata.
+`disk_io='none'` skips this final phase entirely.
 
 Restart reads density directly onto the current compact reciprocal basis and
 maps saved wavefunctions onto compatible current G rows. Geometry, cutoff,

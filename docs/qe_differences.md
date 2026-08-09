@@ -42,12 +42,12 @@ The parser accepts QE-style Fortran namelists and the supported cards, but only
 the variables listed in [Input parameters](input_parameters.md) are active.
 Important distinctions are:
 
-- only `calculation='scf'` is available;
+- `calculation='scf'`, `'nscf'`, and `'bands'` are available; the fixed-potential modes require a compatible density saved by a preceding SCF calculation;
 - `&IONS` and `&CELL` have no implemented variables;
 - explicit FFT dimensions such as `nr1`, `nr2`, and `nr3` are not available;
 - `occupations='from_input'` and a working `OCCUPATIONS` card are absent;
 - `mixing_pulay_frequency` is a qepy-pw research extension;
-- `disk_io` currently distinguishes only `none` from persistent output;
+- `disk_io` accepts QE's `none`, `low`, `medium`, and `high` values, while the persistent levels currently share one end-of-run save policy;
 - QE-recognized variables outside the implemented subset fail explicitly.
 
 The error/warning presentation deliberately resembles QE 7.5 where the same
@@ -194,10 +194,19 @@ containing XML/HDF5 density and wavefunction data plus pseudopotential copies.
 This is intended for the implemented restart path and interoperability tests,
 not as a guarantee that every QE postprocessor accepts every file.
 
-QE has several disk-I/O levels controlling wavefunction retention and
-frequency. qepy-pw currently keeps active wavefunctions in memory and treats
-all non-`none` values as one save policy. `disk_io='none'` skips persistent
-output but does not change the mathematical SCF state.
+The final save follows QE's `punch('all')` phase: after force and stress
+evaluation it writes schema metadata, writes charge density only for SCF,
+copies pseudopotentials, and finally writes collected wavefunctions. Thus an
+NSCF or bands run does not replace the converged SCF charge density.
+
+The QE working-buffer distinction is implemented separately from the final
+save. `low` keeps active wavefunctions in memory; `medium` uses the binary
+direct-record `<wfcdir>/<prefix>.wfc[rank]` buffer when a process handles more
+than one k point; and `high` always uses it. Every freshly diagonalized k point
+is written to that buffer and later density, force, stress, and save consumers
+read it back. `outdir` and `wfcdir` are created during initialization, including
+when `disk_io='none'`. The final non-`none` save remains the collected,
+portable HDF5 representation under `<prefix>.save`.
 
 ## 12. Output and diagnostics
 
@@ -220,4 +229,3 @@ energy, `1e-4 eV` for bands/Fermi levels, `1e-4 Ry/bohr` for total force, and
 `0.01 kbar` for pressure. Passing these tests demonstrates stability of the
 implemented port; it is not a general certification over all materials,
 pseudopotentials, cutoffs, or QE features.
-

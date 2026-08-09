@@ -12,6 +12,7 @@ from qepy_pw.occupations import (
     _integrated_tetra_fraction,
     _linear_tetra_moments,
     _linear_tetra_moments_block,
+    smearing_density,
     smeared_occupations,
     smearing_order,
     tetrahedron_occupations,
@@ -58,6 +59,24 @@ def _qe_w1gauss_scalar(x: float, order: int) -> float:
     raise AssertionError(order)
 
 
+def _qe_w0gauss_scalar(x: float, order: int) -> float:
+    """Direct transcription of QE 7.5 ``Modules/w0gauss.f90``."""
+    if order == 1:
+        return exp(-min(200.0, x * x)) / sqrt(pi) * (1.5 - x * x)
+    if order == -1:
+        shifted = x - 1.0 / sqrt(2.0)
+        return (
+            exp(-min(200.0, shifted * shifted))
+            / sqrt(pi)
+            * (2.0 - sqrt(2.0) * x)
+        )
+    if order == -99:
+        return 0.0 if abs(x) > 36.0 else 1.0 / (
+            2.0 + exp(-x) + exp(x)
+        )
+    raise AssertionError(order)
+
+
 @pytest.mark.parametrize("order", [1, -1, -99])
 def test_non_gaussian_wgauss_and_w1gauss_match_qe_75(order: int) -> None:
     arguments = np.asarray([-40.0, -2.0, -0.5, 0.0, 0.75, 2.0, 40.0])
@@ -67,8 +86,29 @@ def test_non_gaussian_wgauss_and_w1gauss_match_qe_75(order: int) -> None:
     expected_energy = np.asarray(
         [_qe_w1gauss_scalar(float(value), order) for value in arguments]
     )
+    expected_density = np.asarray(
+        [_qe_w0gauss_scalar(float(value), order) for value in arguments]
+    )
     assert np.allclose(wgauss(arguments, order), expected_weights, atol=2.0e-15)
     assert np.allclose(w1gauss(arguments, order), expected_energy, atol=2.0e-15)
+    assert np.allclose(
+        smearing_density(arguments, order), expected_density, atol=2.0e-15
+    )
+
+
+@pytest.mark.parametrize("order", [0, 1, -1, -99])
+def test_analytic_smearing_density_matches_broadened_step_derivative(
+    order: int,
+) -> None:
+    arguments = np.linspace(-5.0, 5.0, 101)
+    step = 1.0e-5
+    numerical = (
+        wgauss(arguments + step, order)
+        - wgauss(arguments - step, order)
+    ) / (2.0 * step)
+    assert smearing_density(arguments, order) == pytest.approx(
+        numerical, abs=2.0e-9
+    )
 
 
 @pytest.mark.parametrize(
@@ -146,6 +186,55 @@ def test_native_tetrahedron_fermi_sum_matches_numpy_formula() -> None:
         expected = float(np.sum(_integrated_tetra_fraction(energies, fermi)))
         actual = float(native.tetrahedron_integrated_sum(energies, fermi))
         assert actual == pytest.approx(expected, abs=2.0e-12)
+
+
+def test_native_tetrahedron_dos_matches_qe_moments() -> None:
+    rng = np.random.default_rng(9821)
+    energies = np.ascontiguousarray(
+        np.sort(rng.normal(size=(37, 9, 4)), axis=-1)
+    )
+    energies[0, 0] = 0.25
+    energies[1, 0, 1] = energies[1, 0, 0]
+    energies[2, 0, 2] = energies[2, 0, 1]
+    grid = np.ascontiguousarray(np.linspace(-2.5, 2.5, 51))
+    expected_density = []
+    expected_integrated = []
+    for energy in grid:
+        moments, density = _linear_tetra_moments_block(
+            energies, float(energy)
+        )
+        expected_density.append(float(np.sum(density)))
+        expected_integrated.append(float(np.sum(moments)))
+
+    native = _load_native_fft()
+    density, integrated = native.tetrahedron_dos_sums(energies, grid)
+    assert density == pytest.approx(expected_density, abs=2.0e-12)
+    assert integrated == pytest.approx(expected_integrated, abs=2.0e-12)
+
+
+def test_native_tetrahedron_accumulation_matches_numpy_scatter() -> None:
+    rng = np.random.default_rng(7204)
+    connectivity = np.ascontiguousarray(
+        rng.integers(0, 17, size=(83, 20), dtype=np.int32)
+    )
+    vertex_weights = np.ascontiguousarray(rng.normal(size=(83, 7, 4)))
+    interpolation = np.ascontiguousarray(rng.normal(size=(4, 20)))
+    weights = np.einsum(
+        "cp,tbc->tbp", interpolation, vertex_weights
+    )
+    expected = np.zeros((17, 7))
+    for corner in range(connectivity.shape[1]):
+        np.add.at(
+            expected,
+            connectivity[:, corner],
+            weights[:, :, corner],
+        )
+
+    native = _load_native_fft()
+    actual = native.tetrahedron_accumulate(
+        connectivity, vertex_weights, interpolation, 17
+    )
+    assert actual == pytest.approx(expected, abs=1.0e-13)
 
 
 @pytest.mark.parametrize(

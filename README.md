@@ -1,8 +1,9 @@
 _# qepy-pw
 
-`qepy-pw` is a Python implementation of the scalar, nonmagnetic SCF path of
-Quantum ESPRESSO `pw.x`. It reads QE-style input files and norm-conserving UPF
-pseudopotentials and produces QE-shaped text output.
+`qepy-pw` is a Python implementation of the scalar, nonmagnetic SCF, NSCF,
+and band-structure paths of Quantum ESPRESSO `pw.x`, together with the
+`bands.x`, `plotband.x`, `dos.x`, and scalar `projwfc.x` post-processing workflow. It reads QE-style input
+files and norm-conserving UPF pseudopotentials and produces QE-shaped output.
 
 The project is intended for development and numerical comparison. It is not a
 drop-in replacement for production Quantum ESPRESSO.
@@ -31,11 +32,31 @@ For development, use an editable installation:
 python -m pip install -e .
 ```
 
-The build installs the `pw.py` command and compiles the Cython/MPI/FFTW
-extension. Run one calculation with:
+The build installs `pw.py`, `bands.py`, `plotband.py`, `dos.py`, and `projwfc.py` and compiles the
+Cython/MPI/FFTW extension. Run one calculation with:
 
 ```bash
 pw.py -in <input.in>
+```
+
+For a band calculation saved with `disk_io='medium'`, post-process and plot it
+with the usual QE-shaped inputs:
+
+```bash
+bands.py -i bands.pp.in
+plotband.py -i plotband.in
+```
+
+An automatic-grid NSCF calculation can be integrated into a total DOS with:
+
+```bash
+dos.py -i dos.in
+```
+
+For symmetry-averaged Löwdin charges and orbital-projected DOS from saved wavefunctions:
+
+```bash
+projwfc.py -i projwfc.in
 ```
 
 ## MPI and OpenMP

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -73,13 +74,35 @@ def test_qe_diamond_character_classes_use_the_printed_symmetry_indices():
     assert len(class_indices) == len(set(class_indices))
 
     output = format_header(pw)
+    assert "deg rotation - cart. axis" in output
     assert "point group O_h (m-3m)" in output
     assert "there are 10 classes" in output
     for point_class in table.classes:
         rendered_indices = "".join(
             f"{index:5d}" for index in point_class.operation_indices
         )
-        assert f"     {point_class.label:<6s}{rendered_indices}" in output
+        assert f"     {point_class.label:<5s}{rendered_indices}" in output
+
+
+def test_c2v_mirror_classes_follow_qe_double_group_axis_order():
+    """QE fixes B1/B2 by mirror normals, not discovery order."""
+    operations = (
+        SymmetryOperation(np.eye(3, dtype=int), np.zeros(3)),
+        SymmetryOperation(np.diag([-1, -1, 1]), np.zeros(3)),
+        # Deliberately provide the y-normal mirror before the x-normal one.
+        SymmetryOperation(np.diag([1, -1, 1]), np.zeros(3)),
+        SymmetryOperation(np.diag([-1, 1, 1]), np.zeros(3)),
+    )
+    table = point_group_character_table(
+        SimpleNamespace(lattice=np.eye(3)), operations
+    )
+    assert table.schoenflies == "C_2v"
+    assert [item.label for item in table.classes] == [
+        "E", "C2", "s_v", "s_v'",
+    ]
+    # For principal z, QE is_c2v orders normal x before normal y.
+    assert table.classes[2].operation_indices == (4,)
+    assert table.classes[3].operation_indices == (3,)
 
 
 def test_gamma_only_scf_still_projects_density_onto_crystal_symmetry(
@@ -123,6 +146,93 @@ def test_gamma_only_scf_preserves_multidimensional_irrep_degeneracies():
     }
     for label, multiplet in expected_multiplets.items():
         assert np.ptp(multiplet) < 1.0e-10, label
+
+
+def test_gamma_nscf_preserves_degeneracies_and_bands_finds_irreps(
+    tmp_path, monkeypatch,
+):
+    """NSCF uses QE's tighter default ethr and bands rotates translations."""
+    from qepy_pw.pp.band_data import read_saved_bands
+    from qepy_pw.pp.bands import _read_wavefunctions, classify_irreps
+    from qepy_pw.pw.save import resolve_save_directory, write_qe_save
+    import qepy_pw.pw.scf as scf_module
+
+    case = CASES["scf_gamma"]
+    source = input_path(case)
+    pseudo_dir = source.parents[1] / "pseudo"
+    scf_pw = read_pw_input(source)
+    scf_pw.control.update({
+        "prefix": "gamma-nscf",
+        "outdir": str(tmp_path),
+        "pseudo_dir": str(pseudo_dir),
+        "disk_io": "medium",
+        "tstress": False,
+    })
+    scf_pw.system["nbnd"] = 12
+    scf_pw.electrons.update({
+        "conv_thr": 1.0e-10,
+        "diago_thr_init": 1.0e-10,
+    })
+    write_qe_save(scf_pw, run_scf(scf_pw))
+
+    nscf_pw = read_pw_input(source)
+    nscf_pw.control.update({
+        "calculation": "nscf",
+        "prefix": "gamma-nscf",
+        "outdir": str(tmp_path),
+        "pseudo_dir": str(pseudo_dir),
+        "disk_io": "medium",
+        "tstress": False,
+    })
+    nscf_pw.system["nbnd"] = 12
+    # Exercise QE's NSCF defaults, independently of the tight SCF settings.
+    nscf_pw.electrons.clear()
+
+    thresholds = []
+    symmetry_applications = 0
+    original_davidson = scf_module.davidson
+    original_apply = ReciprocalDensitySymmetrizer.apply
+
+    def tracked_davidson(*args, **kwargs):
+        thresholds.append(kwargs["tolerance"])
+        solution = original_davidson(*args, **kwargs)
+        if len(thresholds) == 1:
+            # Exercise QE's outer c_bands retry independently of whether
+            # this small Gamma fixture happens to converge in one call.
+            return replace(
+                solution,
+                converged=False,
+                number_unconverged=nscf_pw.system["nbnd"],
+            )
+        return solution
+
+    def tracked_apply(self, density):
+        nonlocal symmetry_applications
+        symmetry_applications += 1
+        return original_apply(self, density)
+
+    monkeypatch.setattr(scf_module, "davidson", tracked_davidson)
+    monkeypatch.setattr(ReciprocalDensitySymmetrizer, "apply", tracked_apply)
+    result = run_scf(nscf_pw)
+
+    assert len(thresholds) >= 2
+    # QE prints ethr in Ry; the solver receives Hartree.
+    np.testing.assert_allclose(thresholds, 0.5 * 0.1e-6 / 8.0)
+    assert symmetry_applications == 1
+    eigenvalues = result.eigenvalues_ha[0]
+    for multiplet in (eigenvalues[1:4], eigenvalues[4:7], eigenvalues[9:11]):
+        assert np.ptp(multiplet) < 1.0e-8
+
+    write_qe_save(nscf_pw, result)
+    save = resolve_save_directory(nscf_pw)
+    data = read_saved_bands("gamma-nscf", str(tmp_path))
+    wavefunctions = _read_wavefunctions(save, data.nks)
+    irreps = classify_irreps(data, wavefunctions, save)
+    # O_h rows: A1g, T2g, T1u, A2u, A1g, Eu.
+    np.testing.assert_array_equal(
+        irreps[0, :11],
+        [1, 5, 5, 5, 9, 9, 9, 7, 1, 8, 8],
+    )
 
 
 @pytest.mark.filterwarnings("ignore:Set OLD_ERROR_HANDLING:DeprecationWarning")
@@ -173,3 +283,48 @@ def test_all_32_crystallographic_point_group_character_tables():
             character_rows.conj() * class_sizes[None, :]
         ) @ character_rows.T
         assert np.allclose(gram, len(rotations) * np.eye(len(table.irreps)))
+
+
+def test_high_verbosity_force_and_stress_decompositions_sum_to_totals():
+    from qepy_pw.output import format_footer
+    from qepy_pw.scf import run_scf
+
+    case = CASES["scf_baseline"]
+    pw = read_pw_input(input_path(case))
+    pw.control["pseudo_dir"] = str(input_path(case).parents[1] / "pseudo")
+    pw.control["verbosity"] = "high"
+    pw.control["tprnfor"] = True
+    result = run_scf(pw)
+
+    assert result.force_terms is not None
+    assert result.stress_terms is not None
+    force_sum = sum((
+        result.force_terms.nonlocal_ha_per_bohr,
+        result.force_terms.ionic_ha_per_bohr,
+        result.force_terms.local_ha_per_bohr,
+        result.force_terms.core_correction_ha_per_bohr,
+        result.force_terms.scf_correction_ha_per_bohr,
+    ))
+    stress_sum = sum((
+        result.stress_terms.kinetic_ha_per_bohr3,
+        result.stress_terms.local_ha_per_bohr3,
+        result.stress_terms.nonlocal_ha_per_bohr3,
+        result.stress_terms.hartree_ha_per_bohr3,
+        result.stress_terms.xc_ha_per_bohr3,
+        result.stress_terms.core_correction_ha_per_bohr3,
+        result.stress_terms.ewald_ha_per_bohr3,
+    ))
+    np.testing.assert_allclose(force_sum, result.forces_ha_per_bohr)
+    np.testing.assert_allclose(
+        stress_sum, result.stress_ha_per_bohr3, atol=1.0e-18
+    )
+    output = format_footer(pw, result)
+    assert "The non-local contrib.  to forces" in output
+    assert "The SCF correction term to forces" in output
+    assert "kinetic stress (kbar)" in output
+    assert "ewald   stress (kbar)" in output
+
+    pw.control["calculation"] = "nscf"
+    nscf_output = format_footer(pw, result)
+    assert "End of band structure calculation" in nscf_output
+    assert "convergence has been achieved" not in nscf_output
