@@ -11,7 +11,8 @@ import spglib
 from qepy_pw.input import read_pw_input
 from qepy_pw.output import _qe_symmetry_operations, format_header
 from qepy_pw.point_group import point_group_character_table
-from qepy_pw.symmetry import SymmetryOperation
+from qepy_pw.scf import run_scf
+from qepy_pw.symmetry import ReciprocalDensitySymmetrizer, SymmetryOperation
 from tests.qe_reference.check import (
     compare_values,
     extract_pw,
@@ -79,6 +80,49 @@ def test_qe_diamond_character_classes_use_the_printed_symmetry_indices():
             f"{index:5d}" for index in point_class.operation_indices
         )
         assert f"     {point_class.label:<6s}{rendered_indices}" in output
+
+
+def test_gamma_only_scf_still_projects_density_onto_crystal_symmetry(
+    monkeypatch,
+):
+    """QE calls sym_rho even when Gamma is both full and irreducible."""
+    case = CASES["scf_gamma"]
+    pw = read_pw_input(input_path(case))
+    assert pw.full_kpoint_count == len(pw.kpoints) == 1
+    assert len(pw.symmetry_operations) > 1
+
+    applications = 0
+    original_apply = ReciprocalDensitySymmetrizer.apply
+
+    def tracked_apply(self, density):
+        nonlocal applications
+        applications += 1
+        return original_apply(self, density)
+
+    monkeypatch.setattr(ReciprocalDensitySymmetrizer, "apply", tracked_apply)
+    run_case(case)
+    assert applications > 0
+
+
+def test_gamma_only_scf_preserves_multidimensional_irrep_degeneracies():
+    """The Si Gamma T and E irreps retain their 3- and 2-fold dimensions."""
+    case = CASES["scf_gamma"]
+    pw = read_pw_input(input_path(case))
+    pw.control["pseudo_dir"] = str(input_path(case).parents[1] / "pseudo")
+    pw.control["disk_io"] = "none"
+    pw.system["nbnd"] = 12
+    pw.electrons["conv_thr"] = 1.0e-10
+    pw.electrons["diago_thr_init"] = 1.0e-10
+
+    result = run_scf(pw)
+    eigenvalues = result.eigenvalues_ha[0]
+    expected_multiplets = {
+        "T valence (bands 2-4)": eigenvalues[1:4],
+        "T conduction (bands 5-7)": eigenvalues[4:7],
+        "E conduction (bands 10-11)": eigenvalues[9:11],
+    }
+    for label, multiplet in expected_multiplets.items():
+        assert np.ptp(multiplet) < 1.0e-10, label
 
 
 @pytest.mark.filterwarnings("ignore:Set OLD_ERROR_HANDLING:DeprecationWarning")
