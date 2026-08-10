@@ -236,6 +236,28 @@ def _broyden_projection_and_gram(
     )
 
 
+def _weighted_broyden_projection_and_gram(
+    delta_residuals: np.ndarray,
+    residual: np.ndarray,
+    metric_weights: np.ndarray,
+    mpi: MPIContext,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Form multisecant products for a diagonal reciprocal-space metric."""
+    history = delta_residuals.shape[0]
+    projection_local = np.empty(history, dtype=float)
+    gram_local = np.empty((history, history), dtype=float)
+    weighted = np.empty_like(residual)
+    for row in range(history):
+        np.conjugate(delta_residuals[row], out=weighted)
+        weighted *= metric_weights
+        projection_local[row] = float(np.real(weighted @ residual))
+        gram_local[row] = np.real(weighted @ delta_residuals.T)
+    return (
+        mpi.sum_array(projection_local),
+        mpi.sum_array(gram_local),
+    )
+
+
 class PlainBroydenMixer:
     """History-based Broyden mixing in the reciprocal-space Coulomb metric."""
 
@@ -400,18 +422,63 @@ class LinearMixer:
 class SpinDensityMixer:
     """Mix collinear charge and magnetization in QE's natural basis.
 
-    The long-range Broyden/Thomas--Fermi preconditioner acts on total charge.
-    Magnetization has no Coulomb singularity and is mixed directly, including
-    its G=0 component so unconstrained LSDA moments can evolve.
+    QE stores total charge and collinear magnetization in the same ``mix_type``.
+    Consequently both channels participate in the same Broyden history and
+    multisecant solve.  The charge channel has the Coulomb metric ``1/G^2``;
+    after removing its common ``4*pi`` factor, QE's finite magnetic metric is
+    ``1/(4*pi^2)`` (lambda=1 bohr).  Thomas--Fermi preconditioning still acts
+    only on total charge.  Magnetic G=0 remains active so an unconstrained
+    total moment can evolve.
     """
 
     def __init__(self, charge_mixer, beta: float = 0.7) -> None:
         self.charge_mixer = charge_mixer
         self.beta = float(beta)
+        if not isinstance(charge_mixer, DistributedBroydenMixer):
+            return
+        self.workspace = charge_mixer.workspace
+        self.mpi = charge_mixer.mpi
+        self.ndim = charge_mixer.ndim
+        self.pulay_frequency = charge_mixer.pulay_frequency
+        self.mixing_step = 0
+        self.mode = charge_mixer.mode
+        self.local_g2 = charge_mixer.local_g2
+        self.charge_active = charge_mixer.active
+        # Interleaved (charge, magnetization) compact coefficients. Charge
+        # G=0 is fixed, while every magnetic coefficient is mixed.
+        active_mask = np.zeros((self.local_g2.size, 2), dtype=bool)
+        active_mask[self.charge_active, 0] = True
+        active_mask[:, 1] = True
+        self.active = np.flatnonzero(active_mask.ravel())
+        active_rows, active_channels = np.unravel_index(
+            self.active, active_mask.shape
+        )
+        self.charge_positions = np.flatnonzero(active_channels == 0)
+        self.magnetic_positions = np.flatnonzero(active_channels == 1)
+        self.metric_weights = np.empty(self.active.size, dtype=float)
+        self.metric_weights[self.charge_positions] = (
+            1.0 / self.local_g2[active_rows[self.charge_positions]]
+        )
+        self.metric_weights[self.magnetic_positions] = 1.0 / (
+            4.0 * np.pi**2
+        )
+        self.tf_factor = charge_mixer.tf_factor
+        self._delta_inputs = _HistoryBuffer(self.ndim)
+        self.delta_residuals = _HistoryBuffer(self.ndim)
+        self.previous_input: np.ndarray | None = None
+        self.previous_residual: np.ndarray | None = None
 
     @property
     def delta_inputs(self):
-        return self.charge_mixer.delta_inputs
+        if isinstance(self.charge_mixer, DistributedBroydenMixer):
+            return self._delta_inputs
+        return getattr(self.charge_mixer, "delta_inputs", ())
+
+    @staticmethod
+    def _to_charge_magnetization(coefficients: np.ndarray) -> None:
+        up = coefficients[:, 0].copy()
+        coefficients[:, 0] += coefficients[:, 1]
+        coefficients[:, 1] = up - coefficients[:, 1]
 
     def mix(
         self,
@@ -424,16 +491,104 @@ class SpinDensityMixer:
         output_spins = np.asarray(density_out, dtype=float)
         if input_spins.shape != output_spins.shape or input_spins.shape[0] != 2:
             raise ValueError("spin densities must have matching shape (2, ...)")
+        if isinstance(self.charge_mixer, DistributedBroydenMixer):
+            self.mixing_step += 1
+            current = self.workspace.grid_to_coefficients(
+                np.moveaxis(input_spins, 0, -1)
+            )
+            self._to_charge_magnetization(current)
+            if residual_coefficients is None:
+                residual = self.workspace.grid_to_coefficients(
+                    np.moveaxis(output_spins, 0, -1)
+                )
+                self._to_charge_magnetization(residual)
+                residual -= current
+            else:
+                residual = np.asarray(
+                    residual_coefficients, dtype=np.complex128
+                )
+                if residual.shape != current.shape:
+                    raise ValueError(
+                        "precomputed spin-density residual has the wrong shape"
+                    )
+            current_active = current.ravel()[self.active].copy()
+            residual_active = residual.ravel()[self.active].copy()
+            saved_input = current_active.copy()
+            saved_residual = residual_active.copy()
+            if self.previous_input is not None:
+                assert self.previous_residual is not None
+                self.delta_inputs.append(
+                    self.previous_input - current_active
+                )
+                self.delta_residuals.append(
+                    self.previous_residual - residual_active
+                )
+            if (
+                self.delta_inputs
+                and self.mixing_step % self.pulay_frequency == 0
+            ):
+                projection, gram = _weighted_broyden_projection_and_gram(
+                    self.delta_residuals.array,
+                    residual_active,
+                    self.metric_weights,
+                    self.mpi,
+                )
+                try:
+                    gamma = np.linalg.solve(gram, projection)
+                except np.linalg.LinAlgError:
+                    gamma = np.linalg.lstsq(
+                        gram, projection, rcond=1.0e-14
+                    )[0]
+                current_active -= gamma @ self.delta_inputs.array
+                residual_active -= gamma @ self.delta_residuals.array
+            if self.mode == "tf":
+                assert self.tf_factor is not None
+                residual_active[self.charge_positions] *= self.tf_factor
+            elif self.mode == "local-tf":
+                full_charge_residual = residual[:, 0].copy()
+                full_charge_residual[self.charge_active] = residual_active[
+                    self.charge_positions
+                ]
+                best_charge = current[:, 0].copy()
+                best_charge[self.charge_active] = current_active[
+                    self.charge_positions
+                ]
+                best_density = self.workspace.coefficients_to_grid(
+                    best_charge, use_scratch=True
+                )
+                screened = _local_thomas_fermi_direction(
+                    full_charge_residual,
+                    np.real(best_density),
+                    self.local_g2,
+                    self.charge_active,
+                    self.mpi,
+                    lambda coefficients: self.workspace.coefficients_to_grid(
+                        coefficients, use_scratch=True
+                    ),
+                    self.workspace.grid_to_coefficients,
+                )
+                residual_active[self.charge_positions] = screened[
+                    self.charge_active
+                ]
+            mixed = current + self.beta * residual
+            mixed.ravel()[self.active] = (
+                current_active + self.beta * residual_active
+            )
+            zero = np.flatnonzero(self.local_g2 <= 1.0e-14)
+            if zero.size:
+                mixed[zero, 0] = current[zero, 0]
+            self.previous_input = saved_input
+            self.previous_residual = saved_residual
+            transformed = np.real(self.workspace.coefficients_to_grid(
+                mixed, use_scratch=True
+            ))
+            return np.ascontiguousarray(np.stack((
+                0.5 * (transformed[..., 0] + transformed[..., 1]),
+                0.5 * (transformed[..., 0] - transformed[..., 1]),
+            )))
         charge_in = input_spins[0] + input_spins[1]
         charge_out = output_spins[0] + output_spins[1]
-        if isinstance(self.charge_mixer, DistributedBroydenMixer):
-            charge = self.charge_mixer.mix(
-                charge_in,
-                charge_out,
-                residual_coefficients=residual_coefficients,
-            )
-        else:
-            charge = self.charge_mixer.mix(charge_in, charge_out)
+        charge = self.charge_mixer.mix(charge_in, charge_out)
         magnetization_in = input_spins[0] - input_spins[1]
         magnetization_out = output_spins[0] - output_spins[1]
         magnetization = (

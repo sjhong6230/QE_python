@@ -2391,6 +2391,7 @@ def _run_scf(
         * (mixing_ndim_estimate + 1)
         * len(local_charge_rows)
         * 16
+        * (2 if lsda else 1)
         if str(pw.electrons.get("mixing_mode", "plain"))
         .strip()
         .lower()
@@ -3822,44 +3823,46 @@ def _run_scf(
         input_hxc = None
         if lsda:
             real_grid_workspace = np.subtract(rho_out, rho)
-            charge_residual = (
-                real_grid_workspace[0] + real_grid_workspace[1]
+            # Transform both spin residuals as one FFT batch, then rotate the
+            # compact coefficients to QE's (charge, magnetization) basis.
+            residual_g_local = charge_workspace.grid_to_coefficients(
+                np.moveaxis(real_grid_workspace, 0, -1)
             )
+            up_residual_g = residual_g_local[:, 0].copy()
+            residual_g_local[:, 0] += residual_g_local[:, 1]
+            residual_g_local[:, 1] = (
+                up_residual_g - residual_g_local[:, 1]
+            )
+            # Native scalar metric consumes a contiguous vector; recycle the
+            # temporary spin-up owner instead of materializing a column copy.
+            up_residual_g[...] = residual_g_local[:, 0]
         else:
             real_grid_workspace = v_eff_grid
             np.subtract(rho_out, rho, out=real_grid_workspace)
             charge_residual = real_grid_workspace
-        # Keep the compact residual produced for QE's dr2 metric and hand it
-        # to Broyden below. Previously mix_rho repeated this forward FFT.
-        residual_g_local = charge_workspace.grid_to_coefficients(
-            charge_residual
+            # Keep the compact residual produced for QE's dr2 metric and hand
+            # it to Broyden below. Previously mix_rho repeated this FFT.
+            residual_g_local = charge_workspace.grid_to_coefficients(
+                charge_residual
+            )
+        charge_residual_g = (
+            up_residual_g if lsda else residual_g_local
         )
         accuracy = 0.5 * pw.volume * mpi.sum_scalar(
             _load_native_fft().hartree_residual_metric(
-                residual_g_local,
+                charge_residual_g,
                 local_charge_g2,
             )
         )
         if lsda:
-            magnetization_residual = (
-                real_grid_workspace[0] - real_grid_workspace[1]
-            )
-            magnetization_residual_g = (
-                charge_workspace.grid_to_coefficients(
-                    magnetization_residual
-                )
-            )
-            # The charge channel carries QE's Coulomb metric.  The magnetic
-            # channel is short-ranged and therefore uses a finite L2 metric,
-            # including G=0 so a changing total moment contributes to dr2.
+            # QE rho_ddot uses e2*4*pi/(2*pi)^2 = 1/pi in Hartree units for
+            # the magnetic channel (lambda=1 bohr), including magnetic G=0.
             accuracy += 0.5 * pw.volume * mpi.sum_scalar(
                 float(np.real(np.vdot(
-                    magnetization_residual_g,
-                    magnetization_residual_g,
-                )))
+                    residual_g_local[:, 1], residual_g_local[:, 1]
+                ))) / np.pi
             )
-            del charge_residual, magnetization_residual
-            del magnetization_residual_g
+            del up_residual_g
         previous_accuracy = accuracy
         # QE estimates the first-solve eigensolver error as ethr*nelec. If
         # the newly measured dr2 is smaller, it repeats the same first SCF
