@@ -134,6 +134,7 @@ execution guide, validation/performance methodology, architecture, and
 QE-compatible diagnostics.
 
 See [PORTING.md](PORTING.md) for the compact runtime and memory notes.
+Release history is recorded in [CHANGELOG.md](CHANGELOG.md).
 
 ## Generative AI
 
