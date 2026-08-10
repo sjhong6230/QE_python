@@ -467,6 +467,7 @@ class SpinDensityMixer:
         self.delta_residuals = _HistoryBuffer(self.ndim)
         self.previous_input: np.ndarray | None = None
         self.previous_residual: np.ndarray | None = None
+        self.next_input_coefficients: np.ndarray | None = None
 
     @property
     def delta_inputs(self):
@@ -493,10 +494,18 @@ class SpinDensityMixer:
             raise ValueError("spin densities must have matching shape (2, ...)")
         if isinstance(self.charge_mixer, DistributedBroydenMixer):
             self.mixing_step += 1
-            current = self.workspace.grid_to_coefficients(
-                np.moveaxis(input_spins, 0, -1)
-            )
-            self._to_charge_magnetization(current)
+            if self.next_input_coefficients is None:
+                current = self.workspace.grid_to_coefficients(
+                    np.moveaxis(input_spins, 0, -1)
+                )
+                self._to_charge_magnetization(current)
+            else:
+                # The preceding call produced both this real-space density and
+                # its compact (n,m)(G) owner. QE likewise carries rho%of_g into
+                # the next iteration, so avoid transforming the same input
+                # spin grids again.
+                current = self.next_input_coefficients
+                self.next_input_coefficients = None
             if residual_coefficients is None:
                 residual = self.workspace.grid_to_coefficients(
                     np.moveaxis(output_spins, 0, -1)
@@ -570,15 +579,22 @@ class SpinDensityMixer:
                 residual_active[self.charge_positions] = screened[
                     self.charge_active
                 ]
-            mixed = current + self.beta * residual
+            # ``current`` is an owned transform/cache and is no longer needed
+            # separately after the secant snapshots above. Reuse it for the
+            # next reciprocal input instead of allocating a third spin-G pair.
+            zero = np.flatnonzero(self.local_g2 <= 1.0e-14)
+            zero_charge = current[zero, 0].copy() if zero.size else None
+            mixed = current
+            mixed += self.beta * residual
             mixed.ravel()[self.active] = (
                 current_active + self.beta * residual_active
             )
-            zero = np.flatnonzero(self.local_g2 <= 1.0e-14)
             if zero.size:
-                mixed[zero, 0] = current[zero, 0]
+                assert zero_charge is not None
+                mixed[zero, 0] = zero_charge
             self.previous_input = saved_input
             self.previous_residual = saved_residual
+            self.next_input_coefficients = mixed
             transformed = np.real(self.workspace.coefficients_to_grid(
                 mixed, use_scratch=True
             ))

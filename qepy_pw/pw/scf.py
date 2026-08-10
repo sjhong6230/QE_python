@@ -4040,9 +4040,14 @@ def _run_scf(
             * (history_count_report + 1)
             * len(local_charge_rows)
             * 16
+            * (2 if isinstance(density_mixer, SpinDensityMixer) else 1)
             if isinstance(
                 density_mixer,
-                (PlainBroydenMixer, DistributedBroydenMixer),
+                (
+                    PlainBroydenMixer,
+                    DistributedBroydenMixer,
+                    SpinDensityMixer,
+                ),
             )
             else 0
         )

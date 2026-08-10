@@ -77,8 +77,10 @@ class _SerialDensityWorkspace:
     def __init__(self, shape):
         self.shape = shape
         self.mpi = MPIContext()
+        self.forward_calls = 0
 
     def grid_to_coefficients(self, grid):
+        self.forward_calls += 1
         values = np.asarray(grid)
         transformed = np.fft.fftn(values, axes=(0, 1, 2))
         return np.ascontiguousarray(
@@ -124,6 +126,7 @@ def test_lsda_broyden_history_contains_magnetization_channel():
     ))
     first = mixer.mix(current, target)
     second = mixer.mix(first, target)
+    assert workspace.forward_calls == 3
     assert len(mixer.delta_inputs) == 1
     assert len(mixer.delta_residuals) == 1
     # A purely magnetic residual still creates a nonzero Broyden secant and
