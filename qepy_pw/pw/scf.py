@@ -3675,6 +3675,7 @@ def _run_scf(
         # point—so freed solver heaps do not inflate the next iteration's PSS
         # sample while avoiding thousands of allocator calls.
         trim_allocator()
+        occupations_started = timers.start()
         if occupations_mode == "smearing":
             fermi_energy, band_occupations, smearing_energy = (
                 smeared_occupations(
@@ -3711,6 +3712,7 @@ def _run_scf(
                     band_occupations.append(values_occupations)
             fermi_energy = None
             smearing_energy = 0.0
+        timers.stop("weights", occupations_started)
         if fixed_potential:
             # NSCF and bands calculations stop after diagonalizing the fixed
             # SCF potential.  In particular, do not construct rho_out, test a

@@ -997,7 +997,9 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
         print(f"     {name:<13s}:" + _format_timing(result, name), file=out)
     print("     sym_rho:init :" + _format_timing(result, "sym_rho:init"), file=out)
     print("\n     Called by electrons:", file=out)
-    for name in ("c_bands", "sum_band", "v_of_rho", "v_h", "v_xc", "mix_rho"):
+    for name in (
+        "c_bands", "weights", "sum_band", "v_of_rho", "v_h", "v_xc", "mix_rho"
+    ):
         print(f"     {name:<13s}:" + _format_timing(result, name), file=out)
     print("\n     Called by sum_band:", file=out)
     for name in (

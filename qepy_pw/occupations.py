@@ -670,6 +670,45 @@ def smearing_density(x: np.ndarray | float, order: int) -> np.ndarray:
     )
 
 
+def _smearing_density_derivative(
+    x: np.ndarray | float, order: int
+) -> np.ndarray:
+    """QE ``w2gauss``: derivative of the smearing delta function.
+
+    Only the smearing orders accepted by :func:`smearing_order` are needed
+    here.  Keeping this analytic is important: ``efermig`` evaluates both
+    derivatives repeatedly while refining the Fermi energy.
+    """
+    values = np.asarray(x, dtype=float)
+    if order == -99:
+        result = np.zeros_like(values)
+        middle = np.abs(values) <= 36.0
+        exponent = np.exp(values[middle])
+        inverse = 1.0 / exponent
+        result[middle] = -(exponent - inverse) / (
+            2.0 + exponent + inverse
+        ) ** 2
+        return result
+    if order == -1:
+        shifted = values - 1.0 / np.sqrt(2.0)
+        gaussian = np.exp(-np.minimum(200.0, shifted * shifted)) / np.sqrt(
+            np.pi
+        )
+        return gaussian * (
+            2.0 * np.sqrt(2.0) * values * values
+            - 6.0 * values
+            + np.sqrt(2.0)
+        )
+    gaussian = np.exp(-np.minimum(200.0, values * values)) / np.sqrt(np.pi)
+    if order == 0:
+        return -2.0 * values * gaussian
+    if order == 1:
+        return values * (2.0 * values * values - 5.0) * gaussian
+    raise QEInputError(
+        "analytic smearing-density derivative supports ngauss=0, 1, -1, or -99"
+    )
+
+
 def w1gauss(x: np.ndarray | float, order: int) -> np.ndarray:
     """QE ``w1gauss`` variational smearing/free-energy correction."""
     values = np.asarray(x, dtype=float)
@@ -730,10 +769,6 @@ def smeared_occupations(
         raise QEInputError("degauss must be positive for smeared occupations")
     if not eigenvalues or any(len(values) == 0 for values in eigenvalues):
         raise QEInputError("cannot determine occupations without bands")
-    # Importing scipy.optimize initializes a sizeable collection of extension
-    # modules and private runtime state. Fixed-occupation calculations never
-    # need it, so keep that per-MPI-rank baseline out of their working set.
-    from scipy.optimize import brentq
     normalized_weights = np.asarray(weights, dtype=float)
     if normalized_weights.shape != (len(eigenvalues),):
         raise QEInputError("k-point weights do not match eigenvalue arrays")
@@ -783,47 +818,81 @@ def smeared_occupations(
     while electron_count(upper) < nelec:
         upper += 10.0 * degauss_ha
 
-    # QE first obtains a Gaussian estimate for MP/cold smearing. Select the
-    # actual-function root nearest that estimate when the broadened electron
-    # count is locally non-monotonic.
-    gaussian_fermi = brentq(
-        lambda value: electron_count(value, 0) - nelec,
-        lower,
-        upper,
-        xtol=1.0e-13,
-        rtol=1.0e-14,
-    )
-    if order in {0, -99}:
-        fermi = brentq(
-            lambda value: electron_count(value) - nelec,
-            lower,
-            upper,
-            xtol=1.0e-13,
-            rtol=1.0e-14,
-        )
-    else:
-        grid = np.linspace(lower, upper, 2001)
-        residual = np.array([electron_count(value) - nelec for value in grid])
-        crossings = np.flatnonzero(residual[:-1] * residual[1:] <= 0.0)
-        if crossings.size == 0:
+    def bisect_fermi(broadening_order: int) -> float:
+        """QE-style electron-count bisection without SciPy startup cost."""
+        local_lower = lower
+        local_upper = upper
+        tolerance = 1.0e-12
+        if (
+            electron_count(local_lower, broadening_order) - nelec > tolerance
+            or electron_count(local_upper, broadening_order) - nelec
+            < -tolerance
+        ):
             raise QEInputError("cannot bracket the Fermi energy")
-        index = int(
-            crossings[
-                np.argmin(np.abs(grid[crossings] - gaussian_fermi))
-            ]
-        )
-        fermi = brentq(
-            lambda value: electron_count(value) - nelec,
-            float(grid[index]),
-            float(grid[index + 1]),
-            xtol=1.0e-13,
-            rtol=1.0e-14,
-        )
+        for _ in range(300):
+            midpoint = 0.5 * (local_lower + local_upper)
+            residual = electron_count(midpoint, broadening_order) - nelec
+            if abs(residual) < tolerance:
+                return midpoint
+            if residual < 0.0:
+                local_lower = midpoint
+            else:
+                local_upper = midpoint
+        raise QEInputError("Fermi-energy bisection did not converge")
 
+    # QE first obtains a Gaussian estimate for MP/cold smearing.  Its
+    # occupation is not necessarily monotonic, so use the same Newton
+    # minimization of (N(Ef)-nelec)^2 as QE 7.5 efermig.f90.  The previous
+    # implementation sampled 2,001 trial Fermi energies on every SCF step;
+    # that dominated otherwise inexpensive LDA calculations with many k
+    # points.
+    gaussian_fermi = bisect_fermi(-99 if order == -99 else 0)
+    if order == 0:
+        fermi = gaussian_fermi
+    elif order == -99:
+        fermi = gaussian_fermi
+    else:
+        fermi = gaussian_fermi
+        residual_tolerance = 1.0e-10
+        for _ in range(300):
+            scaled = (fermi - flat_eigenvalues) / degauss_ha
+            residual = electron_count(fermi) - nelec
+            first = spin_degeneracy * float(
+                np.dot(flat_weights, smearing_density(scaled, order))
+            ) / degauss_ha
+            second = spin_degeneracy * float(
+                np.dot(
+                    flat_weights,
+                    _smearing_density_derivative(scaled, order),
+                )
+            ) / (degauss_ha * degauss_ha)
+            numerator = 2.0 * residual * first
+            denominator = abs(
+                2.0 * (first * first + residual * second)
+            )
+            if denominator <= residual_tolerance:
+                break
+            refined = fermi - numerator / denominator
+            if (
+                abs(refined - fermi) < residual_tolerance
+                or abs(electron_count(refined) - nelec) < residual_tolerance
+            ):
+                fermi = refined
+                break
+            fermi = refined
+
+        # This is QE's deliberately looser acceptance criterion for MP/cold.
+        # Fall back to its legacy actual-smearing bisection only if the local
+        # minimization did not locate the physically adjacent root.
+        if abs(electron_count(fermi) - nelec) >= 1.0e-2:
+            fermi = bisect_fermi(order)
+
+    flat_occupations = spin_degeneracy * wgauss(
+        (fermi - flat_eigenvalues) / degauss_ha, order
+    )
+    boundaries = np.cumsum([len(values) for values in eigenvalues[:-1]])
     occupations = [
-        spin_degeneracy
-        * wgauss((fermi - np.asarray(values)) / degauss_ha, order)
-        for values in eigenvalues
+        values.copy() for values in np.split(flat_occupations, boundaries)
     ]
     smearing_energy = spin_degeneracy * degauss_ha * float(
         np.dot(
