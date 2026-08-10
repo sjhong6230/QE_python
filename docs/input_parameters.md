@@ -5,6 +5,19 @@ quoted strings, indexed names such as `celldm(1)`, comma- or newline-separated
 assignments, `D` exponents, and comments beginning with `!` or `#` are
 accepted. Names are case-insensitive.
 
+One-dimensional namelist arrays accept both standard Fortran forms. An
+unindexed whole-array assignment is expanded from element 1, and an indexed
+assignment followed by several values fills consecutive elements:
+
+```text
+e1(1)=1.0, e1(2)=0.0, e1(3)=0.0
+e1=1.0, 0.0, 0.0
+e1(1)=1.0, 0.0, 0.0
+```
+
+These three inputs are equivalent. This lexical behavior is shared by
+`pw.py` and all namelist-based post-processing executables.
+
 Only variables listed below affect the implemented scalar SCF, NSCF, and
 band-structure calculations.
 Supplying a valid QE 7.5 variable outside this list produces an explicit

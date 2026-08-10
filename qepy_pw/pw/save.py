@@ -172,7 +172,11 @@ def _input_xml(root: ET.Element, pw: PWInput, result: SCFResult) -> None:
     bands = ET.SubElement(input_element, _qes("bands"))
     _text(bands, "nbnd", max((len(v) for v in result.eigenvalues_ha), default=0))
     _text(bands, "tot_charge", float(pw.system.get("tot_charge", 0.0)))
-    _text(bands, "occupations", pw.system.get("occupations", "fixed"))
+    occupations = str(pw.system.get("occupations", "fixed"))
+    _text(bands, "occupations", occupations)
+    if occupations.strip().lower() == "smearing":
+        smearing = _text(bands, "smearing", pw.system.get("smearing", "gaussian"))
+        smearing.set("degauss", f"{0.5 * float(pw.system.get('degauss', 0.0)):.16e}")
 
     basis = ET.SubElement(input_element, _qes("basis"))
     # qepy-pw stores a complete complex G basis even for a Gamma-only input;
@@ -337,9 +341,11 @@ def _output_xml(root: ET.Element, pw: PWInput, result: SCFResult) -> None:
     if result.fermi_energy_ha is not None:
         _text(bands, "fermi_energy", result.fermi_energy_ha)
     _text(bands, "nks", len(pw.kpoints))
-    _text(bands, "occupations_kind", pw.system.get("occupations", "fixed"))
-    _text(bands, "smearing", pw.system.get("smearing", "gaussian"))
-    _text(bands, "degauss", float(pw.system.get("degauss", 0.0)))
+    occupations = str(pw.system.get("occupations", "fixed"))
+    _text(bands, "occupations_kind", occupations)
+    if occupations.strip().lower() == "smearing":
+        smearing = _text(bands, "smearing", pw.system.get("smearing", "gaussian"))
+        smearing.set("degauss", f"{0.5 * float(pw.system.get('degauss', 0.0)):.16e}")
     if pw.kpoint_grid is not None:
         ET.SubElement(
             bands,

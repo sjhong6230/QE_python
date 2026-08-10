@@ -18,6 +18,7 @@ the current source tree, not the complete feature set of upstream QE.
 | [QE-compatible diagnostics](qe_diagnostics.md) | Implemented QE-style error and warning conditions and their compatibility boundary |
 | [Band post-processing](band_postprocessing.md) | `bands.py`, scalar irrep classification, overlap ordering, and `plotband.py` formats |
 | [DOS post-processing](dos_postprocessing.md) | `dos.py` smearing and tetrahedron integration, input, and output formats |
+| [Scalar field post-processing](pp_postprocessing.md) | `pp.py` extraction, intermediate files, weighted combinations, interpolation, XSF, and cube output |
 | [Projected DOS](projwfc_postprocessing.md) | `projwfc.py` Löwdin atomic projections, charges, spilling, and PDOS files |
 
 ## Scope at a glance
