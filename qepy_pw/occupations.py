@@ -48,22 +48,72 @@ def smearing_order(name: object) -> int:
         ) from exc
 
 
-def default_number_of_bands(nelec: float, occupations: object) -> int:
-    """Return QE's scalar ``setup.f90`` default number of bands.
+def spin_electron_counts(
+    nelec: float, tot_magnetization: float = -10000.0
+) -> tuple[float, float]:
+    """Return QE's ``nelup`` and ``neldw`` for a collinear calculation."""
+    if tot_magnetization < -9999.0:
+        if abs(nelec - round(nelec)) < 1.0e-8:
+            nelup = float(int(round(nelec) + 1) // 2)
+            return nelup, float(nelec - nelup)
+        return 0.5 * nelec, 0.5 * nelec
+    return (
+        0.5 * (nelec + tot_magnetization),
+        0.5 * (nelec - tot_magnetization),
+    )
+
+
+def default_number_of_bands(
+    nelec: float,
+    occupations: object,
+    *,
+    nspin: int = 1,
+    tot_magnetization: float = -10000.0,
+) -> int:
+    """Return QE's ``setup.f90`` default number of bands.
 
     QE uses Fortran ``NINT`` rather than a ceiling operation.  Electron
     counts are nonnegative here, so ``floor(x + 1/2)`` reproduces its
     round-to-nearest behavior, including half-integer ties away from zero.
     """
-    filled = int(np.floor(0.5 * nelec + 0.5))
+    nelup, neldw = spin_electron_counts(nelec, tot_magnetization)
+    filled = max(
+        int(np.floor(0.5 * nelec + 0.5)),
+        int(np.floor(nelup + 0.5)) if nspin == 2 else 0,
+        int(np.floor(neldw + 0.5)) if nspin == 2 else 0,
+    )
     metallic_modes = {
         "smearing", "tetrahedra", "tetrahedra_lin", "tetrahedra-lin",
         "tetrahedra_opt", "tetrahedra-opt",
     }
     if str(occupations).strip().lower() not in metallic_modes:
         return filled
-    metallic = int(np.floor(1.2 * 0.5 * nelec + 0.5))
+    metallic = max(
+        int(np.floor(1.2 * 0.5 * nelec + 0.5)),
+        int(np.floor(1.2 * nelup + 0.5)) if nspin == 2 else 0,
+        int(np.floor(1.2 * neldw + 0.5)) if nspin == 2 else 0,
+    )
     return max(filled + 4, metallic)
+
+
+def fixed_occupations(
+    number_of_bands: int,
+    nelup: float,
+    neldw: float,
+    spatial_kpoints: int,
+) -> list[np.ndarray]:
+    """Build QE-order fixed LSDA occupations (all up k points, then down)."""
+    result: list[np.ndarray] = []
+    for electrons in (nelup, neldw):
+        if electrons < -1.0e-10 or electrons > number_of_bands + 1.0e-10:
+            raise QEInputError("too few spin bands")
+        row = np.zeros(number_of_bands, dtype=float)
+        whole = min(number_of_bands, int(np.floor(electrons + 1.0e-12)))
+        row[:whole] = 1.0
+        if whole < number_of_bands:
+            row[whole] = max(0.0, min(1.0, electrons - whole))
+        result.extend(row.copy() for _ in range(spatial_kpoints))
+    return result
 
 
 _OPTIMIZED_TETRA_WEIGHTS = np.asarray(
@@ -444,6 +494,7 @@ def tetrahedron_occupations(
     full_to_irreducible: np.ndarray,
     reciprocal: np.ndarray,
     method: str,
+    spin_degeneracy: float = 2.0,
 ) -> tuple[float, list[np.ndarray]]:
     """QE linear, Blöchl-corrected, or optimized tetrahedron occupations."""
     normalized = str(method).strip().lower().replace("-", "_")
@@ -459,13 +510,23 @@ def tetrahedron_occupations(
         optimized,
     )
     matrix = np.stack([np.asarray(values, dtype=float) for values in eigenvalues])
+    spin_polarized = abs(spin_degeneracy - 1.0) < 1.0e-12
+    spatial_points = len(matrix)
+    bands_per_spin = matrix.shape[1]
+    if spin_polarized:
+        if len(matrix) % 2:
+            raise QEInputError("LSDA tetrahedra require paired spin k points")
+        spatial_points = len(matrix) // 2
+        matrix = np.concatenate(
+            (matrix[:spatial_points], matrix[spatial_points:]), axis=1
+        )
     effective = _tetrahedron_effective_energies(
         matrix, tetra, interpolation
     )
     sorted_effective = np.ascontiguousarray(
         np.sort(effective, axis=-1), dtype=np.float64
     )
-    capacity = 2.0 * matrix.shape[1]
+    capacity = spin_degeneracy * matrix.shape[1]
     if nelec <= 0.0 or nelec >= capacity - 1.0e-12:
         raise QEInputError(
             f"nbnd provides {capacity:.6g} tetrahedron states for {nelec:.6g} electrons; add unoccupied bands"
@@ -478,7 +539,7 @@ def tetrahedron_occupations(
     for _ in range(300):
         fermi = 0.5 * (lower + upper)
         count = (
-            2.0
+            spin_degeneracy
             * float(native.tetrahedron_integrated_sum(
                 sorted_effective, fermi
             ))
@@ -512,20 +573,35 @@ def tetrahedron_occupations(
         np.ascontiguousarray(interpolation, dtype=np.float64),
         len(matrix),
     )
-    integrated *= 2.0 / ntetra
+    integrated *= spin_degeneracy / ntetra
     point_weights = np.asarray(irreducible_weights, dtype=float)
+    if spin_polarized:
+        point_weights = point_weights[:spatial_points]
     if np.any(point_weights <= 0.0):
         raise QEInputError("tetrahedron irreducible k-point weights must be positive")
     occupations = integrated / point_weights[:, None]
     # QE averages weights over exactly degenerate bands at each k point.
+    sections = (
+        ((0, bands_per_spin), (bands_per_spin, 2 * bands_per_spin))
+        if spin_polarized
+        else ((0, matrix.shape[1]),)
+    )
     for ik, values in enumerate(matrix):
-        begin = 0
-        while begin < len(values):
-            end = begin + 1
-            while end < len(values) and abs(values[end] - values[begin]) < 1.0e-6:
-                end += 1
-            occupations[ik, begin:end] = np.mean(occupations[ik, begin:end])
-            begin = end
+        for first, last in sections:
+            begin = first
+            while begin < last:
+                end = begin + 1
+                while end < last and abs(values[end] - values[begin]) < 1.0e-6:
+                    end += 1
+                occupations[ik, begin:end] = np.mean(
+                    occupations[ik, begin:end]
+                )
+                begin = end
+    if spin_polarized:
+        return float(fermi), [
+            *[row[:bands_per_spin].copy() for row in occupations],
+            *[row[bands_per_spin:].copy() for row in occupations],
+        ]
     return float(fermi), [row.copy() for row in occupations]
 
 
@@ -641,11 +717,14 @@ def smeared_occupations(
     nelec: float,
     degauss_ha: float,
     order: int,
+    spin_degeneracy: float = 2.0,
 ) -> tuple[float, list[np.ndarray], float]:
     """Find the Fermi level, occupations, and QE ``demet`` in Hartree.
 
-    Returned occupations include the scalar spin degeneracy and therefore
-    approach two below the Fermi level. K-point weights remain separate.
+    By default returned occupations include scalar spin degeneracy and
+    approach two below the Fermi level. Pass ``spin_degeneracy=1`` for LSDA;
+    the two spin blocks then each approach one. K-point weights remain
+    separate.
     """
     if degauss_ha <= 0.0:
         raise QEInputError("degauss must be positive for smeared occupations")
@@ -658,7 +737,13 @@ def smeared_occupations(
     normalized_weights = np.asarray(weights, dtype=float)
     if normalized_weights.shape != (len(eigenvalues),):
         raise QEInputError("k-point weights do not match eigenvalue arrays")
-    normalized_weights = normalized_weights / np.sum(normalized_weights)
+    if spin_degeneracy <= 0.0:
+        raise QEInputError("spin degeneracy must be positive")
+    normalized_weights = (
+        normalized_weights
+        * (2.0 / spin_degeneracy)
+        / np.sum(normalized_weights)
+    )
     flat_eigenvalues = np.concatenate(
         [np.asarray(values, dtype=float) for values in eigenvalues]
     )
@@ -668,7 +753,7 @@ def smeared_occupations(
             for weight, values in zip(normalized_weights, eigenvalues)
         ]
     )
-    capacity = 2.0 * sum(
+    capacity = spin_degeneracy * sum(
         weight * len(values)
         for weight, values in zip(normalized_weights, eigenvalues)
     )
@@ -679,7 +764,7 @@ def smeared_occupations(
         )
 
     def electron_count(fermi: float, broadening_order: int = order) -> float:
-        return 2.0 * float(
+        return spin_degeneracy * float(
             np.dot(
                 flat_weights,
                 wgauss(
@@ -736,10 +821,11 @@ def smeared_occupations(
         )
 
     occupations = [
-        2.0 * wgauss((fermi - np.asarray(values)) / degauss_ha, order)
+        spin_degeneracy
+        * wgauss((fermi - np.asarray(values)) / degauss_ha, order)
         for values in eigenvalues
     ]
-    smearing_energy = 2.0 * degauss_ha * float(
+    smearing_energy = spin_degeneracy * degauss_ha * float(
         np.dot(
             flat_weights,
             w1gauss(
