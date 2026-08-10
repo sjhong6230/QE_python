@@ -397,6 +397,54 @@ class LinearMixer:
         return (1.0 - self.beta) * density_in + self.beta * density_out
 
 
+class SpinDensityMixer:
+    """Mix collinear charge and magnetization in QE's natural basis.
+
+    The long-range Broyden/Thomas--Fermi preconditioner acts on total charge.
+    Magnetization has no Coulomb singularity and is mixed directly, including
+    its G=0 component so unconstrained LSDA moments can evolve.
+    """
+
+    def __init__(self, charge_mixer, beta: float = 0.7) -> None:
+        self.charge_mixer = charge_mixer
+        self.beta = float(beta)
+
+    @property
+    def delta_inputs(self):
+        return self.charge_mixer.delta_inputs
+
+    def mix(
+        self,
+        density_in: np.ndarray,
+        density_out: np.ndarray,
+        *,
+        residual_coefficients: np.ndarray | None = None,
+    ) -> np.ndarray:
+        input_spins = np.asarray(density_in, dtype=float)
+        output_spins = np.asarray(density_out, dtype=float)
+        if input_spins.shape != output_spins.shape or input_spins.shape[0] != 2:
+            raise ValueError("spin densities must have matching shape (2, ...)")
+        charge_in = input_spins[0] + input_spins[1]
+        charge_out = output_spins[0] + output_spins[1]
+        if isinstance(self.charge_mixer, DistributedBroydenMixer):
+            charge = self.charge_mixer.mix(
+                charge_in,
+                charge_out,
+                residual_coefficients=residual_coefficients,
+            )
+        else:
+            charge = self.charge_mixer.mix(charge_in, charge_out)
+        magnetization_in = input_spins[0] - input_spins[1]
+        magnetization_out = output_spins[0] - output_spins[1]
+        magnetization = (
+            (1.0 - self.beta) * magnetization_in
+            + self.beta * magnetization_out
+        )
+        return np.stack(
+            (0.5 * (charge + magnetization), 0.5 * (charge - magnetization))
+        )
+
+
 class DistributedBroydenMixer:
     """QE-style Broyden mixer over locally owned charge-density G rows."""
 

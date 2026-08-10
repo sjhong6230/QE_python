@@ -451,6 +451,193 @@ def pw92_lda_unpolarized(
     return epsilon, potential
 
 
+def _pw92_component(
+    rs: np.ndarray,
+    a: float,
+    a1: float,
+    b1: float,
+    b2: float,
+    b3: float,
+    b4: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Vectorized PW92 rational component used by ``pw_spin``."""
+    root = np.sqrt(rs)
+    rs32 = rs * root
+    rs2 = rs * rs
+    omega = 2.0 * a * (
+        b1 * root + b2 * rs + b3 * rs32 + b4 * rs2
+    )
+    derivative = 2.0 * a * (
+        0.5 * b1 * root
+        + b2 * rs
+        + 1.5 * b3 * rs32
+        + 2.0 * b4 * rs2
+    )
+    logarithm = np.log1p(1.0 / omega)
+    energy = -2.0 * a * (1.0 + a1 * rs) * logarithm
+    potential = (
+        -2.0 * a * (1.0 + (2.0 / 3.0) * a1 * rs) * logarithm
+        - (2.0 / 3.0)
+        * a
+        * (1.0 + a1 * rs)
+        * derivative
+        / (omega * (omega + 1.0))
+    )
+    return energy, potential
+
+
+def _pz81_correlation_unpolarized(
+    rs: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    low_rs = rs < 1.0
+    logarithm = np.log(rs)
+    energy_high = (
+        0.0311 * logarithm
+        - 0.048
+        + 0.0020 * rs * logarithm
+        - 0.0116 * rs
+    )
+    potential_high = (
+        0.0311 * logarithm
+        - (0.048 + 0.0311 / 3.0)
+        + (2.0 / 3.0) * 0.0020 * rs * logarithm
+        + (2.0 * -0.0116 - 0.0020) * rs / 3.0
+    )
+    denominator = 1.0 + 1.0529 * np.sqrt(rs) + 0.3334 * rs
+    energy_low = -0.1423 / denominator
+    potential_low = energy_low * (
+        1.0 + (7.0 / 6.0) * 1.0529 * np.sqrt(rs)
+        + (4.0 / 3.0) * 0.3334 * rs
+    ) / denominator
+    return (
+        np.where(low_rs, energy_high, energy_low),
+        np.where(low_rs, potential_high, potential_low),
+    )
+
+
+def _pz81_correlation_polarized(
+    rs: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    low_rs = rs < 1.0
+    logarithm = np.log(rs)
+    energy_high = (
+        0.01555 * logarithm
+        - 0.0269
+        + 0.0007 * rs * logarithm
+        - 0.0048 * rs
+    )
+    potential_high = (
+        0.01555 * logarithm
+        + (-0.0269 - 0.01555 / 3.0)
+        + (2.0 / 3.0) * 0.0007 * rs * logarithm
+        + (2.0 * -0.0048 - 0.0007) * rs / 3.0
+    )
+    denominator = 1.0 + 1.3981 * np.sqrt(rs) + 0.2611 * rs
+    energy_low = -0.0843 / denominator
+    potential_low = energy_low * (
+        1.0 + (7.0 / 6.0) * 1.3981 * np.sqrt(rs)
+        + (4.0 / 3.0) * 0.2611 * rs
+    ) / denominator
+    return (
+        np.where(low_rs, energy_high, energy_low),
+        np.where(low_rs, potential_high, potential_low),
+    )
+
+
+def lsda_lda(
+    spin_density: np.ndarray,
+    functional: str = "pz",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return collinear LSDA ``epsilon_xc`` and ``(v_up, v_down)``.
+
+    The implementation follows QE 7.5 XClib's ``xc_lsda``, including the
+    Perdew--Zunger 1981 and Perdew--Wang 1992 spin interpolation formulas.
+    ``spin_density`` is ordered as majority/up then minority/down.
+    """
+    spins = np.asarray(spin_density, dtype=np.float64)
+    if spins.ndim < 2 or spins.shape[0] != 2:
+        raise ValueError("spin_density must have shape (2, ...)")
+    if functional not in LDA_FUNCTIONALS:
+        raise ValueError(f"unsupported LSDA functional {functional!r}")
+    total = np.abs(spins[0] + spins[1])
+    active = total > 1.0e-10
+    safe_total = np.maximum(total, 1.0e-10)
+    zeta = np.clip((spins[0] - spins[1]) / safe_total, -1.0, 1.0)
+    rs = 0.6203504908994 / np.cbrt(safe_total)
+
+    exchange_constant = -1.10783814957303361 * (2.0 / 3.0)
+    up_root = np.cbrt(np.maximum(0.0, (1.0 + zeta) * safe_total))
+    down_root = np.cbrt(np.maximum(0.0, (1.0 - zeta) * safe_total))
+    exchange_up = exchange_constant * up_root
+    exchange_down = exchange_constant * down_root
+    exchange = 0.5 * (
+        (1.0 + zeta) * exchange_up
+        + (1.0 - zeta) * exchange_down
+    )
+    potential_up = (4.0 / 3.0) * exchange_up
+    potential_down = (4.0 / 3.0) * exchange_down
+
+    p43 = 4.0 / 3.0
+    denominator = 2.0**p43 - 2.0
+    fz = (
+        (1.0 + zeta) ** p43
+        + (1.0 - zeta) ** p43
+        - 2.0
+    ) / denominator
+    dfz = p43 * (
+        np.cbrt(1.0 + zeta) - np.cbrt(1.0 - zeta)
+    ) / denominator
+    if functional == "pz":
+        ecu, vcu = _pz81_correlation_unpolarized(rs)
+        ecp, vcp = _pz81_correlation_polarized(rs)
+        difference = ecp - ecu
+        correlation = ecu + fz * difference
+        common = vcu + fz * (vcp - vcu)
+        correlation_up = common + difference * dfz * (1.0 - zeta)
+        correlation_down = common + difference * dfz * (-1.0 - zeta)
+    else:
+        ecu, vcu = _pw92_component(
+            rs, 0.031091, 0.21370, 7.5957, 3.5876, 1.6382, 0.49294
+        )
+        ecp, vcp = _pw92_component(
+            rs, 0.015545, 0.20548, 14.1189, 6.1977, 3.3662, 0.62517
+        )
+        stiffness_energy, stiffness_potential = _pw92_component(
+            rs, 0.016887, 0.11125, 10.357, 3.6231, 0.88026, 0.49671
+        )
+        alpha = -stiffness_energy
+        alpha_potential = -stiffness_potential
+        zeta3 = zeta**3
+        zeta4 = zeta3 * zeta
+        fz0 = 1.709921
+        correlation = (
+            ecu
+            + alpha * fz * (1.0 - zeta4) / fz0
+            + (ecp - ecu) * fz * zeta4
+        )
+        spin_derivative = (
+            alpha
+            / fz0
+            * (dfz * (1.0 - zeta4) - 4.0 * fz * zeta3)
+            + (ecp - ecu) * (dfz * zeta4 + 4.0 * fz * zeta3)
+        )
+        common = (
+            vcu
+            + alpha_potential * fz * (1.0 - zeta4) / fz0
+            + (vcp - vcu) * fz * zeta4
+        )
+        correlation_up = common + spin_derivative * (1.0 - zeta)
+        correlation_down = common - spin_derivative * (1.0 + zeta)
+
+    epsilon = exchange + correlation
+    potentials = np.stack(
+        (potential_up + correlation_up, potential_down + correlation_down)
+    )
+    epsilon[~active] = 0.0
+    potentials[:, ~active] = 0.0
+    return epsilon, potentials
+
+
 def pz81_unpolarized(
     rho: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:

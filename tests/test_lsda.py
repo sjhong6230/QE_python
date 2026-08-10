@@ -13,6 +13,8 @@ from qepy_pw.occupations import (
     smeared_occupations,
     spin_electron_counts,
 )
+from qepy_pw.xc import lsda_lda, pw92_lda_unpolarized, pz81_unpolarized
+from qepy_pw.scf import run_scf
 
 
 def _lsda_input(system: str, kpoints: str = "K_POINTS gamma") -> str:
@@ -134,3 +136,82 @@ def test_lsda_default_band_count_uses_larger_spin_population() -> None:
         nspin=2,
         tot_magnetization=-10000.0,
     ) == 8
+
+
+@pytest.mark.parametrize(
+    ("functional", "unpolarized"),
+    [("pz", pz81_unpolarized), ("pw", pw92_lda_unpolarized)],
+)
+def test_lsda_reduces_to_lda_at_zero_spin_polarization(
+    functional, unpolarized
+) -> None:
+    total = np.logspace(-9, 1, 41)
+    epsilon, potential = lsda_lda(
+        np.stack((0.5 * total, 0.5 * total)), functional
+    )
+    expected_epsilon, expected_potential = unpolarized(total)
+    assert epsilon == pytest.approx(expected_epsilon, abs=2.0e-14)
+    assert potential[0] == pytest.approx(expected_potential, abs=2.0e-14)
+    assert potential[1] == pytest.approx(expected_potential, abs=2.0e-14)
+
+
+@pytest.mark.parametrize("functional", ["pz", "pw"])
+def test_lsda_potentials_are_energy_density_derivatives(functional: str) -> None:
+    spin_density = np.asarray([[0.11, 0.43], [0.07, 0.19]])
+    epsilon, potential = lsda_lda(spin_density, functional)
+    energy_density = np.sum(spin_density, axis=0) * epsilon
+    step = 1.0e-7
+    for spin in range(2):
+        displaced = spin_density.copy()
+        displaced[spin] += step
+        plus_epsilon, _ = lsda_lda(displaced, functional)
+        plus = np.sum(displaced, axis=0) * plus_epsilon
+        displaced[spin] -= 2.0 * step
+        minus_epsilon, _ = lsda_lda(displaced, functional)
+        minus = np.sum(displaced, axis=0) * minus_epsilon
+        derivative = (plus - minus) / (2.0 * step)
+        assert derivative == pytest.approx(potential[spin], abs=2.0e-8)
+    assert np.all(np.isfinite(energy_density))
+
+
+def test_lsda_spin_swap_swaps_only_the_potentials() -> None:
+    density = np.asarray([[0.31, 0.04], [0.12, 0.27]])
+    epsilon, potential = lsda_lda(density, "pz")
+    swapped_epsilon, swapped_potential = lsda_lda(density[::-1], "pz")
+    assert swapped_epsilon == pytest.approx(epsilon, abs=2.0e-15)
+    assert swapped_potential == pytest.approx(potential[::-1], abs=2.0e-15)
+
+
+def test_lsda_scf_runs_two_spin_blocks_and_preserves_spatial_symmetry() -> None:
+    pw = read_pw_input(io.StringIO("""\
+&CONTROL
+  calculation='scf',
+  pseudo_dir='./tests/qe_reference/upstream/pseudo',
+  disk_io='none', tstress=.true., tprnfor=.true.
+/
+&SYSTEM
+  ibrav=1, celldm(1)=10.0, nat=2, ntyp=1,
+  ecutwfc=12.0, nbnd=1, nspin=2,
+  occupations='fixed', tot_magnetization=0
+/
+&ELECTRONS
+  conv_thr=1.d-5, electron_maxstep=30
+/
+ATOMIC_SPECIES
+H 1.0008 H.pz-vbc.UPF
+ATOMIC_POSITIONS angstrom
+H 0.00 0.00 -0.35
+H 0.00 0.00  0.35
+K_POINTS gamma
+"""))
+    result = run_scf(pw)
+    assert result.converged
+    assert result.density.shape[0] == 2
+    assert pw.kpoint_spins == (1, 2)
+    assert len(result.eigenvalues_ha) == 2
+    assert result.forces_ha_per_bohr is not None
+    assert result.stress_ha_per_bohr3 is not None
+    assert [row[0] for row in result.occupations] == [1.0, 1.0]
+    # A nonmagnetic starting state must remain invariant under spin exchange;
+    # the crystal density symmetrizer is applied independently to each block.
+    np.testing.assert_allclose(result.density[0], result.density[1], atol=1e-6)
