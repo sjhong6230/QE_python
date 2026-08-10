@@ -610,6 +610,34 @@ def lsda_lda(
         raise ValueError("spin_density must have shape (2, ...)")
     if functional not in LDA_FUNCTIONALS:
         raise ValueError(f"unsupported LSDA functional {functional!r}")
+    point_count = spins[0].size
+    if point_count <= GGA_POINT_BLOCK_SIZE:
+        return _lsda_lda_block(spins, functional)
+
+    # LSDA spin interpolation carries substantially more pointwise work arrays
+    # than scalar LDA.  Tile it through the same cache-sized blocks used by GGA
+    # so large FFT grids do not stream dozens of full-grid temporaries through
+    # memory for every v_xc call.
+    epsilon = np.empty(spins.shape[1:], dtype=np.float64, order="C")
+    potentials = np.empty(spins.shape, dtype=np.float64, order="C")
+    spin_flat = spins.reshape(2, -1)
+    epsilon_flat = epsilon.reshape(-1)
+    potential_flat = potentials.reshape(2, -1)
+    for first in range(0, point_count, GGA_POINT_BLOCK_SIZE):
+        last = min(first + GGA_POINT_BLOCK_SIZE, point_count)
+        block_epsilon, block_potentials = _lsda_lda_block(
+            spin_flat[:, first:last], functional
+        )
+        epsilon_flat[first:last] = block_epsilon
+        potential_flat[:, first:last] = block_potentials
+    return epsilon, potentials
+
+
+def _lsda_lda_block(
+    spins: np.ndarray,
+    functional: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Evaluate PZ/PW LSDA on one cache-sized contiguous density block."""
     total = np.abs(spins[0] + spins[1])
     active = total > 1.0e-10
     safe_total = np.maximum(total, 1.0e-10)

@@ -192,6 +192,32 @@ def test_lsda_spin_swap_swaps_only_the_potentials() -> None:
 
 
 @pytest.mark.parametrize("functional", ["pz", "pw"])
+def test_large_lsda_grid_tiling_preserves_pointwise_results(functional: str) -> None:
+    points = 40_000
+    total = np.linspace(1.0e-8, 0.8, points)
+    polarization = 0.7 * np.sin(np.linspace(-2.0, 3.0, points))
+    density = np.stack((
+        0.5 * total * (1.0 + polarization),
+        0.5 * total * (1.0 - polarization),
+    ))
+    epsilon, potential = lsda_lda(density, functional)
+    split = points // 2
+    left_epsilon, left_potential = lsda_lda(
+        density[:, :split], functional
+    )
+    right_epsilon, right_potential = lsda_lda(
+        density[:, split:], functional
+    )
+    np.testing.assert_array_equal(
+        epsilon, np.concatenate((left_epsilon, right_epsilon))
+    )
+    np.testing.assert_array_equal(
+        potential,
+        np.concatenate((left_potential, right_potential), axis=1),
+    )
+
+
+@pytest.mark.parametrize("functional", ["pz", "pw"])
 def test_lsda_xc_depends_explicitly_on_magnetization(functional: str) -> None:
     total = np.asarray([0.08, 0.3, 1.2])
     unpolarized = np.stack((0.5 * total, 0.5 * total))
