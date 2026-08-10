@@ -80,6 +80,7 @@ from ..xc import (
     canonical_xc_name,
     lsda_lda,
     pbe_unpolarized_components,
+    pbe_spin_components,
     pw92_lda_unpolarized,
     pz81_unpolarized,
 )
@@ -1108,9 +1109,22 @@ def _xc_energy_potential(
     """Evaluate the selected XC functional on a rank-local FFT slab."""
     if density.ndim >= 4 and density.shape[0] == 2:
         if functional in GGA_FUNCTIONALS:
-            raise UnsupportedFeatureError(
-                "spin-polarized GGA is not implemented; use an LDA pseudopotential or input_dft='LDA'"
+            if workspace is None or g_vectors is None:
+                raise ValueError(
+                    "spin-polarized GGA requires an FFT workspace and reciprocal vectors"
+                )
+            epsilon, potential, _stress_tensor = (
+                _spin_gga_energy_potential_data(
+                    density,
+                    workspace,
+                    g_vectors,
+                    functional,
+                    need_stress=False,
+                    need_epsilon=need_epsilon,
+                    energy_density_out=energy_density_out,
+                )
             )
+            return epsilon, potential
         epsilon, potential = lsda_lda(density, functional)
         if energy_density_out is not None:
             np.multiply(
@@ -1220,6 +1234,88 @@ def _gga_energy_potential_data(
     local_potential -= gradient_coefficient
     del gradient_coefficient
     del derivatives
+    return epsilon, local_potential, stress_tensor
+
+
+def _spin_gga_energy_potential_data(
+    density: np.ndarray,
+    workspace: LocalPotentialWorkspace,
+    g_vectors: np.ndarray,
+    functional: str,
+    *,
+    need_stress: bool = False,
+    need_epsilon: bool = True,
+    energy_density_out: np.ndarray | None = None,
+) -> tuple[np.ndarray | None, np.ndarray, np.ndarray | None]:
+    """Return collinear PBE-family energy, potential, and gradient stress."""
+    gradients: list[np.ndarray] = []
+    for component in density:
+        coefficients = workspace.grid_to_coefficients(component)
+        gradient_coefficients = np.multiply(
+            g_vectors,
+            coefficients[:, None],
+            dtype=np.complex128,
+        )
+        gradient_coefficients *= 1j
+        gradient_grid = workspace.coefficients_to_grid(
+            gradient_coefficients
+        )
+        gradients.append(np.moveaxis(gradient_grid, -1, 0).real.copy())
+        del coefficients, gradient_coefficients, gradient_grid
+    spin_gradient = np.stack(gradients)
+    del gradients
+    (
+        epsilon,
+        local_potential,
+        exchange_coefficients,
+        correlation_coefficient,
+    ) = pbe_spin_components(density, spin_gradient, functional)
+    if energy_density_out is not None:
+        output = np.asarray(energy_density_out)
+        if output.shape != density.shape[1:]:
+            raise ValueError(
+                "spin-GGA energy_density_out must have the spatial grid shape"
+            )
+        np.multiply(np.sum(density, axis=0), epsilon, out=output)
+    total_gradient = spin_gradient[0] + spin_gradient[1]
+    stress_tensor = None
+    if need_stress:
+        stress_tensor = np.einsum(
+            "s...,si...,sj...->ij",
+            exchange_coefficients,
+            spin_gradient,
+            spin_gradient,
+            optimize=True,
+        )
+        stress_tensor += np.einsum(
+            "...,i...,j...->ij",
+            correlation_coefficient,
+            total_gradient,
+            total_gradient,
+            optimize=True,
+        )
+
+    for spin in range(2):
+        flux = (
+            exchange_coefficients[spin][None, ...]
+            * spin_gradient[spin]
+            + correlation_coefficient[None, ...] * total_gradient
+        )
+        flux_grid = np.moveaxis(flux, 0, -1).astype(
+            np.complex128, copy=False
+        )
+        flux_coefficients = workspace.grid_to_coefficients(flux_grid)
+        np.multiply(
+            flux_coefficients,
+            g_vectors,
+            out=flux_coefficients,
+        )
+        flux_coefficients *= 1j
+        derivatives = workspace.coefficients_to_grid(flux_coefficients)
+        local_potential[spin] -= np.sum(derivatives.real, axis=-1)
+        del flux, flux_grid, flux_coefficients, derivatives
+    if not need_epsilon:
+        epsilon = None
     return epsilon, local_potential, stress_tensor
 
 
@@ -1706,17 +1802,30 @@ def _hellmann_feynman_stress(
         np.add(density, core_density, out=real_workspace)
         total_density = real_workspace
     if xc_functional in GGA_FUNCTIONALS:
-        (
-            epsilon_xc,
-            potential_xc,
-            gga_stress_tensor,
-        ) = _gga_energy_potential_data(
-            total_density,
-            charge_workspace,
-            g_vectors,
-            xc_functional,
-            need_stress=True,
-        )
+        if spin_polarized:
+            (
+                epsilon_xc,
+                potential_xc,
+                gga_stress_tensor,
+            ) = _spin_gga_energy_potential_data(
+                total_density,
+                charge_workspace,
+                g_vectors,
+                xc_functional,
+                need_stress=True,
+            )
+        else:
+            (
+                epsilon_xc,
+                potential_xc,
+                gga_stress_tensor,
+            ) = _gga_energy_potential_data(
+                total_density,
+                charge_workspace,
+                g_vectors,
+                xc_functional,
+                need_stress=True,
+            )
     else:
         epsilon_xc, potential_xc = _xc_energy_potential(
             total_density,
@@ -2000,10 +2109,6 @@ def _run_scf(
     pw.system["_resolved_xc"] = xc_functional
     nspin = int(pw.system.get("nspin", 1))
     lsda = nspin == 2
-    if lsda and xc_functional in GGA_FUNCTIONALS:
-        raise UnsupportedFeatureError(
-            "spin-polarized GGA is not implemented; use an LDA pseudopotential or input_dft='LDA'"
-        )
     z_by_label = {label: pseudo.z_valence for label, pseudo in pseudo_by_label.items()}
     nelec = sum(z_by_label[atom.label] for atom in pw.atoms) - float(pw.system.get("tot_charge", 0.0))
     if not lsda and occupations_mode == "fixed" and (
@@ -2719,11 +2824,16 @@ def _run_scf(
         saved_coefficients = read_saved_density_coefficients(
             pw, charge_indices[local_charge_rows]
         )
+        saved_charge_coefficients = (
+            saved_coefficients[0] + saved_coefficients[1]
+            if lsda
+            else saved_coefficients
+        )
         saved_charge = pw.volume * mpi.sum_scalar(
             float(
                 np.real(
                     np.sum(
-                        saved_coefficients[
+                        saved_charge_coefficients[
                             local_charge_g2 < 1.0e-14
                         ]
                     )
@@ -2738,13 +2848,23 @@ def _run_scf(
                 f"saved density contains {saved_charge:.12g} electrons; "
                 f"expected {nelec:.12g}"
             )
-        rho = np.ascontiguousarray(
-            np.real(
-                charge_workspace.coefficients_to_grid(
-                    saved_coefficients, use_scratch=True
+        if lsda:
+            rho = np.stack([
+                np.ascontiguousarray(np.real(
+                    charge_workspace.coefficients_to_grid(
+                        component, use_scratch=True
+                    )
+                ))
+                for component in saved_coefficients
+            ])
+        else:
+            rho = np.ascontiguousarray(
+                np.real(
+                    charge_workspace.coefficients_to_grid(
+                        saved_coefficients, use_scratch=True
+                    )
                 )
             )
-        )
         # A fixed-potential calculation never reaches sum_band/sym_rho below.
         # Project the restart density as it is loaded so NSCF and bands also
         # inherit the crystal symmetry invariant.  This is a no-op (to
@@ -2752,12 +2872,17 @@ def _run_scf(
         # saves produced before Gamma-only density symmetrization was fixed.
         if len(pw.symmetry_operations) > 1:
             symmetry_started = timers.start()
-            rho = density_symmetrizer.apply(rho)
-            total_density = mpi.sum_scalar(float(np.sum(rho)))
-            rho *= nelec * np.prod(shape) / (total_density * pw.volume)
+            rho = _symmetrize_density_components(
+                rho,
+                density_symmetrizer,
+                nelec,
+                shape,
+                pw.volume,
+                mpi,
+            )
             timers.stop("potinit:sym", symmetry_started)
         _starting_charge = nelec
-        del saved_coefficients
+        del saved_coefficients, saved_charge_coefficients
     elif mpi.size == 1:
         rho, _starting_charge = _atomic_starting_density(
             pw,

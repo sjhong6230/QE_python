@@ -275,11 +275,72 @@ QE total-energy decomposition.
 
 ## 7. Occupations
 
+### 7.0 Collinear LSDA representation
+
+For `nspin=2`, the fundamental real-space variables are the two collinear
+spin densities $n_\uparrow(\mathbf r)$ and $n_\downarrow(\mathbf r)$. The
+Hartree problem depends only on
+
+$$
+n=n_\uparrow+n_\downarrow,
+$$
+
+whereas the local spin-density exchange-correlation functional is
+$E_{\mathrm{xc}}[n_\uparrow,n_\downarrow]$ and produces two potentials
+$V_{\mathrm{xc}}^\sigma=\delta E_{\mathrm{xc}}/\delta n_\sigma$. The mixer
+uses the equivalent charge/magnetization basis
+
+$$
+n=n_\uparrow+n_\downarrow,
+\qquad m=n_\uparrow-n_\downarrow.
+$$
+
+The Coulomb-preconditioned Broyden history acts on $n$; the short-ranged
+magnetic channel $m$, including its $G=0$ component, is mixed without the
+$1/G^2$ singular metric. Crystal symmetry operations act separately on
+$n_\uparrow$ and $n_\downarrow$. This is the collinear analogue of QE's
+`sym_rho` path and does not introduce a spin-flip operation.
+
+QE represents spin-resolved Bloch problems by duplicating the spatial
+k-point list. For $N_k$ spatial points, indices $1,\ldots,N_k$ carry spin up
+and $N_k+1,\ldots,2N_k$ carry spin down. The atomic starting orbitals are
+scalar and common to both blocks; `starting_magnetization` first polarizes the
+atomic starting density and hence the two initial effective Hamiltonians,
+which independently rotate the two orbital trial subspaces.
+
+For a PBE-family GGA, exchange obeys the exact spin-scaling construction
+
+$$
+E_x[n_\uparrow,n_\downarrow]
+=\frac12 E_x[2n_\uparrow]+\frac12 E_x[2n_\downarrow].
+$$
+
+The PBE correlation correction is evaluated from $n$, $\zeta=m/n$, and
+$|\nabla n|^2$. Consequently its gradient derivative contributes the same
+total-density flux to both spin potentials, while the exchange flux remains
+spin diagonal. In compact form,
+
+$$
+\mathbf q_\sigma
+=c_{x\sigma}\nabla n_\sigma+c_c\nabla n,
+\qquad
+V_{\mathrm{xc}}^\sigma
+=V_{\mathrm{xc,local}}^\sigma-\nabla\cdot\mathbf q_\sigma.
+$$
+
 ### 7.1 Fixed occupations
 
 For a scalar nonmagnetic insulator, states are filled in energy order with a
 maximum occupation of two. Degenerate frontier states are averaged within the
 implemented tolerance.
+
+For fixed LSDA occupations, each spin band has maximum occupation one. An
+explicit total magnetization $M$ fixes
+
+$$
+N_\uparrow=\frac{N_e+M}{2},\qquad
+N_\downarrow=\frac{N_e-M}{2}.
+$$
 
 ### 7.2 Smearing
 

@@ -544,6 +544,57 @@ def _pz81_correlation_polarized(
     )
 
 
+def _pw92_spin_correlation(
+    rs: np.ndarray, zeta: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return QE ``pw_spin`` correlation energy and spin potentials."""
+    p43 = 4.0 / 3.0
+    denominator = 2.0**p43 - 2.0
+    fz = (
+        (1.0 + zeta) ** p43
+        + (1.0 - zeta) ** p43
+        - 2.0
+    ) / denominator
+    dfz = p43 * (
+        np.cbrt(1.0 + zeta) - np.cbrt(1.0 - zeta)
+    ) / denominator
+    ecu, vcu = _pw92_component(
+        rs, 0.031091, 0.21370, 7.5957, 3.5876, 1.6382, 0.49294
+    )
+    ecp, vcp = _pw92_component(
+        rs, 0.015545, 0.20548, 14.1189, 6.1977, 3.3662, 0.62517
+    )
+    stiffness_energy, stiffness_potential = _pw92_component(
+        rs, 0.016887, 0.11125, 10.357, 3.6231, 0.88026, 0.49671
+    )
+    alpha = -stiffness_energy
+    alpha_potential = -stiffness_potential
+    zeta3 = zeta**3
+    zeta4 = zeta3 * zeta
+    fz0 = 1.709921
+    correlation = (
+        ecu
+        + alpha * fz * (1.0 - zeta4) / fz0
+        + (ecp - ecu) * fz * zeta4
+    )
+    spin_derivative = (
+        alpha
+        / fz0
+        * (dfz * (1.0 - zeta4) - 4.0 * fz * zeta3)
+        + (ecp - ecu) * (dfz * zeta4 + 4.0 * fz * zeta3)
+    )
+    common = (
+        vcu
+        + alpha_potential * fz * (1.0 - zeta4) / fz0
+        + (vcp - vcu) * fz * zeta4
+    )
+    return (
+        correlation,
+        common + spin_derivative * (1.0 - zeta),
+        common - spin_derivative * (1.0 + zeta),
+    )
+
+
 def lsda_lda(
     spin_density: np.ndarray,
     functional: str = "pz",
@@ -596,38 +647,9 @@ def lsda_lda(
         correlation_up = common + difference * dfz * (1.0 - zeta)
         correlation_down = common + difference * dfz * (-1.0 - zeta)
     else:
-        ecu, vcu = _pw92_component(
-            rs, 0.031091, 0.21370, 7.5957, 3.5876, 1.6382, 0.49294
+        correlation, correlation_up, correlation_down = (
+            _pw92_spin_correlation(rs, zeta)
         )
-        ecp, vcp = _pw92_component(
-            rs, 0.015545, 0.20548, 14.1189, 6.1977, 3.3662, 0.62517
-        )
-        stiffness_energy, stiffness_potential = _pw92_component(
-            rs, 0.016887, 0.11125, 10.357, 3.6231, 0.88026, 0.49671
-        )
-        alpha = -stiffness_energy
-        alpha_potential = -stiffness_potential
-        zeta3 = zeta**3
-        zeta4 = zeta3 * zeta
-        fz0 = 1.709921
-        correlation = (
-            ecu
-            + alpha * fz * (1.0 - zeta4) / fz0
-            + (ecp - ecu) * fz * zeta4
-        )
-        spin_derivative = (
-            alpha
-            / fz0
-            * (dfz * (1.0 - zeta4) - 4.0 * fz * zeta3)
-            + (ecp - ecu) * (dfz * zeta4 + 4.0 * fz * zeta3)
-        )
-        common = (
-            vcu
-            + alpha_potential * fz * (1.0 - zeta4) / fz0
-            + (vcp - vcu) * fz * zeta4
-        )
-        correlation_up = common + spin_derivative * (1.0 - zeta)
-        correlation_down = common - spin_derivative * (1.0 + zeta)
 
     epsilon = exchange + correlation
     potentials = np.stack(
@@ -636,6 +658,177 @@ def lsda_lda(
     epsilon[~active] = 0.0
     potentials[:, ~active] = 0.0
     return epsilon, potentials
+
+
+def pbe_spin_components(
+    spin_density: np.ndarray,
+    spin_gradient: np.ndarray,
+    functional: str = "pbe",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return collinear PBE-family XC pointwise data.
+
+    Results are ``epsilon_xc``, the density-local spin potentials, the two
+    exchange flux coefficients, and the common correlation flux coefficient.
+    The full variational potential is obtained by subtracting the divergence
+    of ``c_x[s] grad(n_s) + c_c grad(n_up+n_down)`` from each local channel.
+    This is QE 7.5's ``gcx_spin`` plus ``pbec_spin`` representation.
+    """
+    spins = np.asarray(spin_density, dtype=np.float64)
+    gradients = np.asarray(spin_gradient, dtype=np.float64)
+    if spins.ndim < 2 or spins.shape[0] != 2:
+        raise ValueError("spin_density must have shape (2, ...)")
+    if gradients.shape != (2, 3, *spins.shape[1:]):
+        raise ValueError("spin_gradient must have shape (2, 3, ...)")
+    try:
+        kappa, mu, beta, exchange_form = _PBE_FAMILY_PARAMETERS[functional]
+    except KeyError as exc:
+        raise ValueError(
+            f"unsupported PBE-family functional {functional!r}"
+        ) from exc
+
+    total = spins[0] + spins[1]
+    total_active = total > 1.0e-10
+    safe_total = np.maximum(total, 1.0e-10)
+    zeta = np.clip(
+        (spins[0] - spins[1]) / safe_total,
+        -1.0 + 1.0e-6,
+        1.0 - 1.0e-6,
+    )
+    epsilon_lda, local_potential = lsda_lda(spins, "pw")
+    energy_density = total * epsilon_lda
+    exchange_coefficients = np.zeros_like(spins)
+
+    for spin in range(2):
+        density = 2.0 * spins[spin]
+        sigma = 4.0 * np.einsum(
+            "i...,i...->...", gradients[spin], gradients[spin]
+        )
+        active = total_active & (density > 1.0e-10) & (sigma > 1.0e-20)
+        safe_density = np.maximum(density, 1.0e-10)
+        safe_sigma = np.maximum(sigma, 1.0e-20)
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            gradient_norm = np.sqrt(safe_sigma)
+            kf = 3.093667726280136 * np.cbrt(safe_density)
+            reduced = gradient_norm / (2.0 * kf * safe_density)
+            argument = mu * reduced * reduced / kappa
+            if exchange_form == "rational":
+                denominator = 1.0 + argument
+                enhancement = kappa * (1.0 - 1.0 / denominator)
+                derivative = 2.0 * mu * reduced / denominator**2
+            else:
+                exponential = np.exp(-argument)
+                enhancement = kappa * (1.0 - exponential)
+                derivative = 2.0 * mu * reduced * exponential
+            exchange_uniform = -(0.75 / np.pi) * kf
+            correction_energy = (
+                0.5 * safe_density * exchange_uniform * enhancement
+            )
+            correction_local = exchange_uniform * (
+                (4.0 / 3.0) * enhancement
+                - (4.0 / 3.0) * reduced * derivative
+            )
+            coefficient = (
+                exchange_uniform
+                * derivative
+                / (kf * gradient_norm)
+            )
+        energy_density += np.where(active, correction_energy, 0.0)
+        local_potential[spin] += np.where(active, correction_local, 0.0)
+        exchange_coefficients[spin] = np.where(active, coefficient, 0.0)
+
+    total_gradient = gradients[0] + gradients[1]
+    total_sigma = np.einsum(
+        "i...,i...->...", total_gradient, total_gradient
+    )
+    correlation_active = total_active & (total_sigma > 1.0e-20)
+    safe_sigma = np.maximum(total_sigma, 1.0e-20)
+    rs = 0.6203504908994 / np.cbrt(safe_total)
+    correlation, correlation_up, correlation_down = (
+        _pw92_spin_correlation(rs, zeta)
+    )
+    phi = 0.5 * (
+        (1.0 + zeta) ** (2.0 / 3.0)
+        + (1.0 - zeta) ** (2.0 / 3.0)
+    )
+    phi2 = phi * phi
+    phi3 = phi2 * phi
+    dphi = (
+        (1.0 + zeta) ** (-1.0 / 3.0)
+        - (1.0 - zeta) ** (-1.0 / 3.0)
+    ) / 3.0
+    gamma = 0.031091
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        kf = 1.919158292677513 / rs
+        ks = 1.128379167095513 * np.sqrt(kf)
+        reduced = np.sqrt(safe_sigma) / (
+            2.0 * phi * ks * safe_total
+        )
+        exponential = np.exp(np.clip(
+            -correlation / (phi3 * gamma), -700.0, 700.0
+        ))
+        a_parameter = beta / gamma / (exponential - 1.0)
+        b_up = exponential * (correlation_up - correlation) / phi3
+        b_down = exponential * (correlation_down - correlation) / phi3
+        y = a_parameter * reduced * reduced
+        y_denominator = 1.0 + y + y * y
+        x_y = (1.0 + y) / y_denominator
+        q_y = y * y * (2.0 + y) / y_denominator**2
+        logarithm_argument = (
+            1.0 + beta / gamma * reduced * reduced * x_y
+        )
+        h0 = phi3 * gamma * np.log(logarithm_argument)
+        common_prefactor = beta * reduced * reduced * phi3 / logarithm_argument
+        density_up = common_prefactor * (
+            -(7.0 / 3.0) * x_y
+            - q_y * (a_parameter * b_up / beta - 7.0 / 3.0)
+        )
+        density_down = common_prefactor * (
+            -(7.0 / 3.0) * x_y
+            - q_y * (a_parameter * b_down / beta - 7.0 / 3.0)
+        )
+        zeta_bracket = (
+            3.0 * h0 / phi
+            - beta * reduced * reduced * phi2 / logarithm_argument
+            * (
+                2.0 * x_y
+                - q_y * (
+                    3.0 * a_parameter * exponential * correlation
+                    / (phi3 * beta)
+                    + 2.0
+                )
+            )
+        )
+        density_up += zeta_bracket * dphi * (1.0 - zeta)
+        density_down -= zeta_bracket * dphi * (1.0 + zeta)
+        correlation_coefficient = (
+            beta * phi / (2.0 * ks * ks * safe_total)
+            * (x_y - q_y) / logarithm_argument
+        )
+    correction_energy = safe_total * h0
+    energy_density += np.where(correlation_active, correction_energy, 0.0)
+    local_potential[0] += np.where(
+        correlation_active, h0 + density_up, 0.0
+    )
+    local_potential[1] += np.where(
+        correlation_active, h0 + density_down, 0.0
+    )
+    correlation_coefficient = np.where(
+        correlation_active, correlation_coefficient, 0.0
+    )
+    epsilon = np.zeros_like(total)
+    np.divide(
+        energy_density,
+        safe_total,
+        out=epsilon,
+        where=total_active,
+    )
+    local_potential[:, ~total_active] = 0.0
+    return (
+        epsilon,
+        local_potential,
+        exchange_coefficients,
+        correlation_coefficient,
+    )
 
 
 def pz81_unpolarized(

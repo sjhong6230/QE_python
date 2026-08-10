@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented in this file.
 
+## Unreleased
+
+### Added
+
+- Collinear `nspin=2` SCF, NSCF, force, and stress paths with QE-ordered
+  spin-up/spin-down k-point blocks, spin-resolved occupations, and
+  charge/magnetization density mixing.
+- `starting_magnetization(i)` and `tot_magnetization` input handling, including
+  fixed-occupation validation and spin-polarized atomic density/Hamiltonian
+  initialization.
+- PZ81/PW92 LSDA and PBE-family spin-GGA exchange-correlation functionals.
+- QE-compatible `rhotot_g`/`rhodiff_g` density persistence, spin-tagged
+  wavefunctions, LSDA restart/NSCF support, and magnetization reporting.
+
 ## [1.0.1] - 2026-08-10
 
 ### Added

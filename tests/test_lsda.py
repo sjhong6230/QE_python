@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -13,8 +14,16 @@ from qepy_pw.occupations import (
     smeared_occupations,
     spin_electron_counts,
 )
-from qepy_pw.xc import lsda_lda, pw92_lda_unpolarized, pz81_unpolarized
+from qepy_pw.xc import (
+    lsda_lda,
+    pbe_spin_components,
+    pbe_unpolarized_components,
+    pw92_lda_unpolarized,
+    pz81_unpolarized,
+)
 from qepy_pw.scf import run_scf
+from qepy_pw.pw.output import format_footer
+from qepy_pw.pw.save import resolve_save_directory, write_qe_save
 
 
 def _lsda_input(system: str, kpoints: str = "K_POINTS gamma") -> str:
@@ -182,12 +191,132 @@ def test_lsda_spin_swap_swaps_only_the_potentials() -> None:
     assert swapped_potential == pytest.approx(potential[::-1], abs=2.0e-15)
 
 
-def test_lsda_scf_runs_two_spin_blocks_and_preserves_spatial_symmetry() -> None:
+@pytest.mark.parametrize("functional", ["pz", "pw"])
+def test_lsda_xc_depends_explicitly_on_magnetization(functional: str) -> None:
+    total = np.asarray([0.08, 0.3, 1.2])
+    unpolarized = np.stack((0.5 * total, 0.5 * total))
+    zeta = 0.6
+    polarized = np.stack((
+        0.5 * total * (1.0 + zeta),
+        0.5 * total * (1.0 - zeta),
+    ))
+    epsilon_zero, potential_zero = lsda_lda(unpolarized, functional)
+    epsilon_m, potential_m = lsda_lda(polarized, functional)
+    assert not np.allclose(epsilon_m, epsilon_zero, atol=1e-12)
+    assert np.allclose(potential_zero[0], potential_zero[1], atol=1e-14)
+    assert np.all(potential_m[0] < potential_m[1])
+
+    # At fixed n, d[n*epsilon_xc(n,m)]/dm is the LSDA magnetic field,
+    # one half of the up/down potential splitting.
+    step = 1.0e-7
+    plus = polarized.copy()
+    minus = polarized.copy()
+    plus[0] += 0.5 * step
+    plus[1] -= 0.5 * step
+    minus[0] -= 0.5 * step
+    minus[1] += 0.5 * step
+    epsilon_plus, _ = lsda_lda(plus, functional)
+    epsilon_minus, _ = lsda_lda(minus, functional)
+    derivative = total * (epsilon_plus - epsilon_minus) / (2.0 * step)
+    np.testing.assert_allclose(
+        derivative,
+        0.5 * (potential_m[0] - potential_m[1]),
+        atol=2e-8,
+    )
+
+
+@pytest.mark.parametrize("functional", ["pbe", "pbesol", "revpbe", "rpbe"])
+def test_spin_gga_reduces_to_unpolarized_gga(functional: str) -> None:
+    total = np.asarray([0.08, 0.3, 1.2])
+    gradient = np.asarray([
+        [0.013, -0.027, 0.041],
+        [-0.008, 0.019, 0.033],
+        [0.022, 0.011, -0.017],
+    ])
+    epsilon, local, exchange_coefficient, correlation_coefficient = (
+        pbe_spin_components(
+            np.stack((0.5 * total, 0.5 * total)),
+            np.stack((0.5 * gradient, 0.5 * gradient)),
+            functional,
+        )
+    )
+    expected_epsilon, expected_local, expected_coefficient = (
+        pbe_unpolarized_components(total, gradient, functional)
+    )
+    np.testing.assert_allclose(epsilon, expected_epsilon, atol=2e-12)
+    np.testing.assert_allclose(local[0], expected_local, atol=2e-12)
+    np.testing.assert_allclose(local[1], expected_local, atol=2e-12)
+    for spin in range(2):
+        flux = (
+            exchange_coefficient[spin, None, ...]
+            * 0.5
+            * gradient
+            + correlation_coefficient[None, ...] * gradient
+        )
+        np.testing.assert_allclose(
+            flux,
+            expected_coefficient[None, ...] * gradient,
+            rtol=2e-5,
+            atol=2e-9,
+        )
+
+
+@pytest.mark.parametrize("functional", ["pbe", "pbesol", "revpbe", "rpbe"])
+def test_spin_gga_components_are_functional_derivatives(functional: str) -> None:
+    density = np.asarray([[0.31], [0.13]])
+    gradient = np.asarray([
+        [[0.041], [-0.023], [0.017]],
+        [[-0.012], [0.031], [0.026]],
+    ])
+    epsilon, local, exchange_coefficient, correlation_coefficient = (
+        pbe_spin_components(density, gradient, functional)
+    )
+    total = np.sum(density, axis=0)
+    step = 1.0e-7
+    for spin in range(2):
+        plus = density.copy()
+        minus = density.copy()
+        plus[spin] += step
+        minus[spin] -= step
+        epsilon_plus, *_ = pbe_spin_components(plus, gradient, functional)
+        epsilon_minus, *_ = pbe_spin_components(minus, gradient, functional)
+        derivative = (
+            np.sum(plus, axis=0) * epsilon_plus
+            - np.sum(minus, axis=0) * epsilon_minus
+        ) / (2.0 * step)
+        np.testing.assert_allclose(derivative, local[spin], atol=2e-8)
+
+        for direction in range(3):
+            plus_gradient = gradient.copy()
+            minus_gradient = gradient.copy()
+            plus_gradient[spin, direction] += step
+            minus_gradient[spin, direction] -= step
+            epsilon_plus, *_ = pbe_spin_components(
+                density, plus_gradient, functional
+            )
+            epsilon_minus, *_ = pbe_spin_components(
+                density, minus_gradient, functional
+            )
+            derivative = total * (epsilon_plus - epsilon_minus) / (2.0 * step)
+            expected_flux = (
+                exchange_coefficient[spin]
+                * gradient[spin, direction]
+                + correlation_coefficient
+                * (gradient[0, direction] + gradient[1, direction])
+            )
+            np.testing.assert_allclose(
+                derivative, expected_flux, atol=2e-8
+            )
+
+
+def test_lsda_scf_runs_two_spin_blocks_and_preserves_spatial_symmetry(
+    tmp_path: Path,
+) -> None:
     pw = read_pw_input(io.StringIO("""\
 &CONTROL
   calculation='scf',
   pseudo_dir='./tests/qe_reference/upstream/pseudo',
-  disk_io='none', tstress=.true., tprnfor=.true.
+  disk_io='medium', prefix='lsda-h2', tstress=.true., tprnfor=.true.
 /
 &SYSTEM
   ibrav=1, celldm(1)=10.0, nat=2, ntyp=1,
@@ -204,6 +333,7 @@ H 0.00 0.00 -0.35
 H 0.00 0.00  0.35
 K_POINTS gamma
 """))
+    pw.control["outdir"] = str(tmp_path)
     result = run_scf(pw)
     assert result.converged
     assert result.density.shape[0] == 2
@@ -215,3 +345,126 @@ K_POINTS gamma
     # A nonmagnetic starting state must remain invariant under spin exchange;
     # the crystal density symmetrizer is applied independently to each block.
     np.testing.assert_allclose(result.density[0], result.density[1], atol=1e-6)
+
+    output = format_footer(pw, result)
+    assert "SPIN UP" in output and "SPIN DOWN" in output
+    assert "total magnetization" in output
+    assert "    1.0000" in output
+
+    write_qe_save(pw, result)
+    save = resolve_save_directory(pw)
+    import h5py
+
+    with h5py.File(save / "charge-density.hdf5", "r") as h5:
+        assert h5.attrs["nspin"] == 2
+        assert "rhotot_g" in h5 and "rhodiff_g" in h5
+    with h5py.File(save / "wfc1.hdf5", "r") as up:
+        assert up.attrs["ispin"] == 1
+    with h5py.File(save / "wfc2.hdf5", "r") as down:
+        assert down.attrs["ispin"] == 2
+
+    pw.control["calculation"] = "nscf"
+    pw.control["tstress"] = False
+    pw.control["tprnfor"] = False
+    pw.electrons["startingpot"] = "file"
+    pw.electrons["startingwfc"] = "file"
+    nscf = run_scf(pw)
+    assert nscf.converged
+    np.testing.assert_allclose(nscf.density, result.density, atol=2e-12)
+
+
+def test_starting_magnetization_initializes_density_and_spin_hamiltonians(
+    monkeypatch,
+) -> None:
+    import qepy_pw.pw.scf as scf_module
+
+    pw = read_pw_input(io.StringIO("""\
+&CONTROL
+  calculation='scf',
+  pseudo_dir='./tests/qe_reference/upstream/pseudo',
+  disk_io='none', tstress=.false.
+/
+&SYSTEM
+  ibrav=1, celldm(1)=10.0, nat=2, ntyp=1,
+  ecutwfc=12.0, nbnd=1, nspin=2,
+  occupations='fixed', tot_magnetization=0,
+  starting_magnetization(1)=0.5
+/
+&ELECTRONS
+  conv_thr=1.d-14, electron_maxstep=1, startingwfc='atomic'
+/
+ATOMIC_SPECIES
+H 1.0008 H.pz-vbc.UPF
+ATOMIC_POSITIONS angstrom
+H 0.00 0.00 -0.35
+H 0.00 0.00  0.35
+K_POINTS gamma
+"""))
+    starting_densities: list[np.ndarray] = []
+    projected_eigenvalues: list[np.ndarray] = []
+    original_density = scf_module._atomic_starting_density
+    original_rotate = scf_module._rotate_starting_subspace
+
+    def tracked_density(*args, **kwargs):
+        density, charge = original_density(*args, **kwargs)
+        starting_densities.append(density.copy())
+        return density, charge
+
+    def tracked_rotate(*args, **kwargs):
+        vectors, values, applied = original_rotate(*args, **kwargs)
+        projected_eigenvalues.append(values.copy())
+        return vectors, values, applied
+
+    monkeypatch.setattr(scf_module, "_atomic_starting_density", tracked_density)
+    monkeypatch.setattr(scf_module, "_rotate_starting_subspace", tracked_rotate)
+    run_scf(pw)
+
+    assert len(starting_densities) == 1
+    initial = starting_densities[0]
+    grid_scale = pw.volume / np.prod(initial.shape[-3:])
+    assert grid_scale * np.sum(initial) == pytest.approx(2.0, abs=2e-12)
+    assert grid_scale * np.sum(initial[0] - initial[1]) == pytest.approx(
+        1.0, abs=2e-12
+    )
+    # QE uses the same scalar atomic orbitals for both collinear channels,
+    # then rotates each trial subspace with its own spin-dependent initial
+    # Hamiltonian. A nonzero starting moment must therefore split these two
+    # projected spectra before the first Davidson solve.
+    assert len(projected_eigenvalues) == 2
+    assert not np.allclose(
+        projected_eigenvalues[0], projected_eigenvalues[1], atol=1e-10
+    )
+
+
+@pytest.mark.parametrize("functional", ["PBE", "PBEsol", "revPBE", "RPBE"])
+def test_spin_gga_scf_force_and_stress_paths(functional: str) -> None:
+    pw = read_pw_input(io.StringIO(f"""\
+&CONTROL
+  calculation='scf',
+  pseudo_dir='./tests/qe_reference/upstream/pseudo',
+  disk_io='none', tstress=.true., tprnfor=.true.
+/
+&SYSTEM
+  ibrav=1, celldm(1)=10.0, nat=2, ntyp=1,
+  ecutwfc=10.0, nbnd=1, nspin=2, input_dft='{functional}',
+  occupations='fixed', tot_magnetization=0,
+  starting_magnetization(1)=0.25
+/
+&ELECTRONS
+  conv_thr=2.d-5, electron_maxstep=30
+/
+ATOMIC_SPECIES
+H 1.0008 H.pz-vbc.UPF
+ATOMIC_POSITIONS angstrom
+H 0.00 0.00 -0.35
+H 0.00 0.00  0.35
+K_POINTS gamma
+"""))
+    result = run_scf(pw)
+    assert result.converged
+    assert np.isfinite(result.total_energy_ha)
+    assert np.all(np.isfinite(result.density))
+    assert result.forces_ha_per_bohr is not None
+    assert np.all(np.isfinite(result.forces_ha_per_bohr))
+    assert result.stress_ha_per_bohr3 is not None
+    assert np.all(np.isfinite(result.stress_ha_per_bohr3))
