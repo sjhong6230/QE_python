@@ -20,6 +20,12 @@ import numpy as np
 
 from ..constants import BOHR_PER_ANGSTROM, TWO_PI
 from ..errors import QEInputError, QEWarning, UnsupportedFeatureError, not_implemented
+from ..fortran_namelist import (
+    expanded_array_keys,
+    split_assignment_values,
+    split_namelist_assignments,
+    strip_namelist_comment,
+)
 from ..qe_input_schema import QE_NAMELIST_VARIABLES
 from ..xc import canonical_xc_name
 from ..symmetry import (
@@ -31,6 +37,17 @@ from ..symmetry import (
 
 _NAMELISTS = {"control", "system", "electrons", "ions", "cell"}
 _CARDS = {"ATOMIC_SPECIES", "ATOMIC_POSITIONS", "K_POINTS", "CELL_PARAMETERS", "OCCUPATIONS"}
+_ONE_DIMENSIONAL_NAMELIST_ARRAYS = {
+    "control": {"refg"},
+    "system": {
+        "celldm", "starting_charge", "starting_magnetization", "hubbard_u",
+        "hubbard_j0", "hubbard_alpha", "hubbard_beta", "angle1", "angle2",
+        "b_field", "fixed_magnetization", "london_c6", "london_rvdw",
+    },
+    "electrons": {"efield_cart"},
+    "ions": set(),
+    "cell": set(),
+}
 
 # Variables that affect the implemented scalar-SCF path.  Rejecting every
 # other explicitly supplied variable is intentional: silently accepting a QE
@@ -167,34 +184,11 @@ class PWInput:
 
 
 def _strip_comment(line: str) -> str:
-    quote = None
-    out: list[str] = []
-    for char in line:
-        if char in {"'", '"'}:
-            quote = None if quote == char else (char if quote is None else quote)
-        if char in {"!", "#"} and quote is None:
-            break
-        out.append(char)
-    return "".join(out)
+    return strip_namelist_comment(line)
 
 
 def _split_assignments(body: str) -> list[str]:
-    parts, token, quote, depth = [], [], None, 0
-    for char in body:
-        if char in {"'", '"'}:
-            quote = None if quote == char else (char if quote is None else quote)
-        if quote is None:
-            depth += char == "("
-            depth -= char == ")"
-        if (char == "," or char == "\n") and quote is None and depth == 0:
-            if "".join(token).strip():
-                parts.append("".join(token).strip())
-            token = []
-        else:
-            token.append(char)
-    if "".join(token).strip():
-        parts.append("".join(token).strip())
-    return parts
+    return split_namelist_assignments(body)
 
 
 def _namelist_terminator(text: str) -> int | None:
@@ -273,7 +267,29 @@ def _parse_namelists(lines: list[str]) -> tuple[dict[str, dict[str, Any]], list[
                         routine="read_namelists",
                     )
                 key, raw = assignment.split("=", 1)
-                values[key.strip().lower()] = _value(raw)
+                fields = split_assignment_values(raw)
+                if not fields:
+                    raise QEInputError(
+                        f"bad line in namelist &{name.upper()}: {assignment}",
+                        routine="read_namelists",
+                    )
+                try:
+                    base = key.split("(", 1)[0].strip().lower()
+                    keys = expanded_array_keys(
+                        key,
+                        len(fields),
+                        unindexed_array=(
+                            "(" not in key
+                            and base in _ONE_DIMENSIONAL_NAMELIST_ARRAYS[name]
+                        ),
+                    )
+                except ValueError as exc:
+                    raise QEInputError(
+                        f"bad line in namelist &{name.upper()}: {assignment}",
+                        routine="read_namelists",
+                    ) from exc
+                for expanded_key, field in zip(keys, fields):
+                    values[expanded_key] = _value(field)
             result[name] = values
         else:
             card_lines.append(clean)

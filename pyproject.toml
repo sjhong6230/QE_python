@@ -32,6 +32,7 @@ dependencies = [
 "plotband.py" = "qepy_pw.pp.plotband:main"
 "dos.py" = "qepy_pw.pp.dos:main"
 "projwfc.py" = "qepy_pw.pp.projwfc:main"
+"pp.py" = "qepy_pw.pp.pp:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
