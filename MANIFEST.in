@@ -1,0 +1,3 @@
+include CHANGELOG.md
+include PORTING.md
+recursive-include docs *.md
