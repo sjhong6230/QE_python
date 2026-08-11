@@ -65,7 +65,7 @@ _IMPLEMENTED_NAMELIST_VARIABLES = {
         "nosym_evc", "noinv", "use_all_frac", "force_symmorphic",
         "starting_charge", "occupations", "degauss", "smearing", "input_dft",
         "starting_magnetization", "nspin", "noncolin", "lda_plus_u",
-        "lspinorb", "no_t_rev", "angle1", "angle2", "tot_charge",
+        "lspinorb", "starting_spin_angle", "no_t_rev", "angle1", "angle2", "tot_charge",
         "tot_magnetization",
         "space_group", "uniqueb", "origin_choice", "rhombohedral",
     },
@@ -1261,6 +1261,9 @@ def read_pw_input(source: str | Path | TextIO) -> PWInput:
     system["nspin"] = nspin
     system["noncolin"] = noncolin
     system["lspinorb"] = lspinorb
+    system["starting_spin_angle"] = bool(
+        system.get("starting_spin_angle", False)
+    )
     system["no_t_rev"] = bool(system.get("no_t_rev", False))
     tot_magnetization = float(
         _input_number(

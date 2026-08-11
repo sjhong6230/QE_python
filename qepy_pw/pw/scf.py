@@ -957,7 +957,10 @@ def _spinor_starting_orbitals(
     if starting_wfc != "random":
         centered_by_label: dict[tuple[str, bool], np.ndarray] = {}
         for atom in pw.atoms:
-            uses_j_basis = not domag
+            uses_j_basis = (
+                not domag
+                or bool(pw.system.get("starting_spin_angle", False))
+            )
             cache_key = (atom.label, uses_j_basis)
             centered = centered_by_label.get(cache_key)
             if centered is None:
@@ -966,7 +969,7 @@ def _spinor_starting_orbitals(
                         basis_vectors, pw.volume
                     )
                     if uses_j_basis
-                    else pseudos[atom.label].atomic_orbital_basis(
+                    else pseudos[atom.label].averaged_atomic_orbital_basis(
                         basis_vectors, pw.volume
                     )
                 )
@@ -1807,6 +1810,19 @@ def _nonlocal_derivatives(
     stress: bool,
 ) -> tuple[float, np.ndarray | None, np.ndarray | None]:
     """Compute force/stress projector derivatives once per species and k."""
+    if bool(pw.system.get("noncolin", False)):
+        return _spinor_nonlocal_derivatives(
+            pw,
+            pseudos,
+            bases,
+            eigenvectors,
+            weights,
+            occupations,
+            mpi,
+            workspaces,
+            forces=forces,
+            stress=stress,
+        )
     energy = 0.0
     result = np.zeros((len(pw.atoms), 3)) if forces else None
     stress_tensor = np.zeros((3, 3)) if stress else None
@@ -1906,6 +1922,125 @@ def _nonlocal_derivatives(
     return energy, result, stress_tensor
 
 
+def _spinor_nonlocal_derivatives(
+    pw: PWInput,
+    pseudos: dict[str, LocalPotential],
+    bases: list[PlaneWaveBasis],
+    eigenvectors: list[np.ndarray],
+    weights: np.ndarray,
+    occupations: list[np.ndarray],
+    mpi: MPIContext,
+    workspaces: Sequence[LocalPotentialWorkspace],
+    *,
+    forces: bool,
+    stress: bool,
+) -> tuple[float, np.ndarray | None, np.ndarray | None]:
+    """Nonlocal energy derivatives for two-component relativistic states."""
+    energy = 0.0
+    result = np.zeros((len(pw.atoms), 3)) if forces else None
+    stress_tensor = np.zeros((3, 3)) if stress else None
+    spin_orbit = bool(pw.system.get("lspinorb", False))
+    difference_step = 1.0e-6
+    for compact_basis, vectors, weight, workspace, band_occupations in zip(
+        bases, eigenvectors, weights, workspaces, occupations
+    ):
+        basis = compact_basis.materialize()
+        local_rows = (
+            workspace.local_plane_wave_indices
+            if mpi.size > 1
+            else np.arange(len(basis.indices))
+        )
+        gk = basis.vectors[local_rows]
+        spin_gk = np.concatenate((gk, gk), axis=0)
+        active = np.flatnonzero(np.abs(band_occupations) > 1.0e-15)
+        if active.size == 0:
+            continue
+        band_count = int(active[-1]) + 1
+        occupied_vectors = vectors[:, :band_count]
+        occupation_weights = np.asarray(band_occupations[:band_count])
+        for atom_index, atom in enumerate(pw.atoms):
+            pseudo = pseudos[atom.label]
+            beta, coupling = (
+                pseudo.spinor_projector_basis(gk, pw.volume)
+                if spin_orbit
+                else pseudo.averaged_spinor_projector_basis(gk, pw.volume)
+            )
+            if beta.shape[1] == 0:
+                continue
+            phase = np.exp(-1j * (gk @ atom.position))
+            spin_phase = np.concatenate((phase, phase))
+            modulated = np.conjugate(spin_phase)[:, None] * occupied_vectors
+            beta_conjugate = np.conjugate(beta)
+            overlap = mpi.sum_array(beta_conjugate.T @ modulated)
+            coupled = coupling @ overlap
+            energy += float(weight) * float(np.real(np.sum(
+                np.conjugate(overlap)
+                * coupled
+                * occupation_weights[None, :]
+            )))
+            if result is not None:
+                derivative_overlap = mpi.sum_array(np.einsum(
+                    "gp,gab->pab",
+                    beta_conjugate,
+                    1j * spin_gk[:, :, None] * modulated[:, None, :],
+                    optimize=True,
+                ))
+                result[atom_index] -= 2.0 * float(weight) * np.real(
+                    np.einsum(
+                        "pab,pb,b->a",
+                        np.conjugate(derivative_overlap),
+                        coupled,
+                        occupation_weights,
+                        optimize=True,
+                    )
+                )
+            if stress_tensor is not None:
+                beta_gradient = np.empty(
+                    (*beta.shape, 3), dtype=np.complex128
+                )
+                for direction in range(3):
+                    plus = gk.copy()
+                    minus = gk.copy()
+                    plus[:, direction] += difference_step
+                    minus[:, direction] -= difference_step
+                    plus_beta = (
+                        pseudo.spinor_projector_basis(plus, pw.volume)[0]
+                        if spin_orbit
+                        else pseudo.averaged_spinor_projector_basis(
+                            plus, pw.volume
+                        )[0]
+                    )
+                    minus_beta = (
+                        pseudo.spinor_projector_basis(minus, pw.volume)[0]
+                        if spin_orbit
+                        else pseudo.averaged_spinor_projector_basis(
+                            minus, pw.volume
+                        )[0]
+                    )
+                    beta_gradient[:, :, direction] = (
+                        plus_beta - minus_beta
+                    ) / (2.0 * difference_step)
+                derivative_overlap = mpi.sum_array(np.einsum(
+                    "gpl,grb->plrb",
+                    np.conjugate(beta_gradient),
+                    spin_gk[:, :, None] * modulated[:, None, :],
+                    optimize=True,
+                ))
+                stress_tensor += (
+                    2.0
+                    * float(weight)
+                    / pw.volume
+                    * np.real(np.einsum(
+                        "plrb,pb,b->lr",
+                        np.conjugate(derivative_overlap),
+                        coupled,
+                        occupation_weights,
+                        optimize=True,
+                    ))
+                )
+    return energy, result, stress_tensor
+
+
 def _local_and_core_forces(
     pw: PWInput,
     pseudos: dict[str, LocalPotential],
@@ -1972,6 +2107,7 @@ def _hellmann_feynman_stress(
     """Return analytic compressive-positive HF stress in Ha/bohr^3."""
     volume = pw.volume
     stress = np.zeros((3, 3))
+    noncolin = density.ndim == 4 and density.shape[0] == 4
 
     # Kinetic term: fixed reduced-coordinate coefficients and k points imply
     # d(G+k)/d strain = -(G+k) strain.
@@ -1986,6 +2122,7 @@ def _hellmann_feynman_stress(
             else np.arange(len(basis.indices))
         )
         gk = basis.vectors[local_rows]
+        stress_gk = np.concatenate((gk, gk), axis=0) if noncolin else gk
         band_count = len(band_occupations)
         plane_wave_weight = np.sum(
             np.abs(vectors[:, :band_count]) ** 2
@@ -1993,7 +2130,9 @@ def _hellmann_feynman_stress(
             axis=1,
         )
         kinetic_stress += float(weight) * mpi.sum_array(
-            np.einsum("g,gi,gj->ij", plane_wave_weight, gk, gk)
+            np.einsum(
+                "g,gi,gj->ij", plane_wave_weight, stress_gk, stress_gk
+            )
         ) / volume
     stress += kinetic_stress
 
@@ -2001,7 +2140,11 @@ def _hellmann_feynman_stress(
     g2 = np.einsum("gi,gi->g", g_vectors, g_vectors)
     q = np.sqrt(g2)
     spin_polarized = density.ndim == 4 and density.shape[0] == 2
-    density_charge = density[0] + density[1] if spin_polarized else density
+    density_charge = (
+        density[0] + density[1]
+        if spin_polarized
+        else (density[0] if noncolin else density)
+    )
     density_g = charge_workspace.grid_to_coefficients(density_charge)
 
     # Local pseudopotential. Atomic phases are invariant when cell and ions
@@ -2069,6 +2212,15 @@ def _hellmann_feynman_stress(
             total_density = real_workspace
             total_density[...] = density
         total_density += 0.5 * core_density[None, ...]
+    elif noncolin:
+        if real_workspace is None:
+            total_density = density.copy()
+        else:
+            if real_workspace.shape != density.shape:
+                raise ValueError("stress real workspace has the wrong shape")
+            total_density = real_workspace
+            total_density[...] = density
+        total_density[0] += core_density
     elif real_workspace is None:
         total_density = density + core_density
     else:
@@ -2088,6 +2240,22 @@ def _hellmann_feynman_stress(
                 g_vectors,
                 xc_functional,
                 need_stress=True,
+            )
+        elif noncolin:
+            channels, direction = eigenchannel_densities(total_density)
+            (
+                epsilon_xc,
+                channel_potential,
+                gga_stress_tensor,
+            ) = _spin_gga_energy_potential_data(
+                channels,
+                charge_workspace,
+                g_vectors,
+                xc_functional,
+                need_stress=True,
+            )
+            potential_xc = noncollinear_potential_components(
+                channel_potential, direction
             )
         else:
             (
@@ -2122,6 +2290,14 @@ def _hellmann_feynman_stress(
         core_potential_xc = 0.5 * (
             potential_xc[0] + potential_xc[1]
         )
+    elif noncolin:
+        xc_energy = grid_scale * mpi.sum_scalar(
+            float(np.sum(total_density[0] * epsilon_xc))
+        )
+        xc_potential_energy = grid_scale * mpi.sum_scalar(
+            float(np.sum(density * potential_xc))
+        )
+        core_potential_xc = potential_xc[0]
     else:
         xc_energy = grid_scale * mpi.sum_scalar(
             float(np.sum(total_density * epsilon_xc))
@@ -2672,7 +2848,15 @@ def _run_scf(
     )
     atomic_orbitals = sum(
         (
-            pseudo_by_label[atom.label].number_of_spinor_atomic_orbitals
+            (
+                pseudo_by_label[atom.label].number_of_spinor_atomic_orbitals
+                if (
+                    not bool(pw.system.get("_domag", False))
+                    or bool(pw.system.get("starting_spin_angle", False))
+                )
+                else 2
+                * pseudo_by_label[atom.label].number_of_averaged_atomic_orbitals
+            )
             if noncolin
             else pseudo_by_label[atom.label].number_of_atomic_orbitals
         )
@@ -2714,6 +2898,8 @@ def _run_scf(
         count * (2 if noncolin else 1) for count in local_plane_wave_counts
     ]
     local_plane_waves = max(local_plane_wave_counts)
+    local_hilbert_rows = max(spinor_plane_wave_counts)
+    density_components = 4 if noncolin else (2 if lsda else 1)
     # This is an array working-set estimate, not an RSS prediction. It covers
     # persistent SCF grids/history, basis metadata, wavefunctions, and the
     # largest Davidson/FFT block. Python, BLAS, FFT, and MPI runtimes are
@@ -2723,7 +2909,7 @@ def _run_scf(
         * (mixing_ndim_estimate + 1)
         * len(local_charge_rows)
         * 16
-        * (2 if lsda else 1)
+        * density_components
         if str(pw.electrons.get("mixing_mode", "plain"))
         .strip()
         .lower()
@@ -2746,7 +2932,9 @@ def _run_scf(
     # float64 |G|^2 vector. The targeted MPI symmetry path releases those
     # replicated setup tables below; all other paths retain them. The final
     # term counts rank-local charge-vector and |G|^2 caches.
-    density_potential_grid_bytes = 7 * local_real_points * 8
+    density_potential_grid_bytes = (
+        7 + 5 * (density_components - 1)
+    ) * local_real_points * 8
     release_replicated_reciprocal_grid = (
         mpi.size > 1
         and pw.full_kpoint_count > len(pw.kpoints)
@@ -2804,24 +2992,32 @@ def _run_scf(
                 for workspace in local_workspaces
             )
     resident_wavefunction_rows = (
-        local_plane_waves
+        local_hilbert_rows
         if disk_wavefunction_io
-        else sum(local_plane_wave_counts)
+        else sum(spinor_plane_wave_counts)
     )
     starting_and_saved_wfc_bytes = (
         (
             resident_wavefunction_rows * nbnd
-            + local_plane_waves * maximum_block
+            + local_hilbert_rows * maximum_block
         )
         * 16
     )
     projector_species_layout = [
         (
-            pseudo_by_label[species.label].number_of_projector_channels,
+            (
+                pseudo_by_label[species.label].number_of_spinor_projector_channels
+                if noncolin
+                else pseudo_by_label[species.label].number_of_projector_channels
+            ),
             sum(atom.label == species.label for atom in pw.atoms),
         )
         for species in pw.species
-        if pseudo_by_label[species.label].number_of_projector_channels
+        if (
+            pseudo_by_label[species.label].number_of_spinor_projector_channels
+            if noncolin
+            else pseudo_by_label[species.label].number_of_projector_channels
+        )
     ]
     packed_projector_channels = sum(
         channels * atoms for channels, atoms in projector_species_layout
@@ -2849,7 +3045,7 @@ def _run_scf(
     projector_workspace_bytes = max(
         (
             local_rows * projector_peak_columns * 16
-            for local_rows in local_plane_wave_counts
+            for local_rows in spinor_plane_wave_counts
         ),
         default=0,
     )
@@ -2877,11 +3073,12 @@ def _run_scf(
             ("dense eigensolver workspace", estimated_workspace)
         ]
     else:
+        maximum_hilbert_rows = max(sizes) * (2 if noncolin else 1)
         solver_rows = (
-            max(sizes) if mpi.size == 1 else local_plane_waves
+            maximum_hilbert_rows if mpi.size == 1 else local_hilbert_rows
         )
         davidson_subspace_columns = min(
-            max(sizes), davidson_ndim * nbnd
+            maximum_hilbert_rows, davidson_ndim * nbnd
         )
         davidson_bytes = (
             (
@@ -2897,7 +3094,8 @@ def _run_scf(
         # rank-local work vectors remain for CG.
         cg_bytes = (2 * solver_rows * nbnd + 5 * solver_rows) * 16
         paro_columns = min(
-            max(sizes), nbnd + max(int(np.rint(0.5 * nbnd)), 4)
+            maximum_hilbert_rows,
+            nbnd + max(int(np.rint(0.5 * nbnd)), 4),
         )
         paro_bytes = (
             2 * solver_rows * paro_columns + 3 * solver_rows * nbnd
@@ -3011,7 +3209,10 @@ def _run_scf(
         )
     if save_wavefunctions and mpi.size > 1:
         save_workspace = (
-            max(sizes) * nbnd * np.dtype(np.complex128).itemsize
+            max(sizes)
+            * (2 if noncolin else 1)
+            * nbnd
+            * np.dtype(np.complex128).itemsize
         )
         if save_workspace > estimated_workspace:
             estimated_workspace = save_workspace
@@ -3695,6 +3896,7 @@ def _run_scf(
                     PlainBroydenMixer,
                     DistributedBroydenMixer,
                     SpinDensityMixer,
+                    PauliDensityMixer,
                 ),
             )
             else 0
@@ -3703,7 +3905,13 @@ def _run_scf(
             vector.nbytes
             for vector in previous_eigenvectors
             if vector is not None
-        ) + max(sizes) * maximum_block * 16 // mpi.size
+        ) + (
+            max(sizes)
+            * (2 if noncolin else 1)
+            * maximum_block
+            * 16
+            // mpi.size
+        )
         bands_started = timers.start()
         for kpoint_index, compact_basis in enumerate(bases):
             if report_kpoints and progress is not None:
@@ -4479,6 +4687,7 @@ def _run_scf(
         )
         iteration_density_bytes = (
             3
+            * density_components
             * shape[0]
             * shape[1]
             * (local_z.stop - local_z.start)
@@ -4489,13 +4698,18 @@ def _run_scf(
             * (history_count_report + 1)
             * len(local_charge_rows)
             * 16
-            * (2 if isinstance(density_mixer, SpinDensityMixer) else 1)
+            * (
+                4
+                if isinstance(density_mixer, PauliDensityMixer)
+                else (2 if isinstance(density_mixer, SpinDensityMixer) else 1)
+            )
             if isinstance(
                 density_mixer,
                 (
                     PlainBroydenMixer,
                     DistributedBroydenMixer,
                     SpinDensityMixer,
+                    PauliDensityMixer,
                 ),
             )
             else 0
@@ -4606,6 +4820,9 @@ def _run_scf(
                 if lsda:
                     derivative_real_workspace[...] = rho
                     derivative_real_workspace += 0.5 * rho_core[None, ...]
+                elif noncolin:
+                    derivative_real_workspace[...] = rho
+                    derivative_real_workspace[0] += rho_core
                 else:
                     np.add(
                         rho,
@@ -4622,11 +4839,15 @@ def _run_scf(
                 local_force, core_force = _local_and_core_forces(
                     pw,
                     pseudo_by_label,
-                    rho[0] + rho[1] if lsda else rho,
+                    (
+                        rho[0] + rho[1]
+                        if lsda
+                        else (rho[0] if noncolin else rho)
+                    ),
                     (
                         0.5 * (final_vxc[0] + final_vxc[1])
                         if lsda
-                        else final_vxc
+                        else (final_vxc[0] if noncolin else final_vxc)
                     ),
                     charge_workspace,
                     local_charge_vectors,

@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import io
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from qepy_pw.errors import QEInputError
+from qepy_pw.basis import PlaneWaveBasis
 from qepy_pw.input import read_pw_input
+from qepy_pw.mpi import MPIContext
 from qepy_pw.occupations import (
     default_number_of_bands,
     fixed_occupations,
@@ -23,6 +26,7 @@ from qepy_pw.xc import (
 )
 from qepy_pw.scf import SCFResult, run_scf
 from qepy_pw.pw.output import format_footer
+from qepy_pw.pw.scf import _spinor_nonlocal_derivatives
 from qepy_pw.pw.save import (
     read_saved_density,
     read_saved_wavefunction,
@@ -83,7 +87,7 @@ def test_scalar_magnetization_defaults_are_explicit() -> None:
 
 def test_noncollinear_input_promotes_density_components_without_k_duplication() -> None:
     pw = _read(
-        "noncolin=.true., lspinorb=.true., no_t_rev=.true., "
+        "noncolin=.true., lspinorb=.true., starting_spin_angle=.true., no_t_rev=.true., "
         "starting_magnetization(1)=0.4, angle1(1)=90, angle2(1)=35",
         """K_POINTS crystal
 2
@@ -93,6 +97,7 @@ def test_noncollinear_input_promotes_density_components_without_k_duplication() 
     assert pw.system["nspin"] == 4
     assert pw.system["noncolin"] is True
     assert pw.system["lspinorb"] is True
+    assert pw.system["starting_spin_angle"] is True
     assert pw.system["no_t_rev"] is True
     assert pw.system["_domag"] is True
     assert pw.system["angle1(1)"] == pytest.approx(90.0)
@@ -580,3 +585,60 @@ K_POINTS gamma
     assert np.all(np.isfinite(result.forces_ha_per_bohr))
     assert result.stress_ha_per_bohr3 is not None
     assert np.all(np.isfinite(result.stress_ha_per_bohr3))
+
+
+def test_spinor_nonlocal_force_is_negative_atomic_energy_derivative() -> None:
+    class AnalyticSpinorPseudo:
+        @staticmethod
+        def spinor_projector_basis(
+            gk: np.ndarray, volume: float
+        ) -> tuple[np.ndarray, np.ndarray]:
+            radial = np.exp(-0.17 * np.einsum("gi,gi->g", gk, gk))
+            angular = 1.0 + 0.13j * gk[:, 0] - 0.07 * gk[:, 1]
+            up = radial * angular / np.sqrt(volume)
+            down = radial * (0.31 - 0.19j) / np.sqrt(volume)
+            return np.concatenate((up, down))[:, None], np.asarray([[0.83]])
+
+    basis = PlaneWaveBasis(
+        np.asarray(((0, 0, 0), (1, 0, 0), (0, -1, 1)), dtype=np.int32),
+        np.asarray(((0.11, -0.23, 0.07), (0.72, 0.08, -0.12),
+                    (-0.18, -0.61, 0.49))),
+        np.asarray((0.0, 0.0, 0.0)),
+    )
+    rng = np.random.default_rng(9713)
+    coefficients = rng.normal(size=(6, 2)) + 1j * rng.normal(size=(6, 2))
+    coefficients /= np.linalg.norm(coefficients, axis=0, keepdims=True)
+    position = np.asarray((0.29, -0.17, 0.41))
+    pseudo = AnalyticSpinorPseudo()
+    workspace = SimpleNamespace(local_plane_wave_indices=np.arange(3))
+
+    def evaluate(atom_position: np.ndarray, *, forces: bool):
+        pw = SimpleNamespace(
+            system={"noncolin": True, "lspinorb": True},
+            atoms=[SimpleNamespace(label="X", position=atom_position)],
+            volume=17.0,
+        )
+        return _spinor_nonlocal_derivatives(
+            pw,
+            {"X": pseudo},
+            [basis],
+            [coefficients],
+            np.asarray((0.75,)),
+            [np.asarray((0.9, 0.35))],
+            MPIContext(),
+            [workspace],
+            forces=forces,
+            stress=False,
+        )
+
+    _, force, _ = evaluate(position, forces=True)
+    assert force is not None
+    step = 2.0e-6
+    numerical = np.empty(3)
+    for direction in range(3):
+        displacement = np.zeros(3)
+        displacement[direction] = step
+        plus = evaluate(position + displacement, forces=False)[0]
+        minus = evaluate(position - displacement, forces=False)[0]
+        numerical[direction] = -(plus - minus) / (2.0 * step)
+    np.testing.assert_allclose(force[0], numerical, rtol=2.0e-8, atol=2.0e-10)

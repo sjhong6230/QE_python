@@ -997,6 +997,70 @@ class LocalPotential:
                 columns.append(np.concatenate(spin_components))
         return np.asfortranarray(np.column_stack(columns))
 
+    def averaged_atomic_orbital_basis(
+        self, gk: np.ndarray, volume: float
+    ) -> np.ndarray:
+        """Build QE ``atomic_wfc_so_mag`` scalar orbitals averaged over j."""
+        if not self.fully_relativistic:
+            raise QEInputError("j averaging requires a fully relativistic UPF")
+        vectors = np.asarray(gk, dtype=float)
+        selected, q, radial_values = self._atomic_wavefunction_radials(
+            vectors, volume
+        )
+        columns: list[np.ndarray] = []
+        for index, wavefunction in enumerate(selected):
+            l_value = wavefunction.angular_momentum
+            j_value = float(wavefunction.total_angular_momentum)
+            if l_value == 0:
+                radial = radial_values[:, index]
+            else:
+                # QE atomic_wfc_so_mag creates a block only on the j=l+1/2
+                # entry and combines it with the first matching j=l-1/2 one.
+                if abs(j_value - l_value - 0.5) > 1.0e-7:
+                    continue
+                partner = next(
+                    (
+                        partner_index
+                        for partner_index, candidate in enumerate(selected)
+                        if candidate.angular_momentum == l_value
+                        and abs(
+                            float(candidate.total_angular_momentum)
+                            - l_value + 0.5
+                        ) < 1.0e-7
+                    ),
+                    None,
+                )
+                if partner is None:
+                    raise QEInputError(
+                        f"fully relativistic l={l_value} atomic orbital has no j partner"
+                    )
+                radial = (
+                    (l_value + 1.0) * radial_values[:, index]
+                    + l_value * radial_values[:, partner]
+                ) / (2.0 * l_value + 1.0)
+            harmonics = _qe_real_spherical_harmonics(l_value, vectors, q)
+            phase = (1j) ** l_value
+            for channel in range(2 * l_value + 1):
+                columns.append(phase * radial * harmonics[:, channel])
+        return (
+            np.asfortranarray(np.column_stack(columns))
+            if columns
+            else np.empty((len(vectors), 0), dtype=np.complex128)
+        )
+
+    @property
+    def number_of_averaged_atomic_orbitals(self) -> int:
+        """Scalar orbital count produced by QE ``atomic_wfc_so_mag``."""
+        count = 0
+        for wavefunction in self.atomic_wavefunctions:
+            if wavefunction.occupation < 0.0:
+                continue
+            l_value = wavefunction.angular_momentum
+            j_value = float(wavefunction.total_angular_momentum)
+            if l_value == 0 or abs(j_value - l_value - 0.5) < 1.0e-7:
+                count += 2 * l_value + 1
+        return count
+
 
 def _unique_radial_arguments(q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Collapse symmetry-equivalent radial arguments before UPF quadrature."""

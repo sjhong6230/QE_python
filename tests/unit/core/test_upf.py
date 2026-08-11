@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from qepy_pw.upf import (
+    AtomicWavefunction,
     LocalPotential,
     RadialProjector,
     _qe_cubic_interpolate_with_derivative,
@@ -98,6 +99,10 @@ def test_disabling_lspinorb_uses_qe_j_averaged_spin_diagonal_projectors() -> Non
             RadialProjector(2, "2P+", 1, np.asarray([0, 2, 3, 2, 0.0]), 5, 1.5),
         ),
         dij_ry=np.diag((2.0, 4.0)),
+        atomic_wavefunctions=(
+            AtomicWavefunction(1, "2P-", 1, 1.0, np.asarray([0, 1, 2, 1, 0.0]), 0.5, 2),
+            AtomicWavefunction(2, "2P+", 1, 1.0, np.asarray([0, 2, 3, 2, 0.0]), 1.5, 2),
+        ),
     )
     vectors = np.asarray([[0.2, -0.1, 0.4], [0.0, 0.3, -0.2]])
     averaged, coupling = pseudo.averaged_spinor_projector_basis(vectors, 80.0)
@@ -120,6 +125,10 @@ def test_disabling_lspinorb_uses_qe_j_averaged_spin_diagonal_projectors() -> Non
     assert abs(axial[1, 0]) > 1.0e-10
     assert abs(axial[0, 1]) > 1.0e-10
     assert abs(axial[1, 1]) < 1.0e-14
+    averaged_atomic = pseudo.averaged_atomic_orbital_basis(vectors, 80.0)
+    assert pseudo.number_of_spinor_atomic_orbitals == 6
+    assert pseudo.number_of_averaged_atomic_orbitals == 3
+    assert averaged_atomic.shape == (2, 3)
 
 
 def test_qe_simpson_integrates_quadratic_on_uniform_grid() -> None:
