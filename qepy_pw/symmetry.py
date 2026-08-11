@@ -23,6 +23,43 @@ if TYPE_CHECKING:
 class SymmetryOperation:
     matrix: np.ndarray
     translation: np.ndarray
+    time_reversal: bool = False
+
+
+def magnetic_symmetry_operations(
+    lattice: np.ndarray,
+    operations: tuple[SymmetryOperation, ...],
+    magnetizations: np.ndarray,
+    *,
+    allow_time_reversal: bool = True,
+    tolerance: float = 1.0e-7,
+) -> tuple[SymmetryOperation, ...]:
+    """Return unitary/antiunitary operations preserving initial moments."""
+    lattice = np.asarray(lattice, dtype=float)
+    inverse_lattice = np.linalg.inv(lattice)
+    moments = np.asarray(magnetizations, dtype=float).reshape(-1, 3)
+    selected: list[SymmetryOperation] = []
+    for operation in operations:
+        rotation = inverse_lattice @ operation.matrix @ lattice
+        axial_rotation = np.linalg.det(rotation) * rotation
+        rotated = moments @ axial_rotation
+        if np.allclose(rotated, moments, atol=tolerance, rtol=0.0):
+            selected.append(operation)
+        elif allow_time_reversal and np.allclose(
+            rotated, -moments, atol=tolerance, rtol=0.0
+        ):
+            selected.append(
+                SymmetryOperation(
+                    operation.matrix,
+                    operation.translation,
+                    time_reversal=True,
+                )
+            )
+    if not selected:
+        return (
+            SymmetryOperation(np.eye(3, dtype=int), np.zeros(3)),
+        )
+    return tuple(selected)
 
 
 class DensitySymmetrizer:
@@ -236,6 +273,77 @@ class DensitySymmetrizer:
             result = self.mpi.sum_array(result)
         result /= len(self.operations)
         return result
+
+
+class PauliDensitySymmetrizer(DensitySymmetrizer):
+    """Symmetrize charge and an axial magnetization under a magnetic group."""
+
+    def __init__(
+        self,
+        shape: tuple[int, int, int],
+        operations: tuple[SymmetryOperation, ...],
+        lattice: np.ndarray,
+        mpi: "MPIContext | None" = None,
+    ) -> None:
+        super().__init__(shape, operations, mpi)
+        inverse_lattice = np.linalg.inv(np.asarray(lattice, dtype=float))
+        rotations = []
+        for operation in operations:
+            rotation = inverse_lattice @ operation.matrix @ lattice
+            axial = np.linalg.det(rotation) * rotation
+            if operation.time_reversal:
+                axial = -axial
+            # apply() samples the forward-related point; use the inverse
+            # axial action when returning that vector to the target point.
+            rotations.append(axial.T)
+        self.axial_inverse_rotations = tuple(rotations)
+
+    def apply_pauli(self, density: np.ndarray) -> np.ndarray:
+        values = np.asarray(density, dtype=float)
+        expected_local = self.local_shape
+        if values.shape != (4, *expected_local):
+            raise ValueError("Pauli density does not match symmetry FFT grid")
+        if len(self.operations) <= 1:
+            return values
+        distributed = self.mpi is not None and self.mpi.size > 1
+        full = (
+            np.stack(
+                [self.mpi.gather_z_slabs(component, self.shape) for component in values]
+            )
+            if distributed
+            else values
+        )
+        sources = [component.ravel() for component in full]
+        averaged = np.zeros((4, int(np.prod(self.shape))), dtype=float)
+        operation_indices = (
+            range(self.mpi.rank, len(self.operations), self.mpi.size)
+            if distributed
+            else range(len(self.operations))
+        )
+        sampled = np.empty((4, int(np.prod(self.shape))), dtype=float)
+        for operation_index in operation_indices:
+            identity = self._identity_operations[operation_index]
+            terms = self._operation_terms[operation_index]
+            if identity:
+                sampled[...] = np.asarray(sources)
+            else:
+                xy, z_slots = self._linear_xy_and_z(terms)
+                xy *= self.shape[2]
+                xy += z_slots
+                for component in range(4):
+                    np.take(sources[component], xy, out=sampled[component])
+            averaged[0] += sampled[0]
+            averaged[1:] += (
+                sampled[1:].T @ self.axial_inverse_rotations[operation_index]
+            ).T
+        if distributed:
+            averaged = self.mpi.sum_array(averaged)
+        averaged /= len(self.operations)
+        result = averaged.reshape((4, *self.shape))
+        if distributed:
+            local_z = self.mpi.slab(self.shape[2])
+            result = result[:, :, :, local_z]
+        return np.ascontiguousarray(result)
 
 
 class ReciprocalDensitySymmetrizer:
@@ -871,8 +979,9 @@ def reduce_kpoints(
 
     coordinate_keys = keys(coordinates)
     lookup = {key: index for index, key in enumerate(coordinate_keys)}
-    reciprocal_matrices = tuple(
-        np.linalg.inv(operation.matrix).T for operation in operations
+    reciprocal_operations = tuple(
+        (np.linalg.inv(operation.matrix).T, operation.time_reversal)
+        for operation in operations
     )
     negative_keys = keys(-coordinates) if time_reversal else []
     time_reversal = time_reversal and all(
@@ -883,9 +992,9 @@ def reduce_kpoints(
     # each (k,symmetry,sign) tuple; on a 12^3 mesh that Python dispatch cost
     # alone was several seconds in every MPI rank before SCF timing began.
     orbit_maps: list[np.ndarray] = []
-    signs = (1.0, -1.0) if time_reversal else (1.0,)
-    for reciprocal_matrix in reciprocal_matrices:
+    for reciprocal_matrix, antiunitary in reciprocal_operations:
         transformed = coordinates @ reciprocal_matrix
+        signs = (-1.0,) if antiunitary else ((1.0, -1.0) if time_reversal else (1.0,))
         for sign in signs:
             mapped_keys = keys(sign * transformed)
             orbit_map = np.fromiter(
@@ -902,13 +1011,11 @@ def reduce_kpoints(
     for index, point in enumerate(coordinates):
         if index in assigned:
             continue
-        orbit: set[int] = set()
+        orbit: set[int] = {index}
         for orbit_map in orbit_maps:
             mapped = int(orbit_map[index])
             if mapped >= 0:
                 orbit.add(mapped)
-        if not orbit:
-            orbit.add(index)
         assigned.update(orbit)
         representative_index = len(representatives)
         mapping[list(orbit)] = representative_index
@@ -936,6 +1043,8 @@ def mesh_compatible_operations(
     for operation in operations:
         inverse_transpose = np.linalg.inv(operation.matrix).T
         transformed = coordinates @ inverse_transpose
+        if operation.time_reversal:
+            transformed = -transformed
         transformed -= np.floor(transformed)
         transformed[
             np.isclose(transformed, 1.0, atol=1.0e-10)

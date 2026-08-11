@@ -5,6 +5,7 @@ import qepy_pw.mixing as mixing_module
 from qepy_pw.mixing import (
     DistributedBroydenMixer,
     LinearMixer,
+    PauliDensityMixer,
     PlainBroydenMixer,
     SpinDensityMixer,
 )
@@ -152,3 +153,44 @@ def test_lsda_linear_mixing_remains_available_without_history():
         mixed, 0.75 * spin_density + 0.25 * spin_target
     )
     assert len(mixer.delta_inputs) == 0
+
+
+def test_noncollinear_broyden_mixes_all_three_magnetic_components():
+    shape = (4, 4, 4)
+    workspace = _SerialDensityWorkspace(shape)
+    frequencies = [np.fft.fftfreq(size) * size for size in shape]
+    vectors = np.stack(
+        np.meshgrid(*frequencies, indexing="ij"), axis=-1
+    ) @ (2.0 * np.pi * np.eye(3))
+    g2 = np.einsum("...j,...j->...", vectors, vectors).ravel()
+    mixer = PauliDensityMixer(
+        DistributedBroydenMixer(workspace, g2, beta=0.3, ndim=6),
+        beta=0.3,
+    )
+    x, y, z = np.meshgrid(
+        *(np.arange(size) / size for size in shape), indexing="ij"
+    )
+    current = np.stack(
+        (
+            1.0 + 0.05 * np.cos(2 * np.pi * x),
+            0.03 * np.sin(2 * np.pi * y),
+            0.04 * np.cos(2 * np.pi * z),
+            0.02 * np.sin(2 * np.pi * (x + z)),
+        )
+    )
+    target = current.copy()
+    target[1:] += np.stack(
+        (
+            0.02 * np.cos(2 * np.pi * z),
+            0.03 * np.sin(2 * np.pi * x),
+            0.04 * np.cos(2 * np.pi * y),
+        )
+    )
+    first = mixer.mix(current, target)
+    second = mixer.mix(first, target)
+    assert len(mixer.delta_inputs) == 1
+    assert np.linalg.norm(mixer.delta_residuals[0]) > 0.0
+    component_changes = np.sqrt(
+        np.sum((second[1:] - first[1:]) ** 2, axis=(1, 2, 3))
+    )
+    assert np.all(component_changes > 0.0)

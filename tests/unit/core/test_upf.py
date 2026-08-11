@@ -6,6 +6,8 @@ import numpy as np
 import pytest
 
 from qepy_pw.upf import (
+    LocalPotential,
+    RadialProjector,
     _qe_cubic_interpolate_with_derivative,
     _qe_real_spherical_harmonics_with_gradient,
     _qe_simpson,
@@ -72,6 +74,36 @@ def test_upf_reader_preserves_fully_relativistic_quantum_numbers(
     assert beta.shape == (4, 4)
     assert coupling.shape == (4, 4)
     np.testing.assert_allclose(coupling, coupling.T)
+
+
+def test_disabling_lspinorb_uses_qe_j_averaged_spin_diagonal_projectors() -> None:
+    radial_grid = np.linspace(0.1, 0.5, 5)
+    pseudo = LocalPotential(
+        element="X",
+        z_valence=1.0,
+        functional="PBE",
+        r=radial_grid,
+        rab=np.full(5, 0.1),
+        vloc_ry=np.zeros(5),
+        coulomb=False,
+        relativistic="full",
+        has_spin_orbit=True,
+        projectors=(
+            RadialProjector(1, "2P-", 1, np.asarray([0, 1, 2, 1, 0.0]), 5, 0.5),
+            RadialProjector(2, "2P+", 1, np.asarray([0, 2, 3, 2, 0.0]), 5, 1.5),
+        ),
+        dij_ry=np.diag((2.0, 4.0)),
+    )
+    vectors = np.asarray([[0.2, -0.1, 0.4], [0.0, 0.3, -0.2]])
+    averaged, coupling = pseudo.averaged_spinor_projector_basis(vectors, 80.0)
+    assert averaged.shape == (4, 6)
+    assert coupling.shape == (6, 6)
+    np.testing.assert_allclose(np.diag(coupling), np.full(6, 5.0 / 3.0))
+    np.testing.assert_allclose(averaged[:2, 3:], 0.0)
+    np.testing.assert_allclose(averaged[2:, :3], 0.0)
+
+    resolved, _ = pseudo.spinor_projector_basis(vectors, 80.0)
+    assert not np.allclose(np.abs(resolved), np.abs(averaged))
 
 
 def test_qe_simpson_integrates_quadratic_on_uniform_grid() -> None:

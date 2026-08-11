@@ -30,6 +30,7 @@ from ..diagonalization import (
     FactorizedProjectorTerm,
     PackedProjectorTerm,
     PlaneWaveHamiltonian,
+    SpinorPlaneWaveHamiltonian,
     ProjectorTerm,
     _lowest_generalized_eigh,
     _matmul_f,
@@ -53,6 +54,7 @@ from ..mixing import (
     DistributedBroydenMixer,
     LinearMixer,
     PlainBroydenMixer,
+    PauliDensityMixer,
     SpinDensityMixer,
 )
 from ..memory import (
@@ -74,17 +76,26 @@ from ..occupations import (
 from ..timing import TimingEntry, TimingRegistry
 from ..mpi import MPIContext
 from ..upf import LocalPotential, read_upf
+from ..spinor import (
+    aligned_spinors,
+    density_components as spinor_density_components,
+    eigenchannel_densities,
+    magnetization_direction,
+    potential_components as noncollinear_potential_components,
+)
 from ..xc import (
     GGA_POINT_BLOCK_SIZE,
     GGA_FUNCTIONALS,
     canonical_xc_name,
     lsda_lda,
+    noncollinear_lda,
     pbe_unpolarized_components,
     pbe_spin_components,
     pw92_lda_unpolarized,
     pz81_unpolarized,
 )
 from ..symmetry import (
+    PauliDensitySymmetrizer,
     ReciprocalDensitySymmetrizer,
     fft_factors,
     symmetrize_forces,
@@ -401,13 +412,20 @@ def _collect_wavefunctions_root(
     miller_indices: list[np.ndarray] = []
     for vectors, basis, workspace in zip(eigenvectors, bases, workspaces):
         indices = basis.indices
-        if vectors.shape[0] == len(basis):
+        npol = vectors.shape[0] // len(basis) if mpi.size == 1 else None
+        if npol in {1, 2}:
             gathered = vectors if mpi.is_root else np.empty((0, 0))
         else:
+            scalar_rows = workspace.local_plane_wave_indices
+            spinor = vectors.shape[0] == 2 * len(scalar_rows)
+            rows = (
+                np.concatenate((scalar_rows, len(basis) + scalar_rows))
+                if spinor else scalar_rows
+            )
             gathered = mpi.gather_indexed_rows_root(
                 vectors,
-                workspace.local_plane_wave_indices,
-                len(basis),
+                rows,
+                len(basis) * (2 if spinor else 1),
             )
         if mpi.is_root:
             collected.append(np.asarray(gathered))
@@ -442,10 +460,15 @@ def _final_wavefunction_payload(
         if mpi.is_root
         else []
     )
-    rows = [
-        np.asarray(workspaces[index].local_plane_wave_indices, dtype=np.int32)
-        for index in range(len(bases))
-    ]
+    rows = []
+    for index, (vectors, basis) in enumerate(zip(eigenvectors, bases)):
+        scalar_rows = np.asarray(
+            workspaces[index].local_plane_wave_indices, dtype=np.int32
+        )
+        if vectors.shape[0] == 2 * len(scalar_rows):
+            rows.append(np.concatenate((scalar_rows, len(basis) + scalar_rows)))
+        else:
+            rows.append(scalar_rows)
     return eigenvectors, miller, rows, True
 
 
@@ -604,6 +627,23 @@ def _nonlocal_projector_terms(
 ) -> tuple[ProjectorTerm, ...]:
     """Build the compact atom-projector representation of the nonlocal term."""
     basis_vectors = basis.vectors
+    if bool(pw.system.get("noncolin", False)):
+        vectors = (
+            basis_vectors
+            if local_rows is None
+            else basis_vectors[np.asarray(local_rows, dtype=np.int32)]
+        )
+        spinor_terms: list[ProjectorTerm] = []
+        for atom in pw.atoms:
+            beta, coupling = pseudos[atom.label].spinor_atomic_projectors(
+                vectors,
+                atom.position,
+                pw.volume,
+                spin_orbit=bool(pw.system.get("lspinorb", False)),
+            )
+            if beta.shape[1]:
+                spinor_terms.append((beta, coupling))
+        return tuple(spinor_terms)
     if factorized or packed:
         vectors = (
             basis_vectors
@@ -871,6 +911,119 @@ def _atomic_starting_orbitals(
     return trials
 
 
+def _spinor_starting_orbitals(
+    pw: PWInput,
+    pseudos: dict[str, LocalPotential],
+    basis: PlaneWaveBasis,
+    number_of_bands: int,
+    random_stream: _QERandom,
+    local_rows: np.ndarray | None = None,
+    mpi: MPIContext | None = None,
+    starting_wfc: str | None = None,
+) -> np.ndarray:
+    """Build QE-like atom-resolved trials in the doubled spinor basis.
+
+    Each scalar atomic orbital is paired with two orthogonal spinors.  Their
+    axes are species-specific when ``domag`` is active, which is essential
+    for ferri/antiferromagnetic and multi-species starting configurations.
+    The magnitude of the starting moment enters through the initial Pauli
+    density and potential, as in QE; it is not encoded in spinor norms.
+    """
+    starting_wfc = str(
+        starting_wfc
+        if starting_wfc is not None
+        else pw.electrons.get("startingwfc", "atomic+random")
+    ).lower()
+    if starting_wfc not in {"atomic", "atomic+random", "random"}:
+        raise UnsupportedFeatureError(
+            f"startingwfc={starting_wfc!r} is not ported"
+        )
+    scalar_rows = (
+        np.arange(len(basis), dtype=np.int32)
+        if local_rows is None
+        else np.asarray(local_rows, dtype=np.int32)
+    )
+    basis_vectors = basis.vectors[scalar_rows]
+    kinetic_scalar = 0.5 * np.einsum(
+        "ij,ij->i", basis_vectors, basis_vectors
+    )
+    kinetic = np.concatenate((kinetic_scalar, kinetic_scalar))
+    species_index = {
+        species.label: index
+        for index, species in enumerate(pw.species, start=1)
+    }
+    domag = bool(pw.system.get("_domag", False))
+    blocks: list[np.ndarray] = []
+    if starting_wfc != "random":
+        centered_by_label: dict[str, np.ndarray] = {}
+        for atom in pw.atoms:
+            centered = centered_by_label.get(atom.label)
+            if centered is None:
+                centered = pseudos[atom.label].atomic_orbital_basis(
+                    basis_vectors, pw.volume
+                )
+                centered_by_label[atom.label] = centered
+            if centered.shape[1] == 0:
+                continue
+            phase = np.exp(-1j * (basis_vectors @ atom.position))
+            scalar = centered * phase[:, None]
+            index = species_index[atom.label]
+            if domag:
+                first, second = aligned_spinors(
+                    float(pw.system.get(f"angle1({index})", 0.0)),
+                    float(pw.system.get(f"angle2({index})", 0.0)),
+                )
+                if float(
+                    pw.system.get(f"starting_magnetization({index})", 0.0)
+                ) < 0.0:
+                    first, second = second, first
+            else:
+                first = np.asarray((1.0, 0.0), dtype=np.complex128)
+                second = np.asarray((0.0, 1.0), dtype=np.complex128)
+            for spinor in (first, second):
+                blocks.append(np.concatenate((
+                    scalar * spinor[0], scalar * spinor[1]
+                ), axis=0))
+    trials = (
+        np.column_stack(blocks)
+        if blocks
+        else np.empty((2 * len(basis_vectors), 0), dtype=np.complex128)
+    )
+    if trials.shape[1]:
+        if local_rows is None:
+            norms = np.linalg.norm(trials, axis=0)
+        else:
+            if mpi is None:
+                raise ValueError("MPI context is required for local trial rows")
+            norms = np.sqrt(mpi.sum_array(np.sum(np.abs(trials) ** 2, axis=0)))
+        usable = norms > max(1.0e-14, 1.0e-12 * float(np.max(norms)))
+        trials = trials[:, usable]
+
+    global_rows = np.concatenate((scalar_rows, len(basis) + scalar_rows))
+    if starting_wfc == "atomic+random" and trials.shape[1] >= number_of_bands:
+        trials = _randomize_atomic_trials(
+            trials,
+            kinetic,
+            random_stream,
+            global_plane_waves=(2 * len(basis) if local_rows is not None else None),
+            rows=(global_rows if local_rows is not None else None),
+        )
+    elif trials.shape[1] < number_of_bands:
+        missing = number_of_bands - trials.shape[1]
+        amplitude, phase_fraction = (
+            random_stream.pairs_by_band(2 * len(basis), missing)
+            if local_rows is None
+            else random_stream.pairs_by_band_rows(
+                2 * len(basis), missing, global_rows
+            )
+        )
+        random_trials = amplitude * np.exp(2j * np.pi * phase_fraction) / (
+            1.0 + 2.0 * kinetic[:, None]
+        )
+        trials = np.column_stack((trials, random_trials))
+    return np.asfortranarray(trials)
+
+
 def _starting_charge_scales(
     pw: PWInput, pseudos: dict[str, LocalPotential]
 ) -> dict[str, float]:
@@ -918,6 +1071,22 @@ def _starting_magnetizations(
         species.label: float(value)
         for species, value in zip(pw.species, values)
     }
+
+
+def _starting_magnetization_vectors(
+    pw: PWInput, pseudos: dict[str, LocalPotential]
+) -> dict[str, np.ndarray]:
+    magnitudes = _starting_magnetizations(pw, pseudos)
+    result: dict[str, np.ndarray] = {}
+    for index, species in enumerate(pw.species, start=1):
+        result[species.label] = (
+            magnitudes[species.label]
+            * magnetization_direction(
+                float(pw.system.get(f"angle1({index})", 0.0)),
+                float(pw.system.get(f"angle2({index})", 0.0)),
+            )
+        )
+    return result
 
 
 def _rotate_starting_subspace(
@@ -972,11 +1141,15 @@ def _atomic_starting_density(
     q = np.sqrt(geometry.charge_g2)
     nspin = int(pw.system.get("nspin", 1))
     coefficients = np.zeros(len(gvec), dtype=complex)
+    magnetization_components = 3 if nspin == 4 else (1 if nspin == 2 else 0)
     magnetization_coefficients = (
-        np.zeros(len(gvec), dtype=complex) if nspin == 2 else None
+        np.zeros((magnetization_components, len(gvec)), dtype=complex)
+        if magnetization_components
+        else None
     )
     charge_scales = _starting_charge_scales(pw, pseudos)
     starting_magnetizations = _starting_magnetizations(pw, pseudos)
+    starting_vectors = _starting_magnetization_vectors(pw, pseudos)
     for species in pw.species:
         pseudo = pseudos[species.label]
         scale = charge_scales[species.label]
@@ -997,10 +1170,16 @@ def _atomic_starting_density(
             atomic_coefficients = scale * radial * structure
             coefficients += atomic_coefficients
             if magnetization_coefficients is not None:
-                magnetization_coefficients += (
-                    starting_magnetizations[species.label]
-                    * atomic_coefficients
-                )
+                if nspin == 4:
+                    magnetization_coefficients += (
+                        starting_vectors[species.label][:, None]
+                        * atomic_coefficients[None, :]
+                    )
+                else:
+                    magnetization_coefficients[0] += (
+                        starting_magnetizations[species.label]
+                        * atomic_coefficients
+                    )
         else:
             # A UPF without PP_RHOATOM contributes the correct average
             # charge but no invented atom-centered Fourier components.
@@ -1011,15 +1190,18 @@ def _atomic_starting_density(
                 / pw.volume
             )
             if magnetization_coefficients is not None:
-                magnetization_coefficients[
-                    geometry.charge_g2 < 1.0e-14
-                ] += (
-                    len(positions)
-                    * scale
-                    * pseudo.z_valence
-                    * starting_magnetizations[species.label]
-                    / pw.volume
+                zero = geometry.charge_g2 < 1.0e-14
+                coefficient = (
+                    len(positions) * scale * pseudo.z_valence / pw.volume
                 )
+                if nspin == 4:
+                    magnetization_coefficients[:, zero] += (
+                        starting_vectors[species.label][:, None] * coefficient
+                    )
+                else:
+                    magnetization_coefficients[0, zero] += (
+                        starting_magnetizations[species.label] * coefficient
+                    )
     starting_charge = float(
         np.real(np.sum(coefficients[geometry.charge_g2 < 1.0e-14]))
     ) * pw.volume
@@ -1037,15 +1219,19 @@ def _atomic_starting_density(
     )
     density = np.ascontiguousarray(np.real(transformed))
     if magnetization_coefficients is not None:
-        magnetization = np.ascontiguousarray(
-            np.real(
-                workspace.coefficients_to_grid(
-                    magnetization_coefficients, use_scratch=True
+        magnetization_grid = workspace.coefficients_to_grid(
+            np.moveaxis(magnetization_coefficients, 0, -1), use_scratch=True
+        )
+        magnetization = np.moveaxis(np.real(magnetization_grid), -1, 0)
+        density = (
+            np.concatenate((density[None, ...], magnetization), axis=0)
+            if nspin == 4
+            else np.stack(
+                (
+                    0.5 * (density + magnetization[0]),
+                    0.5 * (density - magnetization[0]),
                 )
             )
-        )
-        density = np.stack(
-            (0.5 * (density + magnetization), 0.5 * (density - magnetization))
         )
     return density, starting_charge
 
@@ -1107,6 +1293,34 @@ def _xc_energy_potential(
     energy_density_out: np.ndarray | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray]:
     """Evaluate the selected XC functional on a rank-local FFT slab."""
+    if density.ndim >= 4 and density.shape[0] == 4:
+        channels, direction = eigenchannel_densities(density)
+        if functional in GGA_FUNCTIONALS:
+            if workspace is None or g_vectors is None:
+                raise ValueError(
+                    "noncollinear GGA requires an FFT workspace and reciprocal vectors"
+                )
+            epsilon, channel_potential, _stress_tensor = (
+                _spin_gga_energy_potential_data(
+                    channels,
+                    workspace,
+                    g_vectors,
+                    functional,
+                    need_stress=False,
+                    need_epsilon=need_epsilon,
+                    energy_density_out=energy_density_out,
+                )
+            )
+            potential = noncollinear_potential_components(
+                channel_potential, direction
+            )
+            return epsilon, potential
+        epsilon, potential = noncollinear_lda(density, functional)
+        if energy_density_out is not None:
+            np.multiply(density[0], epsilon, out=energy_density_out)
+        if not need_epsilon:
+            epsilon = None
+        return epsilon, potential
     if density.ndim >= 4 and density.shape[0] == 2:
         if functional in GGA_FUNCTIONALS:
             if workspace is None or g_vectors is None:
@@ -1391,6 +1605,8 @@ def _density_from_states(
     workspaces: Sequence[LocalPotentialWorkspace] | None = None,
     timers: TimingRegistry | None = None,
     kpoint_spins: Sequence[int] | None = None,
+    spinor: bool = False,
+    domag: bool = True,
 ) -> np.ndarray:
     mpi = mpi if mpi is not None else MPIContext()
     z_slab = mpi.slab(shape[2])
@@ -1401,7 +1617,10 @@ def _density_from_states(
     )
     spin_polarized = kpoint_spins is not None
     rho_local = np.zeros(
-        (2, *local_shape) if spin_polarized else local_shape, dtype=float
+        (4, *local_shape)
+        if spinor
+        else ((2, *local_shape) if spin_polarized else local_shape),
+        dtype=float,
     )
     for index, (coeff, basis, weight, band_occupations) in enumerate(
         zip(vectors, bases, weights, occupations)
@@ -1418,18 +1637,53 @@ def _density_from_states(
                 basis.indices, shape, mpi=mpi
             )
         transform_started = timers.start() if timers is not None else None
-        spin = int(kpoint_spins[index]) - 1 if spin_polarized else 0
-        destination = rho_local[spin] if spin_polarized else rho_local
-        workspace.accumulate_density(
-            destination,
-            coeff[:, :band_count],
-            weight
-            * np.asarray(band_occupations[:band_count], dtype=float)
-            / volume,
-        )
+        if spinor:
+            plane_waves = coeff.shape[0] // 2
+            if coeff.shape[0] != 2 * plane_waves:
+                raise ValueError("spinor wavefunction has an odd row count")
+            grids = workspace.coefficients_to_grid(
+                np.concatenate(
+                    (
+                        coeff[:plane_waves, :band_count],
+                        coeff[plane_waves:, :band_count],
+                    ),
+                    axis=1,
+                )
+            )
+            up = grids[..., :band_count]
+            down = grids[..., band_count:]
+            components = spinor_density_components(
+                np.stack((up, down)), spin_axis=0
+            )
+            band_weights = (
+                weight
+                * np.asarray(band_occupations[:band_count], dtype=float)
+                / volume
+            )
+            rho_local[0] += np.einsum(
+                "...b,b->...", components[0], band_weights
+            )
+            if domag:
+                rho_local[1:] += np.einsum(
+                    "s...b,b->s...", components[1:], band_weights
+                )
+        else:
+            spin = int(kpoint_spins[index]) - 1 if spin_polarized else 0
+            destination = rho_local[spin] if spin_polarized else rho_local
+            workspace.accumulate_density(
+                destination,
+                coeff[:, :band_count],
+                weight
+                * np.asarray(band_occupations[:band_count], dtype=float)
+                / volume,
+            )
         if timers is not None and transform_started is not None:
             timers.stop("sum_band:wfc", transform_started)
-    if spin_polarized:
+    if spinor:
+        total_sum = mpi.sum_scalar(float(np.sum(rho_local[0])))
+        if total_sum > 0.0:
+            rho_local *= nelec * np.prod(shape) / (total_sum * volume)
+    elif spin_polarized:
         assert kpoint_spins is not None
         for spin in range(2):
             target = sum(
@@ -1459,7 +1713,7 @@ def _gather_density_root(
     """Gather either a scalar density or two collinear spin components."""
     if density.ndim == 3:
         return mpi.gather_z_slabs_root(density, shape)
-    if density.ndim == 4 and density.shape[0] == 2:
+    if density.ndim == 4 and density.shape[0] in {2, 4}:
         gathered = [
             mpi.gather_z_slabs_root(component, shape)
             for component in density
@@ -1467,25 +1721,34 @@ def _gather_density_root(
         if mpi.is_root:
             return np.stack(gathered)
         return np.empty((0,), dtype=density.dtype)
-    raise ValueError("density must be scalar or collinear spin density")
+    raise ValueError("density must be scalar, collinear, or Pauli-component density")
 
 
 def _symmetrize_density_components(
     density: np.ndarray,
-    symmetrizer: ReciprocalDensitySymmetrizer,
+    symmetrizer: ReciprocalDensitySymmetrizer | PauliDensitySymmetrizer,
     nelec: float,
     shape: tuple[int, int, int],
     volume: float,
     mpi: MPIContext,
 ) -> np.ndarray:
     """Apply spatial symmetry without interchanging collinear spin channels."""
-    if density.ndim == 3:
+    if density.ndim == 4 and density.shape[0] == 4:
+        if not isinstance(symmetrizer, PauliDensitySymmetrizer):
+            raise ValueError("Pauli density requires a magnetic symmetrizer")
+        result = symmetrizer.apply_pauli(density)
+    elif density.ndim == 3:
         result = symmetrizer.apply(density)
     else:
         result = np.stack(
             [symmetrizer.apply(component) for component in density]
         )
-    total_density = mpi.sum_scalar(float(np.sum(result)))
+    charge = (
+        result[0]
+        if result.ndim == 4 and result.shape[0] == 4
+        else (np.sum(result, axis=0) if result.ndim == 4 else result)
+    )
+    total_density = mpi.sum_scalar(float(np.sum(charge)))
     result *= nelec * np.prod(shape) / (total_density * volume)
     return result
 
@@ -2133,13 +2396,20 @@ def _run_scf(
     pw.system["_resolved_xc"] = xc_functional
     nspin = int(pw.system.get("nspin", 1))
     lsda = nspin == 2
+    noncolin = nspin == 4
+    domag = bool(pw.system.get("_domag", False))
     z_by_label = {label: pseudo.z_valence for label, pseudo in pseudo_by_label.items()}
     nelec = sum(z_by_label[atom.label] for atom in pw.atoms) - float(pw.system.get("tot_charge", 0.0))
-    if not lsda and occupations_mode == "fixed" and (
-        abs(nelec - round(nelec)) > 1e-10
-        or int(round(nelec)) % 2
+    if not lsda and not noncolin and occupations_mode == "fixed" and (
+        abs(nelec - round(nelec)) > 1e-10 or int(round(nelec)) % 2
     ):
         raise UnsupportedFeatureError("fixed non-spin occupations require an even integer electron count")
+    if noncolin and occupations_mode == "fixed" and abs(
+        nelec - round(nelec)
+    ) > 1.0e-10:
+        raise QEInputError(
+            "fixed noncollinear occupations require an integer electron count"
+        )
     tot_magnetization = float(
         pw.system.get("tot_magnetization", -10000.0)
     )
@@ -2149,7 +2419,7 @@ def _run_scf(
             "tot_magnetization is larger than the number of electrons",
             routine="setup",
         )
-    occupied = int(round(nelec)) // 2
+    occupied = int(round(nelec)) if noncolin else int(round(nelec)) // 2
     occupied_by_spin = (int(np.ceil(nelup)), int(np.ceil(neldw)))
     nbnd = int(
         pw.system.get(
@@ -2200,14 +2470,18 @@ def _run_scf(
     disk_wavefunction_io = uses_disk_wavefunction_buffer(
         disk_io, len(bases)
     )
-    if min(sizes) < nbnd:
+    if min(sizes) * (2 if noncolin else 1) < nbnd:
         raise QEInputError(
             f"nbnd={nbnd} exceeds the smallest plane-wave basis "
-            f"dimension ({min(sizes)})"
+            f"dimension ({min(sizes) * (2 if noncolin else 1)})"
         )
     diagonalization = _canonical_diagonalization(
         pw.electrons.get("diagonalization", "david")
     )
+    if noncolin and diagonalization == "dense":
+        raise UnsupportedFeatureError(
+            "dense diagonalization is not available for spinor calculations"
+        )
     if "diago_david_ndiim" in pw.electrons:
         raise QEInputError(
             "unknown ELECTRONS variable diago_david_ndiim; "
@@ -2343,13 +2617,19 @@ def _run_scf(
         retain_serial_sticks=mpi.size > 1,
     )
     symmetry_plan_started = timers.start()
-    density_symmetrizer = ReciprocalDensitySymmetrizer(
-        shape,
-        pw.symmetry_operations,
-        charge_indices,
-        reciprocal_grid.charge_g2,
-        charge_workspace,
-        mpi,
+    density_symmetrizer = (
+        PauliDensitySymmetrizer(
+            shape, pw.symmetry_operations, pw.lattice, mpi
+        )
+        if noncolin
+        else ReciprocalDensitySymmetrizer(
+            shape,
+            pw.symmetry_operations,
+            charge_indices,
+            reciprocal_grid.charge_g2,
+            charge_workspace,
+            mpi,
+        )
     )
     timers.stop("sym_rho:init", symmetry_plan_started)
     # Star construction needs a dense lookup table and other one-shot index
@@ -2388,6 +2668,9 @@ def _run_scf(
     starting_magnetizations = _starting_magnetizations(
         pw, pseudo_by_label
     )
+    starting_magnetization_vectors = _starting_magnetization_vectors(
+        pw, pseudo_by_label
+    )
     starting_charge = 0.0
     for atom in pw.atoms:
         pseudo = pseudo_by_label[atom.label]
@@ -2410,6 +2693,9 @@ def _run_scf(
     local_plane_wave_counts = [
         len(local_workspaces[index].local_plane_wave_indices)
         for index in range(len(local_workspaces))
+    ]
+    spinor_plane_wave_counts = [
+        count * (2 if noncolin else 1) for count in local_plane_wave_counts
     ]
     local_plane_waves = max(local_plane_wave_counts)
     # This is an array working-set estimate, not an RSS prediction. It covers
@@ -2858,7 +3144,7 @@ def _run_scf(
         saved_charge_coefficients = (
             saved_coefficients[0] + saved_coefficients[1]
             if lsda
-            else saved_coefficients
+            else (saved_coefficients[0] if noncolin else saved_coefficients)
         )
         saved_charge = pw.volume * mpi.sum_scalar(
             float(
@@ -2879,7 +3165,7 @@ def _run_scf(
                 f"saved density contains {saved_charge:.12g} electrons; "
                 f"expected {nelec:.12g}"
             )
-        if lsda:
+        if lsda or noncolin:
             rho = np.stack([
                 np.ascontiguousarray(np.real(
                     charge_workspace.coefficients_to_grid(
@@ -2929,8 +3215,11 @@ def _run_scf(
             len(local_charge_rows), dtype=complex
         )
         starting_magnetization_coefficients = (
-            np.zeros(len(local_charge_rows), dtype=complex)
-            if lsda
+            np.zeros(
+                (3 if noncolin else 1, len(local_charge_rows)),
+                dtype=complex,
+            )
+            if (lsda or noncolin)
             else None
         )
         for species in pw.species:
@@ -2954,10 +3243,18 @@ def _run_scf(
                 atomic_coefficients = scale * radial * structure
                 starting_coefficients += atomic_coefficients
                 if starting_magnetization_coefficients is not None:
-                    starting_magnetization_coefficients += (
-                        starting_magnetizations[species.label]
-                        * atomic_coefficients
-                    )
+                    if noncolin:
+                        starting_magnetization_coefficients += (
+                            starting_magnetization_vectors[species.label][
+                                :, None
+                            ]
+                            * atomic_coefficients[None, :]
+                        )
+                    else:
+                        starting_magnetization_coefficients[0] += (
+                            starting_magnetizations[species.label]
+                            * atomic_coefficients
+                        )
             else:
                 zero = local_charge_g2 < 1.0e-14
                 starting_coefficients[zero] += (
@@ -2967,13 +3264,24 @@ def _run_scf(
                     / pw.volume
                 )
                 if starting_magnetization_coefficients is not None:
-                    starting_magnetization_coefficients[zero] += (
+                    coefficient = (
                         len(positions_species)
                         * scale
                         * pseudo.z_valence
-                        * starting_magnetizations[species.label]
                         / pw.volume
                     )
+                    if noncolin:
+                        starting_magnetization_coefficients[:, zero] += (
+                            starting_magnetization_vectors[species.label][
+                                :, None
+                            ]
+                            * coefficient
+                        )
+                    else:
+                        starting_magnetization_coefficients[0, zero] += (
+                            starting_magnetizations[species.label]
+                            * coefficient
+                        )
         _starting_charge = pw.volume * mpi.sum_scalar(
             float(
                 np.real(
@@ -3004,18 +3312,21 @@ def _run_scf(
             )
         )
         if starting_magnetization_coefficients is not None:
-            starting_magnetization = np.ascontiguousarray(
-                np.real(
-                    charge_workspace.coefficients_to_grid(
-                        starting_magnetization_coefficients,
-                        use_scratch=True,
-                    )
-                )
+            starting_magnetization_grid = charge_workspace.coefficients_to_grid(
+                np.moveaxis(starting_magnetization_coefficients, 0, -1),
+                use_scratch=True,
             )
-            rho = np.stack(
-                (
-                    0.5 * (rho + starting_magnetization),
-                    0.5 * (rho - starting_magnetization),
+            starting_magnetization = np.moveaxis(
+                np.real(starting_magnetization_grid), -1, 0
+            )
+            rho = (
+                np.concatenate((rho[None, ...], starting_magnetization), axis=0)
+                if noncolin
+                else np.stack(
+                    (
+                        0.5 * (rho + starting_magnetization[0]),
+                        0.5 * (rho - starting_magnetization[0]),
+                    )
                 )
             )
             del starting_magnetization
@@ -3072,6 +3383,8 @@ def _run_scf(
         )
     if lsda:
         density_mixer = SpinDensityMixer(density_mixer, beta=mixing)
+    elif noncolin:
+        density_mixer = PauliDensityMixer(density_mixer, beta=mixing)
     iterations: list[SCFIteration] = []
     old_energy = None
     eigenvalues: list[np.ndarray] = []
@@ -3083,7 +3396,7 @@ def _run_scf(
         WavefunctionBuffer(
             resolve_wfcdir(pw),
             resolve_prefix(pw),
-            local_plane_wave_counts,
+            spinor_plane_wave_counts,
             nbnd,
             rank=mpi.rank,
             processes=mpi.size,
@@ -3197,7 +3510,11 @@ def _run_scf(
         )
         if build_input_hxc:
             hartree_started = timers.start()
-            rho_charge = rho[0] + rho[1] if lsda else rho
+            rho_charge = (
+                rho[0] + rho[1]
+                if lsda
+                else (rho[0] if noncolin else rho)
+            )
             rho_g_local = charge_workspace.grid_to_coefficients(rho_charge)
             vh_g_local = np.zeros_like(rho_g_local)
             _load_native_fft().hartree_coefficients(
@@ -3223,11 +3540,14 @@ def _run_scf(
             (mpi.size > 1 or threads_per_process > 1)
             and diagonalization != "dense"
         )
-        if lsda:
+        if lsda or noncolin:
             v_eff_local = None
             if build_input_hxc:
                 spin_xc_density = rho.copy()
-                spin_xc_density += 0.5 * rho_core[None, ...]
+                if noncolin:
+                    spin_xc_density[0] += rho_core
+                else:
+                    spin_xc_density += 0.5 * rho_core[None, ...]
                 xc_started = timers.start()
                 _epsilon_input, vxc = _xc_energy_potential(
                     spin_xc_density,
@@ -3238,11 +3558,19 @@ def _run_scf(
                 )
                 timers.stop("v_xc", xc_started)
                 assert vh is not None
-                input_hxc = vxc + vh[None, ...]
+                if noncolin:
+                    input_hxc = vxc
+                    input_hxc[0] += vh
+                else:
+                    input_hxc = vxc + vh[None, ...]
                 assert _epsilon_input is None
                 del spin_xc_density, vxc, _epsilon_input
             assert input_hxc is not None
-            v_eff_grid = input_hxc + v_ion_local[None, ...]
+            v_eff_grid = input_hxc.copy()
+            if noncolin:
+                v_eff_grid[0] += v_ion_local
+            else:
+                v_eff_grid += v_ion_local[None, ...]
             potential_average = np.asarray(
                 [
                     mpi.sum_scalar(float(np.sum(component)))
@@ -3282,7 +3610,7 @@ def _run_scf(
                 if native_potential_layout
                 else v_eff_grid
             )
-        if build_input_hxc and not lsda:
+        if build_input_hxc and not lsda and not noncolin:
             np.add(rho, rho_core, out=v_eff_grid)
             xc_started = timers.start()
             _epsilon_input, vxc = _xc_energy_potential(
@@ -3301,7 +3629,7 @@ def _run_scf(
         # QE constructs vrs once per SCF iteration and shares it across the
         # entire k loop.  Keep the same real-space array in serial as well as
         # MPI instead of inverse-transforming identical v_eff(G) for every k.
-        if not lsda:
+        if not lsda and not noncolin:
             np.add(v_ion_local, input_hxc, out=v_eff_grid)
             potential_average = mpi.sum_scalar(
                 float(np.sum(v_eff_local))
@@ -3379,6 +3707,8 @@ def _run_scf(
                     if native_potential_layout
                     else active_v_eff_grid
                 )
+            elif noncolin:
+                active_v_eff_local = v_eff_grid
             else:
                 active_v_eff_local = v_eff_local
             if diagonalization == "dense":
@@ -3417,22 +3747,32 @@ def _run_scf(
                     ),
                 )
                 timers.stop("init_us_2", init_us_started)
-                operator = PlaneWaveHamiltonian(
-                    basis,
-                    active_v_eff_g,
-                    projector_terms,
-                    local_workspace=local_workspace,
-                    timers=timers,
-                    real_potential=active_v_eff_local,
-                    native_potential_layout=(
-                        (mpi.size > 1 or threads_per_process > 1)
-                        and diagonalization != "dense"
-                    ),
-                    # QE's usnldiag uses v_of_0: the G=0 component of the
-                    # ionic local potential, not the average total effective
-                    # potential used by H|psi>.
-                    potential_average=v_ion_average,
-                )
+                if noncolin:
+                    operator = SpinorPlaneWaveHamiltonian(
+                        basis,
+                        active_v_eff_local,
+                        projector_terms,
+                        local_workspace=local_workspace,
+                        timers=timers,
+                        potential_average=v_ion_average,
+                    )
+                else:
+                    operator = PlaneWaveHamiltonian(
+                        basis,
+                        active_v_eff_g,
+                        projector_terms,
+                        local_workspace=local_workspace,
+                        timers=timers,
+                        real_potential=active_v_eff_local,
+                        native_potential_layout=(
+                            (mpi.size > 1 or threads_per_process > 1)
+                            and diagonalization != "dense"
+                        ),
+                        # QE's usnldiag uses v_of_0: the G=0 component of the
+                        # ionic local potential, not the average total effective
+                        # potential used by H|psi>.
+                        potential_average=v_ion_average,
+                    )
                 trial_vectors = (
                     wavefunction_buffer[kpoint_index]
                     if wavefunction_buffer is not None
@@ -3443,7 +3783,12 @@ def _run_scf(
                 trial_applied = None
                 if trial_vectors is None:
                     wfcinit_started = timers.start()
-                    starting = _atomic_starting_orbitals(
+                    starting_builder = (
+                        _spinor_starting_orbitals
+                        if noncolin
+                        else _atomic_starting_orbitals
+                    )
+                    starting = starting_builder(
                         pw,
                         pseudo_by_label,
                         basis,
@@ -3455,7 +3800,11 @@ def _run_scf(
                         # of the serial one, without allocating its global
                         # wavefunction matrix on every rank.
                         local_rows=(
-                            operator.local_rows
+                            (
+                                local_workspace.local_plane_wave_indices
+                                if noncolin
+                                else operator.local_rows
+                            )
                             if mpi.size > 1
                             and pw.full_kpoint_count > len(pw.kpoints)
                             else None
@@ -3468,12 +3817,13 @@ def _run_scf(
                         ),
                         starting_wfc=starting_wavefunctions,
                     )
-                    if mpi.size > 1 and starting.shape[0] == len(basis):
+                    expected_global_rows = len(basis) * (2 if noncolin else 1)
+                    if mpi.size > 1 and starting.shape[0] == expected_global_rows:
                         starting = starting[
                             operator.local_rows
                         ]
                     rotation_operator = operator
-                    if starting_local_workspaces is not None:
+                    if starting_local_workspaces is not None and not noncolin:
                         rotation_operator = PlaneWaveHamiltonian(
                             basis,
                             active_v_eff_g,
@@ -3555,7 +3905,7 @@ def _run_scf(
                             initial_eigenvalues=retry_eigenvalues,
                             initial_applied=retry_applied,
                             mpi=mpi,
-                            global_dimension=len(basis),
+                            global_dimension=len(basis) * (2 if noncolin else 1),
                             global_row_indices=operator.local_rows,
                             timers=timers,
                             operator_into=operator.apply_into,
@@ -3714,7 +4064,8 @@ def _run_scf(
                     nelec,
                     0.5 * degauss_ry,
                     gaussian_order,
-                    spin_degeneracy=1.0 if lsda else 2.0,
+                    spin_degeneracy=1.0 if (lsda or noncolin) else 2.0,
+                    kpoint_weight_sum=1.0 if noncolin else None,
                 )
             )
         elif occupations_mode in tetrahedron_modes:
@@ -3726,7 +4077,8 @@ def _run_scf(
                 pw.full_to_irreducible,
                 pw.reciprocal,
                 occupations_mode,
-                spin_degeneracy=1.0 if lsda else 2.0,
+                spin_degeneracy=1.0 if (lsda or noncolin) else 2.0,
+                paired_spin_blocks=lsda,
             )
             smearing_energy = 0.0
         else:
@@ -3734,6 +4086,12 @@ def _run_scf(
                 band_occupations = fixed_occupations(
                     nbnd, nelup, neldw, pw.spatial_kpoint_count
                 )
+            elif noncolin:
+                band_occupations = []
+                for values in eigenvalues:
+                    values_occupations = np.zeros(len(values))
+                    values_occupations[:occupied] = 1.0
+                    band_occupations.append(values_occupations)
             else:
                 band_occupations = []
                 for values in eigenvalues:
@@ -3808,6 +4166,8 @@ def _run_scf(
             local_workspaces,
             timers,
             kpoint_spins=(pw.kpoint_spins if lsda else None),
+            spinor=noncolin,
+            domag=domag,
         )
         if not retain_occupied_states:
             del eigenvectors
@@ -3845,6 +4205,13 @@ def _run_scf(
                     )
                 )
             )
+        elif noncolin:
+            deband = -grid_scale * mpi.sum_scalar(
+                float(
+                    np.einsum("sijk,sijk->", rho_out, v_eff_grid)
+                    - np.einsum("ijk,ijk->", rho_out[0], v_ion_local)
+                )
+            )
         else:
             deband = -grid_scale * mpi.sum_scalar(
                 float(
@@ -3868,6 +4235,11 @@ def _run_scf(
             # Native scalar metric consumes a contiguous vector; recycle the
             # temporary spin-up owner instead of materializing a column copy.
             up_residual_g[...] = residual_g_local[:, 0]
+        elif noncolin:
+            real_grid_workspace = np.subtract(rho_out, rho)
+            residual_g_local = charge_workspace.grid_to_coefficients(
+                np.moveaxis(real_grid_workspace, 0, -1)
+            )
         else:
             real_grid_workspace = v_eff_grid
             np.subtract(rho_out, rho, out=real_grid_workspace)
@@ -3877,9 +4249,12 @@ def _run_scf(
             residual_g_local = charge_workspace.grid_to_coefficients(
                 charge_residual
             )
-        charge_residual_g = (
-            up_residual_g if lsda else residual_g_local
-        )
+        if lsda:
+            charge_residual_g = up_residual_g
+        elif noncolin:
+            charge_residual_g = np.ascontiguousarray(residual_g_local[:, 0])
+        else:
+            charge_residual_g = residual_g_local
         accuracy = 0.5 * pw.volume * mpi.sum_scalar(
             _load_native_fft().hartree_residual_metric(
                 charge_residual_g,
@@ -3895,6 +4270,19 @@ def _run_scf(
                 ))) / np.pi
             )
             del up_residual_g
+        elif noncolin:
+            accuracy += 0.5 * pw.volume * mpi.sum_scalar(
+                float(
+                    np.real(
+                        np.vdot(
+                            residual_g_local[:, 1:],
+                            residual_g_local[:, 1:],
+                        )
+                    )
+                )
+                / np.pi
+            )
+            del charge_residual_g
         previous_accuracy = accuracy
         # QE estimates the first-solve eigensolver error as ethr*nelec. If
         # the newly measured dr2 is smaller, it repeats the same first SCF
@@ -3931,7 +4319,7 @@ def _run_scf(
             rho_energy = rho_out
         elif isinstance(
             density_mixer,
-            (DistributedBroydenMixer, SpinDensityMixer),
+            (DistributedBroydenMixer, SpinDensityMixer, PauliDensityMixer),
         ):
             rho_energy = density_mixer.mix(
                 rho,
@@ -3949,7 +4337,9 @@ def _run_scf(
         del rho
         energy_potential_started = timers.start()
         rho_energy_charge = (
-            rho_energy[0] + rho_energy[1] if lsda else rho_energy
+            rho_energy[0] + rho_energy[1]
+            if lsda
+            else (rho_energy[0] if noncolin else rho_energy)
         )
         rho_energy_g_local = charge_workspace.grid_to_coefficients(
             rho_energy_charge
@@ -3973,9 +4363,12 @@ def _run_scf(
         )
         del rho_energy_g_local
         xc_started = timers.start()
-        if lsda:
+        if lsda or noncolin:
             spin_xc_density = rho_energy.copy()
-            spin_xc_density += 0.5 * rho_core[None, ...]
+            if noncolin:
+                spin_xc_density[0] += rho_core
+            else:
+                spin_xc_density += 0.5 * rho_core[None, ...]
             epsilon_energy, vxc_energy = _xc_energy_potential(
                 spin_xc_density,
                 xc_functional,
@@ -3986,7 +4379,11 @@ def _run_scf(
             exc = grid_scale * mpi.sum_scalar(
                 float(
                     np.sum(
-                        (spin_xc_density[0] + spin_xc_density[1])
+                        (
+                            spin_xc_density[0]
+                            if noncolin
+                            else spin_xc_density[0] + spin_xc_density[1]
+                        )
                         * epsilon_energy
                     )
                 )
@@ -4017,8 +4414,12 @@ def _run_scf(
         )
         del vh_energy_g_local
         timers.stop("v_of_rho", energy_potential_started)
-        if lsda:
-            energy_hxc = vxc_energy + vh_energy[None, ...]
+        if lsda or noncolin:
+            if noncolin:
+                energy_hxc = vxc_energy
+                energy_hxc[0] += vh_energy
+            else:
+                energy_hxc = vxc_energy + vh_energy[None, ...]
             descf = -grid_scale * mpi.sum_scalar(
                 float(
                     np.einsum(

@@ -21,9 +21,14 @@ from qepy_pw.xc import (
     pw92_lda_unpolarized,
     pz81_unpolarized,
 )
-from qepy_pw.scf import run_scf
+from qepy_pw.scf import SCFResult, run_scf
 from qepy_pw.pw.output import format_footer
-from qepy_pw.pw.save import resolve_save_directory, write_qe_save
+from qepy_pw.pw.save import (
+    read_saved_density,
+    read_saved_wavefunction,
+    resolve_save_directory,
+    write_qe_save,
+)
 
 
 def _lsda_input(system: str, kpoints: str = "K_POINTS gamma") -> str:
@@ -432,6 +437,65 @@ K_POINTS gamma
     nscf = run_scf(pw)
     assert nscf.converged
     np.testing.assert_allclose(nscf.density, result.density, atol=2e-12)
+
+
+def test_noncollinear_save_round_trip_uses_qe_pauli_and_spinor_layouts(
+    tmp_path: Path,
+) -> None:
+    pw = read_pw_input(io.StringIO("""\
+&CONTROL
+  calculation='scf', pseudo_dir='./tests/qe_reference/upstream/pseudo',
+  disk_io='medium', prefix='noncolin-save'
+/
+&SYSTEM
+  ibrav=1, celldm(1)=10.0, nat=1, ntyp=1,
+  ecutwfc=12.0, nbnd=1, noncolin=.true., lspinorb=.true.,
+  starting_magnetization(1)=0.4, angle1(1)=70.0, angle2(1)=-25.0
+/
+&ELECTRONS /
+ATOMIC_SPECIES
+H 1.0008 H.pz-vbc.UPF
+ATOMIC_POSITIONS angstrom
+H 0.0 0.0 0.0
+K_POINTS gamma
+"""))
+    pw.control["outdir"] = str(tmp_path)
+    shape = (4, 4, 4)
+    charge = np.full(shape, 1.0 / pw.volume)
+    density = np.stack((charge, 0.2 * charge, -0.1 * charge, 0.3 * charge))
+    spinor = np.asarray([[1.0], [1.0j]]) / np.sqrt(2.0)
+    result = SCFResult(
+        converged=True,
+        total_energy_ha=-0.5,
+        eigenvalues_ha=[np.asarray([-0.5])],
+        density=density,
+        plane_waves_per_k=[1],
+        occupations=[np.asarray([1.0])],
+        wavefunctions=[spinor],
+        wavefunction_miller_indices=[np.zeros((1, 3), dtype=np.int32)],
+    )
+
+    write_qe_save(pw, result)
+    save = resolve_save_directory(pw)
+    import h5py
+
+    with h5py.File(save / "charge-density.hdf5", "r") as h5:
+        assert h5.attrs["nspin"] == 4
+        assert set(("rhotot_g", "m_x", "m_y", "m_z")) <= set(h5)
+    with h5py.File(save / "wfc1.hdf5", "r") as h5:
+        assert h5.attrs["npol"] == 2
+        assert h5["evc"].shape == (1, 2)
+
+    restored_density = read_saved_density(pw, shape, expected_electrons=1.0)
+    restored_spinor = read_saved_wavefunction(
+        pw, 0, np.zeros((1, 3), dtype=np.int32), 1
+    )
+    np.testing.assert_allclose(restored_density, density, atol=1e-14)
+    np.testing.assert_allclose(restored_spinor, spinor, atol=1e-14)
+
+    footer = format_footer(pw, result)
+    assert "    1.0000" in footer
+    assert "total magnetization" in footer
 
 
 def test_starting_magnetization_splits_initial_spin_hamiltonians(

@@ -5,9 +5,11 @@ import pytest
 
 from qepy_pw.symmetry import (
     DensitySymmetrizer,
+    PauliDensitySymmetrizer,
     SymmetryOperation,
     fft_factors,
     find_space_group,
+    magnetic_symmetry_operations,
     mesh_compatible_operations,
     reduce_kpoints,
     symmetrize_forces,
@@ -77,3 +79,57 @@ def test_cubic_space_group_projects_force_and_stress_irreducibly() -> None:
     np.testing.assert_allclose(
         projected, np.trace(tensor) / 3.0 * np.eye(3), atol=2.0e-15
     )
+
+
+def test_magnetic_group_marks_spin_reversing_operations_antiunitary() -> None:
+    lattice = 5.0 * np.eye(3)
+    spatial = find_space_group(lattice, np.zeros((1, 3)), ["X"])
+    magnetic = magnetic_symmetry_operations(
+        lattice, spatial, np.asarray([[0.0, 0.0, 1.0]])
+    )
+    unitary_only = magnetic_symmetry_operations(
+        lattice,
+        spatial,
+        np.asarray([[0.0, 0.0, 1.0]]),
+        allow_time_reversal=False,
+    )
+    assert len(magnetic) > len(unitary_only)
+    assert any(operation.time_reversal for operation in magnetic)
+    for operation in magnetic:
+        rotation = np.linalg.inv(lattice) @ operation.matrix @ lattice
+        transformed = np.asarray([0.0, 0.0, 1.0]) @ (
+            np.linalg.det(rotation) * rotation
+        )
+        if operation.time_reversal:
+            transformed = -transformed
+        np.testing.assert_allclose(transformed, [0.0, 0.0, 1.0], atol=2e-15)
+
+
+def test_pauli_density_symmetry_rotates_axial_magnetization() -> None:
+    lattice = np.eye(3)
+    rotation = SymmetryOperation(
+        np.asarray([[0, 1, 0], [-1, 0, 0], [0, 0, 1]]), np.zeros(3)
+    )
+    density = np.zeros((4, 2, 2, 2))
+    density[0].fill(1.0)
+    density[3].fill(0.25)
+    symmetrizer = PauliDensitySymmetrizer(
+        (2, 2, 2), (_identity(), rotation), lattice
+    )
+    projected = symmetrizer.apply_pauli(density)
+    np.testing.assert_allclose(projected, density)
+
+
+def test_antiunitary_operation_maps_k_to_minus_rotated_k() -> None:
+    anti_identity = SymmetryOperation(
+        np.eye(3, dtype=int), np.zeros(3), time_reversal=True
+    )
+    coordinates = np.asarray([[0.25, 0.0, 0.0], [0.75, 0.0, 0.0]])
+    points, weights = reduce_kpoints(
+        coordinates,
+        np.ones(2),
+        (anti_identity,),
+        time_reversal=False,
+    )
+    assert len(points) == 1
+    np.testing.assert_allclose(weights, [1.0])

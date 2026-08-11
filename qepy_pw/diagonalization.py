@@ -369,6 +369,127 @@ class PlaneWaveHamiltonian:
         return result[:, 0] if was_vector else result
 
 
+class SpinorPlaneWaveHamiltonian:
+    """Apply a norm-conserving two-component Pauli Hamiltonian.
+
+    Coefficients follow QE's combined-index layout: all up-spin plane waves
+    first, followed by all down-spin plane waves. The four real local fields
+    are ordered ``(scalar, x, y, z)``.
+    """
+
+    def __init__(
+        self,
+        basis: PlaneWaveBasis,
+        real_potential: np.ndarray,
+        projector_terms: tuple[ProjectorTerm, ...] = (),
+        *,
+        local_workspace: LocalPotentialWorkspace | None = None,
+        timers: TimingRegistry | None = None,
+        potential_average: float = 0.0,
+    ) -> None:
+        self.basis = basis
+        self.local_workspace = (
+            local_workspace
+            if local_workspace is not None
+            else LocalPotentialWorkspace(basis, tuple(real_potential.shape[1:]))
+        )
+        self.mpi = self.local_workspace.mpi
+        self.timers = timers
+        fields = np.asarray(real_potential, dtype=np.float64)
+        local_shape = (
+            self.local_workspace.shape[0],
+            self.local_workspace.shape[1],
+            self.local_workspace.local_slab.stop
+            - self.local_workspace.local_slab.start,
+        )
+        if fields.shape == (4, *self.local_workspace.shape):
+            fields = fields[:, :, :, self.local_workspace.local_slab]
+        if fields.shape != (4, *local_shape):
+            raise ValueError("spinor local potential has the wrong shape")
+        self.real_potential = np.ascontiguousarray(fields)
+        scalar_rows = self.local_workspace.local_plane_wave_indices
+        global_rows = len(basis)
+        self.local_rows = np.concatenate(
+            (scalar_rows, global_rows + scalar_rows)
+        )
+        kinetic = basis.kinetic
+        local_kinetic = kinetic[scalar_rows] if self.mpi.size > 1 else kinetic
+        self.local_kinetic = np.concatenate((local_kinetic, local_kinetic))
+        self.potential_average = float(potential_average)
+        self.projector_terms = projector_terms
+
+    @property
+    def diagonal(self) -> np.ndarray:
+        result = self.local_kinetic + self.potential_average
+        for term in self.projector_terms:
+            if isinstance(term, (FactorizedProjectorTerm, PackedProjectorTerm)):
+                raise ValueError(
+                    "spinor Hamiltonian requires materialized projectors"
+                )
+            beta, coupling = term
+            result = result + np.real(
+                np.einsum(
+                    "gi,ij,gj->g", beta, coupling, beta.conj(), optimize=True
+                )
+            )
+        return result
+
+    def apply(self, coefficients: np.ndarray) -> np.ndarray:
+        return self._apply(coefficients)
+
+    def apply_into(
+        self, coefficients: np.ndarray, out: np.ndarray
+    ) -> np.ndarray:
+        return self._apply(coefficients, out=out)
+
+    def _apply(
+        self, coefficients: np.ndarray, out: np.ndarray | None = None
+    ) -> np.ndarray:
+        vectors = np.asarray(coefficients, dtype=np.complex128)
+        was_vector = vectors.ndim == 1
+        if was_vector:
+            vectors = vectors[:, None]
+        if vectors.shape[0] % 2:
+            raise ValueError("spinor coefficient dimension must be even")
+        plane_waves = vectors.shape[0] // 2
+        up, down = vectors[:plane_waves], vectors[plane_waves:]
+        wave_grid = self.local_workspace.coefficients_to_grid(
+            np.concatenate((up, down), axis=1)
+        )
+        bands = vectors.shape[1]
+        up_grid, down_grid = wave_grid[..., :bands], wave_grid[..., bands:]
+        scalar, x_field, y_field, z_field = self.real_potential
+        local_grid = np.empty_like(wave_grid)
+        local_grid[..., :bands] = (
+            (scalar + z_field)[..., None] * up_grid
+            + (x_field - 1j * y_field)[..., None] * down_grid
+        )
+        local_grid[..., bands:] = (
+            (x_field + 1j * y_field)[..., None] * up_grid
+            + (scalar - z_field)[..., None] * down_grid
+        )
+        local_coefficients = self.local_workspace.grid_to_coefficients(
+            local_grid
+        )
+        result = (
+            np.empty_like(vectors, order="F")
+            if out is None
+            else np.asarray(out).reshape(vectors.shape)
+        )
+        result[:plane_waves] = local_coefficients[:, :bands]
+        result[plane_waves:] = local_coefficients[:, bands:]
+        result += self.local_kinetic[:, None] * vectors
+        for term in self.projector_terms:
+            if isinstance(term, (FactorizedProjectorTerm, PackedProjectorTerm)):
+                raise ValueError(
+                    "spinor Hamiltonian requires materialized projectors"
+                )
+            beta, coupling = term
+            overlap = self.mpi.sum_array(beta.conj().T @ vectors)
+            result += beta @ (coupling @ overlap)
+        return result[:, 0] if was_vector else result
+
+
 def _orthonormalize(
     vectors: np.ndarray,
     against: np.ndarray | None = None,

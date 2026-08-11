@@ -1,4 +1,4 @@
-"""QE-shaped text reporting for scalar and collinear-spin SCF calculations.
+"""QE-shaped text reporting for scalar, collinear, and spinor calculations.
 
 Keeping presentation here prevents numerical code from accumulating print
 branches and gives the CLI and regression-reference generator one formatter.
@@ -155,7 +155,7 @@ def format_header(pw: PWInput) -> str:
         f"{cdate} at {ctime}",
         file=out,
     )
-    print("\n     Python reference port of the scalar SCF path in Quantum ESPRESSO pw.x", file=out)
+    print("\n     Python plane-wave implementation compatible with Quantum ESPRESSO pw.x", file=out)
     print(f"     Reading input from {pw.source}\n", file=out)
     from ..errors import QEWarning, format_qe_warning
 
@@ -358,12 +358,13 @@ def format_header(pw: PWInput) -> str:
     else:
         print(f"     number of k points= {len(pw.kpoints):5d}\n", file=out)
     print("                       cart. coord. in units 2pi/alat", file=out)
+    spin_degeneracy = 2.0 if int(pw.system.get("nspin", 1)) == 1 else 1.0
     for index, point in enumerate(pw.kpoints, start=1):
         cart = (point.crystal @ pw.reciprocal) / reciprocal_unit
         print(
             f"        k({index:5d}) = ("
             f" {cart[0]:11.7f} {cart[1]:11.7f} {cart[2]:11.7f}), "
-            f"wk = {2.0 * point.weight:11.7f}",
+            f"wk = {spin_degeneracy * point.weight:11.7f}",
             file=out,
         )
     print("\n                       cryst. coord.", file=out)
@@ -371,7 +372,8 @@ def format_header(pw: PWInput) -> str:
         print(
             f"        k({index:5d}) = ("
             f" {point.crystal[0]:11.7f} {point.crystal[1]:11.7f} "
-            f"{point.crystal[2]:11.7f}), wk = {2.0 * point.weight:11.7f}",
+            f"{point.crystal[2]:11.7f}), wk = "
+            f"{spin_degeneracy * point.weight:11.7f}",
             file=out,
         )
     print("", file=out)
@@ -673,6 +675,7 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
         pw.system.get("occupations", "fixed")
     ).strip().lower()
     lsda = int(pw.system.get("nspin", 1)) == 2
+    noncolin = int(pw.system.get("nspin", 1)) == 4
     spatial_kpoints = int(getattr(pw, "spatial_kpoint_count", len(pw.kpoints)))
     for index, (point, values) in enumerate(
         zip(pw.kpoints, result.eigenvalues_ha)
@@ -705,7 +708,7 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
         print("\n     occupation numbers", file=out)
         if index < len(result.occupations):
             displayed_occupations = result.occupations[index]
-            if not lsda:
+            if not lsda and not noncolin:
                 displayed_occupations = 0.5 * displayed_occupations
         else:
             displayed_occupations = np.zeros(len(values))
@@ -780,6 +783,26 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
         print(
             "\n     total magnetization       ="
             f"{total_magnetization:10.2f} Bohr mag/cell",
+            file=out,
+        )
+        print(
+            "     absolute magnetization    ="
+            f"{absolute_magnetization:10.2f} Bohr mag/cell",
+            file=out,
+        )
+    elif noncolin and density.ndim == 4 and density.shape[0] == 4:
+        grid_scale = pw.volume / np.prod(density.shape[-3:])
+        total_magnetization = grid_scale * np.sum(
+            density[1:], axis=(1, 2, 3)
+        )
+        absolute_magnetization = grid_scale * float(
+            np.sum(np.sqrt(np.sum(density[1:] ** 2, axis=0)))
+        )
+        print(
+            "\n     total magnetization       ="
+            f"{total_magnetization[0]:10.2f}"
+            f"{total_magnetization[1]:10.2f}"
+            f"{total_magnetization[2]:10.2f} Bohr mag/cell",
             file=out,
         )
         print(

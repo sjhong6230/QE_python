@@ -655,10 +655,106 @@ class LocalPotential:
                     ]
         return beta, coupling
 
-    def spinor_atomic_projectors(
-        self, gk: np.ndarray, position: np.ndarray, volume: float
+    def averaged_spinor_projector_basis(
+        self, gk: np.ndarray, volume: float
     ) -> tuple[np.ndarray, np.ndarray]:
-        beta, coupling = self.spinor_projector_basis(gk, volume)
+        """Return QE ``average_pp`` projectors duplicated in spin space.
+
+        A fully relativistic NC potential used with ``lspinorb=.false.`` is
+        first averaged over its j=l+/-1/2 partners.  The resulting operator
+        is diagonal in spin; this is physically distinct from merely using
+        the j-resolved operator with a disabled input flag.
+        """
+        if not self.fully_relativistic:
+            raise QEInputError("averaging requires a fully relativistic UPF")
+        vectors = np.asarray(gk, dtype=float)
+        if not self.projectors:
+            return np.empty((2 * len(vectors), 0), dtype=complex), np.empty((0, 0))
+        q = np.linalg.norm(vectors, axis=1)
+        radial = self.radial_projector_fourier(q, volume)
+        averaged: list[tuple[int, np.ndarray, float]] = []
+        index = 0
+        while index < len(self.projectors):
+            projector = self.projectors[index]
+            l_value = projector.angular_momentum
+            if l_value == 0:
+                averaged.append((l_value, radial[:, index], 0.5 * self.dij_ry[index, index]))
+                index += 1
+                continue
+            if index + 1 >= len(self.projectors):
+                raise QEInputError(
+                    f"fully relativistic l={l_value} projector has no j partner"
+                )
+            partner = self.projectors[index + 1]
+            if partner.angular_momentum != l_value:
+                raise QEInputError(
+                    f"fully relativistic l={l_value} projectors are not paired"
+                )
+            pair = (projector, partner)
+            j_values = [float(item.total_angular_momentum) for item in pair]
+            try:
+                plus_slot = next(
+                    slot for slot, j_value in enumerate(j_values)
+                    if abs(j_value - l_value - 0.5) < 1.0e-7
+                )
+                minus_slot = next(
+                    slot for slot, j_value in enumerate(j_values)
+                    if abs(j_value - l_value + 0.5) < 1.0e-7
+                )
+            except StopIteration as exc:
+                raise QEInputError(
+                    f"fully relativistic l={l_value} projectors have invalid j values"
+                ) from exc
+            plus_index = index + plus_slot
+            minus_index = index + minus_slot
+            d_plus = float(self.dij_ry[plus_index, plus_index])
+            d_minus = float(self.dij_ry[minus_index, minus_index])
+            d_average = (
+                (l_value + 1.0) * d_plus + l_value * d_minus
+            ) / (2.0 * l_value + 1.0)
+            ratios = (d_plus / d_average, d_minus / d_average)
+            if d_average == 0.0 or min(ratios) < 0.0:
+                raise QEInputError(
+                    f"cannot average l={l_value} relativistic projector couplings"
+                )
+            radial_average = (
+                (l_value + 1.0) * np.sqrt(ratios[0]) * radial[:, plus_index]
+                + l_value * np.sqrt(ratios[1]) * radial[:, minus_index]
+            ) / (2.0 * l_value + 1.0)
+            averaged.append((l_value, radial_average, 0.5 * d_average))
+            index += 2
+
+        columns: list[np.ndarray] = []
+        couplings: list[float] = []
+        harmonics_by_l: dict[int, np.ndarray] = {}
+        for l_value, radial_values, coupling in averaged:
+            harmonics = harmonics_by_l.get(l_value)
+            if harmonics is None:
+                harmonics = _qe_real_spherical_harmonics(l_value, vectors, q)
+                harmonics_by_l[l_value] = harmonics
+            phase = (-1j) ** l_value
+            for channel in range(2 * l_value + 1):
+                columns.append(phase * radial_values * harmonics[:, channel])
+                couplings.append(coupling)
+        scalar = np.asfortranarray(np.column_stack(columns))
+        zeros = np.zeros_like(scalar)
+        beta = np.asfortranarray(np.block([[scalar, zeros], [zeros, scalar]]))
+        coupling = np.diag(np.asarray(couplings + couplings, dtype=float))
+        return beta, coupling
+
+    def spinor_atomic_projectors(
+        self,
+        gk: np.ndarray,
+        position: np.ndarray,
+        volume: float,
+        *,
+        spin_orbit: bool = True,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        beta, coupling = (
+            self.spinor_projector_basis(gk, volume)
+            if spin_orbit
+            else self.averaged_spinor_projector_basis(gk, volume)
+        )
         phase = np.exp(-1j * (np.asarray(gk) @ np.asarray(position)))
         spinor_phase = np.concatenate((phase, phase))
         return np.asfortranarray(beta * spinor_phase[:, None]), coupling

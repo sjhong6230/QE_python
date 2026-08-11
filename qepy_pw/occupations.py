@@ -77,6 +77,15 @@ def default_number_of_bands(
     round-to-nearest behavior, including half-integer ties away from zero.
     """
     nelup, neldw = spin_electron_counts(nelec, tot_magnetization)
+    if nspin == 4:
+        filled = int(np.floor(nelec + 0.5))
+        metallic_modes = {
+            "smearing", "tetrahedra", "tetrahedra_lin", "tetrahedra-lin",
+            "tetrahedra_opt", "tetrahedra-opt",
+        }
+        if str(occupations).strip().lower() not in metallic_modes:
+            return filled
+        return max(filled + 4, int(np.floor(1.2 * nelec + 0.5)))
     filled = max(
         int(np.floor(0.5 * nelec + 0.5)),
         int(np.floor(nelup + 0.5)) if nspin == 2 else 0,
@@ -495,6 +504,7 @@ def tetrahedron_occupations(
     reciprocal: np.ndarray,
     method: str,
     spin_degeneracy: float = 2.0,
+    paired_spin_blocks: bool | None = None,
 ) -> tuple[float, list[np.ndarray]]:
     """QE linear, Blöchl-corrected, or optimized tetrahedron occupations."""
     normalized = str(method).strip().lower().replace("-", "_")
@@ -510,7 +520,11 @@ def tetrahedron_occupations(
         optimized,
     )
     matrix = np.stack([np.asarray(values, dtype=float) for values in eigenvalues])
-    spin_polarized = abs(spin_degeneracy - 1.0) < 1.0e-12
+    spin_polarized = (
+        abs(spin_degeneracy - 1.0) < 1.0e-12
+        if paired_spin_blocks is None
+        else bool(paired_spin_blocks)
+    )
     spatial_points = len(matrix)
     bands_per_spin = matrix.shape[1]
     if spin_polarized:
@@ -757,6 +771,7 @@ def smeared_occupations(
     degauss_ha: float,
     order: int,
     spin_degeneracy: float = 2.0,
+    kpoint_weight_sum: float | None = None,
 ) -> tuple[float, list[np.ndarray], float]:
     """Find the Fermi level, occupations, and QE ``demet`` in Hartree.
 
@@ -774,9 +789,14 @@ def smeared_occupations(
         raise QEInputError("k-point weights do not match eigenvalue arrays")
     if spin_degeneracy <= 0.0:
         raise QEInputError("spin degeneracy must be positive")
+    target_weight_sum = (
+        2.0 / spin_degeneracy
+        if kpoint_weight_sum is None
+        else float(kpoint_weight_sum)
+    )
     normalized_weights = (
         normalized_weights
-        * (2.0 / spin_degeneracy)
+        * target_weight_sum
         / np.sum(normalized_weights)
     )
     flat_eigenvalues = np.concatenate(

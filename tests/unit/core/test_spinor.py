@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from qepy_pw.basis import LocalPotentialWorkspace, PlaneWaveBasis
+from qepy_pw.diagonalization import SpinorPlaneWaveHamiltonian
 from qepy_pw.spinor import (
     aligned_spinors,
     apply_local_potential,
@@ -53,3 +55,35 @@ def test_noncollinear_lda_is_spin_rotation_covariant() -> None:
         np.linalg.norm(potential_second[1:], axis=0),
         atol=2e-15,
     )
+
+
+def test_spinor_plane_wave_hamiltonian_uses_doubled_qe_layout() -> None:
+    indices = np.asarray([[0, 0, 0], [1, 0, 0]], dtype=np.int32)
+    vectors = indices.astype(float)
+    kinetic = np.asarray([0.0, 0.5])
+    basis = PlaneWaveBasis(indices, vectors, kinetic)
+    workspace = LocalPotentialWorkspace(basis, (3, 1, 1))
+    fields = np.empty((4, 3, 1, 1))
+    fields[0].fill(1.2)
+    fields[1].fill(-0.3)
+    fields[2].fill(0.4)
+    fields[3].fill(0.7)
+    operator = SpinorPlaneWaveHamiltonian(
+        basis, fields, local_workspace=workspace
+    )
+    coefficients = np.asarray(
+        [[0.2 + 0.1j], [-0.4 + 0.3j], [0.7 - 0.2j], [0.1 + 0.8j]]
+    )
+    spin_matrix = np.asarray(
+        [[1.9, -0.3 - 0.4j], [-0.3 + 0.4j, 0.5]], dtype=complex
+    )
+    expected = np.empty_like(coefficients)
+    for plane_wave in range(2):
+        expected[[plane_wave, plane_wave + 2], 0] = (
+            spin_matrix
+            @ coefficients[[plane_wave, plane_wave + 2], 0]
+            + kinetic[plane_wave]
+            * coefficients[[plane_wave, plane_wave + 2], 0]
+        )
+    np.testing.assert_allclose(operator.apply(coefficients), expected, atol=2e-15)
+    assert operator.diagonal.shape == (4,)

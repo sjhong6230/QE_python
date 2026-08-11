@@ -13,6 +13,15 @@ class _ConstantDensityWorkspace:
         destination += float(np.sum(weights))
 
 
+class _SpinorGridWorkspace:
+    def __init__(self, grid: np.ndarray) -> None:
+        self.grid = grid
+
+    def coefficients_to_grid(self, coefficients) -> np.ndarray:
+        assert coefficients.shape[1] == self.grid.shape[-1]
+        return self.grid.copy()
+
+
 class _MeanProjector:
     def apply(self, density: np.ndarray) -> np.ndarray:
         return np.full_like(density, np.mean(density))
@@ -67,5 +76,36 @@ def test_spatial_density_symmetry_does_not_mix_spin_channels() -> None:
     assert np.all(result[1] == np.mean(density[1]))
     assert np.sum(result[0] - result[1]) == pytest.approx(
         np.sum(density[0] - density[1])
+    )
+
+
+def test_spinor_density_builds_charge_and_three_magnetization_components() -> None:
+    theta, phi = np.deg2rad([63.0, -28.0])
+    spinor = np.asarray(
+        [np.cos(theta / 2.0), np.exp(1j * phi) * np.sin(theta / 2.0)]
+    )
+    grid = np.empty((1, 1, 1, 2), dtype=complex)
+    grid[0, 0, 0] = spinor
+    density = _density_from_states(
+        [np.ones((2, 1), dtype=complex)],
+        [object()],
+        np.asarray([1.0]),
+        [np.asarray([1.0])],
+        (1, 1, 1),
+        1.0,
+        nelec=1.0,
+        workspaces=[_SpinorGridWorkspace(grid)],
+        spinor=True,
+        domag=True,
+    )
+    np.testing.assert_allclose(
+        density[:, 0, 0, 0],
+        [
+            1.0,
+            np.sin(theta) * np.cos(phi),
+            np.sin(theta) * np.sin(phi),
+            np.cos(theta),
+        ],
+        atol=2e-15,
     )
 

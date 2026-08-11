@@ -31,6 +31,7 @@ from ..xc import canonical_xc_name
 from ..symmetry import (
     SymmetryOperation,
     find_space_group,
+    magnetic_symmetry_operations,
     mesh_compatible_operations,
     reduce_kpoints,
 )
@@ -1515,6 +1516,28 @@ def read_pw_input(source: str | Path | TextIO) -> PWInput:
                 operations = (
                     SymmetryOperation(np.eye(3, dtype=int), np.zeros(3)),
                 )
+        if noncolin and bool(system.get("_domag", False)):
+            moments = np.asarray(
+                [
+                    float(system[f"starting_magnetization({index})"])
+                    * np.asarray(
+                        (
+                            np.sin(np.deg2rad(float(system[f"angle1({index})"])))
+                            * np.cos(np.deg2rad(float(system[f"angle2({index})"]))),
+                            np.sin(np.deg2rad(float(system[f"angle1({index})"])))
+                            * np.sin(np.deg2rad(float(system[f"angle2({index})"]))),
+                            np.cos(np.deg2rad(float(system[f"angle1({index})"]))),
+                        )
+                    )
+                    for index in range(1, declared_ntyp + 1)
+                ]
+            )
+            operations = magnetic_symmetry_operations(
+                lattice,
+                operations,
+                moments,
+                allow_time_reversal=not bool(system.get("no_t_rev", False)),
+            )
     if kcard[0] == "automatic" and not system.get("nosym", False) and not nosym_evc:
         operations = mesh_compatible_operations(
             np.array([point.crystal for point in kpoints]), operations
@@ -1525,7 +1548,11 @@ def read_pw_input(source: str | Path | TextIO) -> PWInput:
             operations,
             # ``noinv`` disables QE's ordinary inversion/time-reversal
             # reduction in this scalar, nonmagnetic implementation.
-            time_reversal=not no_time_reversal,
+            time_reversal=(
+                not no_time_reversal
+                if not (noncolin and bool(system.get("_domag", False)))
+                else False
+            ),
             return_mapping=True,
         )
         kpoints = [
