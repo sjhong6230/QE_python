@@ -4,10 +4,21 @@ from __future__ import annotations
 
 import numpy as np
 
+from .spinor import eigenchannel_densities, potential_components
+
 
 LDA_FUNCTIONALS = frozenset({"pz", "pw"})
 GGA_FUNCTIONALS = frozenset({"pbe", "pbesol", "revpbe", "rpbe"})
 SUPPORTED_XC_FUNCTIONALS = LDA_FUNCTIONALS | GGA_FUNCTIONALS
+
+
+def noncollinear_lda(
+    density: np.ndarray, functional: str = "pz"
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return rotationally invariant noncollinear LSDA energy and 4-potential."""
+    channels, direction = eigenchannel_densities(density)
+    epsilon, channel_potential = lsda_lda(channels, functional)
+    return epsilon, potential_components(channel_potential, direction)
 
 
 def canonical_xc_name(name: object) -> str | None:

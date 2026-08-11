@@ -66,6 +66,12 @@ def test_upf_reader_preserves_fully_relativistic_quantum_numbers(
     assert pseudo.projectors[0].total_angular_momentum == pytest.approx(1.5)
     assert pseudo.atomic_wavefunctions[0].total_angular_momentum == pytest.approx(1.5)
     assert pseudo.atomic_wavefunctions[0].principal_quantum_number == 2
+    beta, coupling = pseudo.spinor_projector_basis(
+        np.asarray([[0.2, -0.1, 0.4], [0.0, 0.3, -0.2]]), 80.0
+    )
+    assert beta.shape == (4, 4)
+    assert coupling.shape == (4, 4)
+    np.testing.assert_allclose(coupling, coupling.T)
 
 
 def test_qe_simpson_integrates_quadratic_on_uniform_grid() -> None:

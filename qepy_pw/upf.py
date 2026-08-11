@@ -336,6 +336,16 @@ class LocalPotential:
             dq,
         )
 
+    @property
+    def number_of_spinor_projector_channels(self) -> int:
+        """Rank of the j-resolved projector basis for one atom."""
+        if not self.fully_relativistic:
+            return 2 * self.number_of_projector_channels
+        return sum(
+            int(round(2.0 * float(projector.total_angular_momentum) + 1.0))
+            for projector in self.projectors
+        )
+
     def radial_projector_fourier_with_derivative(
         self, q: np.ndarray, volume: float
     ) -> tuple[np.ndarray, np.ndarray]:
@@ -565,6 +575,93 @@ class LocalPotential:
             coupling.setflags(write=False)
             self._expanded_projector_coupling = coupling
         return beta_matrix, coupling
+
+    def spinor_projector_basis(
+        self, gk: np.ndarray, volume: float
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Build j,mj projectors in QE's combined ``(PW, spin)`` layout."""
+        if not self.fully_relativistic:
+            raise QEInputError("spinor projectors require a fully relativistic UPF")
+        vectors = np.asarray(gk, dtype=float)
+        q = np.linalg.norm(vectors, axis=1)
+        radial = self.radial_projector_fourier(q, volume)
+        safe = q > 1.0e-14
+        theta = np.zeros(len(q))
+        theta[safe] = np.arccos(np.clip(vectors[safe, 2] / q[safe], -1.0, 1.0))
+        phi = np.arctan2(vectors[:, 1], vectors[:, 0])
+        harmonics: dict[tuple[int, int], np.ndarray] = {}
+        columns: list[np.ndarray] = []
+        identities: list[tuple[int, int]] = []
+        for projector_index, projector in enumerate(self.projectors):
+            l_value = projector.angular_momentum
+            j_value = float(projector.total_angular_momentum)
+            denominator = float(2 * l_value + 1)
+            phase = (-1j) ** l_value
+            for m_value in range(-l_value - 1, l_value + 1):
+                if abs(j_value - l_value - 0.5) < 1.0e-8:
+                    up_coefficient = np.sqrt((l_value + m_value + 1.0) / denominator)
+                    down_coefficient = np.sqrt((l_value - m_value) / denominator)
+                elif abs(j_value - l_value + 0.5) < 1.0e-8:
+                    if m_value < -l_value + 1:
+                        continue
+                    up_coefficient = np.sqrt((l_value - m_value + 1.0) / denominator)
+                    down_coefficient = -np.sqrt((l_value + m_value) / denominator)
+                else:
+                    raise QEInputError(
+                        f"incompatible l={l_value}, j={j_value} in relativistic projector"
+                    )
+                up_harmonic = np.zeros(len(q), dtype=np.complex128)
+                if -l_value <= m_value <= l_value:
+                    key = (l_value, m_value)
+                    if key not in harmonics:
+                        harmonics[key] = _complex_spherical_harmonic(
+                            l_value, m_value, theta, phi
+                        )
+                    up_harmonic = harmonics[key]
+                down_harmonic = np.zeros(len(q), dtype=np.complex128)
+                if -l_value <= m_value + 1 <= l_value:
+                    key = (l_value, m_value + 1)
+                    if key not in harmonics:
+                        harmonics[key] = _complex_spherical_harmonic(
+                            l_value, m_value + 1, theta, phi
+                        )
+                    down_harmonic = harmonics[key]
+                column = np.concatenate(
+                    (
+                        phase * radial[:, projector_index] * up_coefficient * up_harmonic,
+                        phase * radial[:, projector_index] * down_coefficient * down_harmonic,
+                    )
+                )
+                columns.append(column)
+                identities.append((projector_index, m_value))
+        beta = np.asfortranarray(np.column_stack(columns))
+        coupling = np.zeros((len(columns), len(columns)), dtype=float)
+        for first, (radial_first, m_first) in enumerate(identities):
+            projector_first = self.projectors[radial_first]
+            for second, (radial_second, m_second) in enumerate(identities):
+                projector_second = self.projectors[radial_second]
+                if (
+                    m_first == m_second
+                    and projector_first.angular_momentum
+                    == projector_second.angular_momentum
+                    and abs(
+                        float(projector_first.total_angular_momentum)
+                        - float(projector_second.total_angular_momentum)
+                    )
+                    < 1.0e-8
+                ):
+                    coupling[first, second] = 0.5 * self.dij_ry[
+                        radial_first, radial_second
+                    ]
+        return beta, coupling
+
+    def spinor_atomic_projectors(
+        self, gk: np.ndarray, position: np.ndarray, volume: float
+    ) -> tuple[np.ndarray, np.ndarray]:
+        beta, coupling = self.spinor_projector_basis(gk, volume)
+        phase = np.exp(-1j * (np.asarray(gk) @ np.asarray(position)))
+        spinor_phase = np.concatenate((phase, phase))
+        return np.asfortranarray(beta * spinor_phase[:, None]), coupling
 
     def projector_basis_with_gradient(
         self, gk: np.ndarray, volume: float
