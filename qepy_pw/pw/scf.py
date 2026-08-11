@@ -2465,6 +2465,22 @@ def _hellmann_feynman_stress(
     return total, symmetrized_terms
 
 
+def _derivative_real_workspace(
+    density: np.ndarray,
+    reusable: np.ndarray,
+) -> np.ndarray:
+    """Return a real-grid scratch owner compatible with derivative kernels.
+
+    QE retains all ``nspin=4`` density components even when ``domag`` is
+    false, while its SCF mixing uses only ``nspin_mag=1``.  Consequently the
+    scalar mixing scratch cannot be reused by the force/stress routines,
+    which still receive the four-component density container.
+    """
+    if reusable.shape == density.shape:
+        return reusable
+    return np.empty_like(density)
+
+
 def _serial_blas_thread_count(
     pw: PWInput,
     mpi: MPIContext,
@@ -4874,7 +4890,7 @@ def _run_scf(
             timers.stop("electrons", electrons_started)
             result_density = _gather_density_root(rho, shape, mpi)
             derivative_real_workspace = (
-                real_grid_workspace
+                _derivative_real_workspace(rho, real_grid_workspace)
                 if calculate_forces or calculate_stress
                 else None
             )

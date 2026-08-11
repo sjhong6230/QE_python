@@ -26,7 +26,11 @@ from qepy_pw.xc import (
 )
 from qepy_pw.scf import SCFResult, run_scf
 from qepy_pw.pw.output import _spin_mode_message, format_footer
-from qepy_pw.pw.scf import _spinor_nonlocal_derivatives, _xc_energy_potential
+from qepy_pw.pw.scf import (
+    _derivative_real_workspace,
+    _spinor_nonlocal_derivatives,
+    _xc_energy_potential,
+)
 from qepy_pw.pw.save import (
     read_saved_density,
     read_saved_wavefunction,
@@ -117,6 +121,24 @@ def test_zero_noncollinear_starting_magnetization_disables_domag() -> None:
     assert pw.system["noncolin"] is True
     assert pw.system["_domag"] is False
     assert pw.system["starting_magnetization(1)"] == 0.0
+
+
+def test_nonmagnetic_spinor_derivatives_do_not_reuse_scalar_mixing_grid() -> None:
+    density = np.zeros((4, 3, 2, 1))
+    scalar_mixing_grid = np.zeros((3, 2, 1))
+
+    derivative_grid = _derivative_real_workspace(
+        density, scalar_mixing_grid
+    )
+
+    assert derivative_grid.shape == density.shape
+    assert not np.shares_memory(derivative_grid, scalar_mixing_grid)
+
+    compatible_grid = np.zeros_like(density)
+    assert (
+        _derivative_real_workspace(density, compatible_grid)
+        is compatible_grid
+    )
 
 
 def test_qe_spin_mode_messages_cover_all_noncollinear_cases() -> None:
