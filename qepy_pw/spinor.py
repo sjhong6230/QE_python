@@ -81,22 +81,46 @@ def apply_local_potential(
 
 def eigenchannel_densities(
     density: np.ndarray,
+    quantization_axis: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Diagonalize a local spin-density matrix into majority/minority channels."""
+    """Diagonalize a local spin density, including QE's fixed-axis GGA labels.
+
+    With ``quantization_axis`` omitted, channel 0 is the local majority
+    channel.  QE instead gives the two GGA channels a continuous global label
+    when all starting moments are collinear: the local eigenchannels are
+    swapped wherever ``m . ux < 0``.  ``direction`` includes the corresponding
+    sign so rotating the two channel potentials back remains invariant.
+    """
     components = np.asarray(density, dtype=np.float64)
     if components.shape[0] != 4:
         raise ValueError("density must contain charge, mx, my, mz components")
     magnetization = components[1:]
-    magnitude = np.sqrt(np.einsum("i...,i...->...", magnetization, magnetization))
+    raw_magnitude = np.sqrt(
+        np.einsum("i...,i...->...", magnetization, magnetization)
+    )
     # A representable 2x2 density matrix obeys |m| <= rho.  Clipping tiny
     # numerical violations is the same positivity repair used by QE's
     # rho2zeta path before evaluating an LSDA/GGA functional.
     charge = np.maximum(components[0], 0.0)
-    np.minimum(magnitude, charge, out=magnitude)
+    magnitude = np.minimum(raw_magnitude, charge)
     direction = np.zeros_like(magnetization)
-    active = magnitude > 1.0e-14
-    direction[:, active] = magnetization[:, active] / magnitude[active]
-    channels = np.stack((0.5 * (charge + magnitude), 0.5 * (charge - magnitude)))
+    active = raw_magnitude > 1.0e-14
+    direction[:, active] = magnetization[:, active] / raw_magnitude[active]
+    sign = np.ones_like(magnitude)
+    if quantization_axis is not None:
+        axis = np.asarray(quantization_axis, dtype=np.float64)
+        if axis.shape != (3,) or not np.all(np.isfinite(axis)):
+            raise ValueError("quantization axis must be a finite three-vector")
+        norm = float(np.linalg.norm(axis))
+        if norm <= 1.0e-14:
+            raise ValueError("quantization axis must be nonzero")
+        projection = np.einsum("i...,i->...", magnetization, axis / norm)
+        sign[projection < 0.0] = -1.0
+        direction *= sign[None, ...]
+    signed_magnitude = sign * magnitude
+    channels = np.stack(
+        (0.5 * (charge + signed_magnitude), 0.5 * (charge - signed_magnitude))
+    )
     return channels, direction
 
 

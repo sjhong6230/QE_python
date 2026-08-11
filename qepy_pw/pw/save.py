@@ -112,11 +112,15 @@ def _atomic_species(parent: ET.Element, pw: PWInput) -> None:
             if int(pw.system.get("nspin", 1)) == 4:
                 _text(
                     entry, "spin_teta",
-                    float(pw.system.get(f"angle1({species_index + 1})", 0.0)),
+                    float(np.deg2rad(
+                        pw.system.get(f"angle1({species_index + 1})", 0.0)
+                    )),
                 )
                 _text(
                     entry, "spin_phi",
-                    float(pw.system.get(f"angle2({species_index + 1})", 0.0)),
+                    float(np.deg2rad(
+                        pw.system.get(f"angle2({species_index + 1})", 0.0)
+                    )),
                 )
 
 

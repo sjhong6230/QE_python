@@ -1104,6 +1104,27 @@ def _starting_magnetization_vectors(
     return result
 
 
+def _fixed_noncollinear_gga_axis(
+    pw: PWInput, vectors: dict[str, np.ndarray]
+) -> np.ndarray | None:
+    """Return QE ``compute_ux`` axis when all initial moments are parallel."""
+    axis = None
+    start = 0
+    atom_vectors = [np.asarray(vectors[atom.label], dtype=float) for atom in pw.atoms]
+    for atom_index, vector in enumerate(atom_vectors):
+        if float(np.dot(vector, vector)) > 1.0e-12:
+            axis = vector.copy()
+            start = atom_index + 1
+            break
+    if axis is None:
+        return None
+    for vector in atom_vectors[start:]:
+        cross = np.cross(axis, vector)
+        if float(np.dot(cross, cross)) >= 1.0e-6:
+            return None
+    return axis / np.linalg.norm(axis)
+
+
 def _rotate_starting_subspace(
     operator: PlaneWaveHamiltonian,
     trials: np.ndarray,
@@ -1306,10 +1327,14 @@ def _xc_energy_potential(
     g_vectors: np.ndarray | None = None,
     need_epsilon: bool = True,
     energy_density_out: np.ndarray | None = None,
+    noncollinear_gga_axis: np.ndarray | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray]:
     """Evaluate the selected XC functional on a rank-local FFT slab."""
     if density.ndim >= 4 and density.shape[0] == 4:
-        channels, direction = eigenchannel_densities(density)
+        channels, direction = eigenchannel_densities(
+            density,
+            noncollinear_gga_axis if functional in GGA_FUNCTIONALS else None,
+        )
         if functional in GGA_FUNCTIONALS:
             if workspace is None or g_vectors is None:
                 raise ValueError(
@@ -2242,7 +2267,12 @@ def _hellmann_feynman_stress(
                 need_stress=True,
             )
         elif noncolin:
-            channels, direction = eigenchannel_densities(total_density)
+            gga_axis = _fixed_noncollinear_gga_axis(
+                pw, _starting_magnetization_vectors(pw, pseudos)
+            )
+            channels, direction = eigenchannel_densities(
+                total_density, gga_axis
+            )
             (
                 epsilon_xc,
                 channel_potential,
@@ -2870,6 +2900,16 @@ def _run_scf(
     )
     starting_magnetization_vectors = _starting_magnetization_vectors(
         pw, pseudo_by_label
+    )
+    noncollinear_gga_axis = (
+        _fixed_noncollinear_gga_axis(pw, starting_magnetization_vectors)
+        if noncolin and xc_functional in GGA_FUNCTIONALS
+        else None
+    )
+    pw.system["_noncollinear_gga_axis"] = (
+        None
+        if noncollinear_gga_axis is None
+        else tuple(float(value) for value in noncollinear_gga_axis)
     )
     starting_charge = 0.0
     for atom in pw.atoms:
@@ -3772,6 +3812,7 @@ def _run_scf(
                     workspace=charge_workspace,
                     g_vectors=local_charge_vectors,
                     need_epsilon=False,
+                    noncollinear_gga_axis=noncollinear_gga_axis,
                 )
                 timers.stop("v_xc", xc_started)
                 assert vh is not None
@@ -3836,6 +3877,7 @@ def _run_scf(
                 workspace=charge_workspace,
                 g_vectors=local_charge_vectors,
                 need_epsilon=False,
+                noncollinear_gga_axis=noncollinear_gga_axis,
             )
             timers.stop("v_xc", xc_started)
             assert vh is not None
@@ -4598,6 +4640,7 @@ def _run_scf(
                 xc_functional,
                 workspace=charge_workspace,
                 g_vectors=local_charge_vectors,
+                noncollinear_gga_axis=noncollinear_gga_axis,
             )
             assert epsilon_energy is not None
             exc = grid_scale * mpi.sum_scalar(
@@ -4622,6 +4665,7 @@ def _run_scf(
                 g_vectors=local_charge_vectors,
                 need_epsilon=False,
                 energy_density_out=real_grid_workspace,
+                noncollinear_gga_axis=noncollinear_gga_axis,
             )
             assert epsilon_energy is None
             del epsilon_energy
@@ -4834,6 +4878,7 @@ def _run_scf(
                     xc_functional,
                     workspace=charge_workspace,
                     g_vectors=local_charge_vectors,
+                    noncollinear_gga_axis=noncollinear_gga_axis,
                 )
                 del final_epsilon
                 local_force, core_force = _local_and_core_forces(

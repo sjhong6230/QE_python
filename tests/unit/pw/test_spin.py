@@ -108,10 +108,20 @@ def test_noncollinear_input_promotes_density_components_without_k_duplication() 
 
 
 def test_zero_noncollinear_starting_magnetization_disables_domag() -> None:
-    pw = _read("nspin=4, angle1(1)=72, angle2(1)=-15")
+    pw = _read(
+        "nspin=4, angle1(1)=72, angle2(1)=-15",
+        """K_POINTS crystal
+1
+0.0 0.0 0.0 1.0""",
+    )
     assert pw.system["noncolin"] is True
     assert pw.system["_domag"] is False
     assert pw.system["starting_magnetization(1)"] == 0.0
+
+
+def test_noncollinear_input_rejects_gamma_only_representation() -> None:
+    with pytest.raises(QEInputError, match="gamma_only and noncolin"):
+        _read("noncolin=.true.")
 
 
 def test_noncollinear_input_rejects_conflicting_spin_flags() -> None:
@@ -462,7 +472,9 @@ ATOMIC_SPECIES
 H 1.0008 H.pz-vbc.UPF
 ATOMIC_POSITIONS angstrom
 H 0.0 0.0 0.0
-K_POINTS gamma
+K_POINTS crystal
+1
+0.0 0.0 0.0 1.0
 """))
     pw.control["outdir"] = str(tmp_path)
     shape = (4, 4, 4)

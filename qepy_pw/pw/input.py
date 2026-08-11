@@ -1467,6 +1467,10 @@ def read_pw_input(source: str | Path | TextIO) -> PWInput:
                 )
             raise QEInputError(message, routine="check_atoms")
     kcard = cards.get("K_POINTS", ("gamma", []))
+    if noncolin and kcard[0] == "gamma":
+        raise QEInputError(
+            "gamma_only and noncolin not allowed", routine="setup"
+        )
     kpoints = _parse_kpoints(kcard, lattice, alat)
     if kcard[0] == "automatic":
         automatic_values = tuple(int(value) for value in kcard[1][0].split())

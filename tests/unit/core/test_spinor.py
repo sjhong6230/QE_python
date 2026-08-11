@@ -8,6 +8,7 @@ from qepy_pw.spinor import (
     aligned_spinors,
     apply_local_potential,
     density_components,
+    eigenchannel_densities,
     magnetization_direction,
     time_reverse,
 )
@@ -55,6 +56,26 @@ def test_noncollinear_lda_is_spin_rotation_covariant() -> None:
         np.linalg.norm(potential_second[1:], axis=0),
         atol=2e-15,
     )
+
+
+def test_qe_fixed_gga_axis_keeps_antiparallel_channel_labels_continuous() -> None:
+    density = np.asarray(
+        (
+            (1.0, 1.0),
+            (0.3, -0.3),
+            (0.0, 0.0),
+            (0.0, 0.0),
+        )
+    )
+    local_channels, local_direction = eigenchannel_densities(density)
+    fixed_channels, fixed_direction = eigenchannel_densities(
+        density, np.asarray((1.0, 0.0, 0.0))
+    )
+
+    np.testing.assert_allclose(local_channels[:, 0], local_channels[:, 1])
+    np.testing.assert_allclose(fixed_channels[:, 1], fixed_channels[::-1, 0])
+    np.testing.assert_allclose(local_direction[0], (1.0, -1.0))
+    np.testing.assert_allclose(fixed_direction[0], (1.0, 1.0))
 
 
 def test_spinor_plane_wave_hamiltonian_uses_doubled_qe_layout() -> None:
