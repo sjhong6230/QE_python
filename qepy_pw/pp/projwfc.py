@@ -68,6 +68,19 @@ class ProjectionData:
     kpoints: np.ndarray | None = None
     plane_waves: np.ndarray | None = None
     nkb: int = 0
+    spins: np.ndarray | None = None
+
+    @property
+    def spin_labels(self) -> np.ndarray:
+        return (
+            np.ones(len(self.weights), dtype=np.int8)
+            if self.spins is None
+            else np.asarray(self.spins, dtype=np.int8)
+        )
+
+    @property
+    def nspin(self) -> int:
+        return int(np.max(self.spin_labels, initial=1))
 
 
 @dataclass(frozen=True)
@@ -78,6 +91,19 @@ class BoxData:
     box_weights: np.ndarray
     shape: tuple[int, int, int]
     masks: tuple[np.ndarray, ...]
+    spins: np.ndarray | None = None
+
+    @property
+    def spin_labels(self) -> np.ndarray:
+        return (
+            np.ones(len(self.weights), dtype=np.int8)
+            if self.spins is None
+            else np.asarray(self.spins, dtype=np.int8)
+        )
+
+    @property
+    def nspin(self) -> int:
+        return int(np.max(self.spin_labels, initial=1))
 
 
 def _xml_vector(element: ET.Element | None, name: str, ns: dict[str, str]) -> np.ndarray:
@@ -395,6 +421,7 @@ def compute_projections(
         np.asarray(kpoints),
         np.asarray(plane_wave_counts, dtype=np.int32),
         nkb,
+        saved.spin_labels,
     )
 
 
@@ -481,7 +508,15 @@ def _box_projections(prefix: str, outdir: str | None, options: dict[str, object]
     result = np.asarray(projections)
     if np.any(result < -1.0e-12) or np.any(result > 1.0 + 1.0e-8):
         raise QEInputError("real-space box projections violate wavefunction normalization")
-    return BoxData(saved.eigenvalues_ev, saved.weights, occupations, result, shape, tuple(masks))
+    return BoxData(
+        saved.eigenvalues_ev,
+        saved.weights,
+        occupations,
+        result,
+        shape,
+        tuple(masks),
+        saved.spin_labels,
+    )
 
 
 def _write_box_xsf(path: Path, mask: np.ndarray, lattice: np.ndarray) -> None:
@@ -513,15 +548,48 @@ def _run_boxes(options: dict[str, object], prefix: str, outdir: str | None) -> t
     kernel = _dos_kernel(data.energies_ev, grid, width, ngauss)
     kresolved = bool(options.get("kresolveddos", False))
     weights = np.ones_like(data.weights) if kresolved else data.weights
-    box_dos = 2.0 * np.einsum("ekb,k,kbx->ex", kernel, weights, data.box_weights)
+    degeneracy = 2.0 if data.nspin == 1 else 1.0
+    if data.nspin == 2 and not kresolved:
+        box_dos = np.asarray([
+            np.einsum(
+                "ekb,k,kbx->ex",
+                kernel[:, data.spin_labels == spin],
+                weights[data.spin_labels == spin],
+                data.box_weights[data.spin_labels == spin],
+            )
+            for spin in (1, 2)
+        ])
+    else:
+        box_dos = degeneracy * np.einsum(
+            "ekb,k,kbx->ex", kernel, weights, data.box_weights
+        )
     output = Path(f"{options.get('filpdos', prefix)}.ldos_boxes")
     with output.open("w", encoding="utf-8", newline="\n") as stream:
-        stream.write(("# ik E (eV)" if kresolved else "# E (eV)") + "".join(f" LDOS_box{box}" for box in range(1, box_dos.shape[1] + 1)) + "\n")
+        if data.nspin == 2 and not kresolved:
+            columns = "".join(
+                f" LDOSup_box{box} LDOSdw_box{box}"
+                for box in range(1, box_dos.shape[2] + 1)
+            )
+        else:
+            columns = "".join(
+                f" LDOS_box{box}" for box in range(1, box_dos.shape[1] + 1)
+            )
+        stream.write(("# ik E (eV)" if kresolved else "# E (eV)") + columns + "\n")
         if kresolved:
             for ik in range(len(data.weights)):
-                values_k = 2.0 * np.einsum("eb,bx->ex", kernel[:, ik], data.box_weights[ik])
+                values_k = degeneracy * np.einsum(
+                    "eb,bx->ex", kernel[:, ik], data.box_weights[ik]
+                )
                 for energy, values in zip(grid, values_k):
                     stream.write(f"{ik + 1:6d} {energy:12.6f}" + "".join(f" {value:14.6e}" for value in values) + "\n")
+        elif data.nspin == 2:
+            for energy_index, energy in enumerate(grid):
+                values = np.moveaxis(box_dos[:, energy_index], 0, 1).ravel()
+                stream.write(
+                    f"{energy:12.6f}"
+                    + "".join(f" {value:14.6e}" for value in values)
+                    + "\n"
+                )
         else:
             for energy, values in zip(grid, box_dos):
                 stream.write(f"{energy:12.6f}" + "".join(f" {value:14.6e}" for value in values) + "\n")
@@ -537,7 +605,14 @@ def _run_boxes(options: dict[str, object], prefix: str, outdir: str | None) -> t
         with path.open("w", encoding="utf-8", newline="\n") as stream:
             for ik, bands in enumerate(data.box_weights, start=1):
                 for band, values in enumerate(bands, start=1):
-                    stream.write(f"k = {ik:5d} band = {band:5d}" + "".join(f" box#{box + 1} = {value:.10e}" for box, value in enumerate(values)) + "\n")
+                    spin = int(data.spin_labels[ik - 1])
+                    stream.write(
+                        f"k = {ik:5d}"
+                        + (f" spin = {spin:d}" if data.nspin == 2 else "")
+                        + f" band = {band:5d}"
+                        + "".join(f" box#{box + 1} = {value:.10e}" for box, value in enumerate(values))
+                        + "\n"
+                    )
         paths.append(path)
     return data, paths
 
@@ -548,7 +623,12 @@ def _write_atomic_proj(path: Path, data: ProjectionData, include_overlaps: bool)
     for index, orbital in enumerate(data.orbitals, start=1):
         ET.SubElement(states, "STATE", index=str(index), atom=str(orbital.atom), species=orbital.symbol, wfc=str(orbital.wfc), l=str(orbital.l), m=str(orbital.m + 1), label=orbital.label)
     for ik, (energies, projections) in enumerate(zip(data.energies_ev, data.projections), start=1):
-        point = ET.SubElement(root, "K_POINT", index=str(ik))
+        point = ET.SubElement(
+            root,
+            "K_POINT",
+            index=str(ik),
+            spin=str(int(data.spin_labels[ik - 1])),
+        )
         for band, (energy, values) in enumerate(zip(energies, projections), start=1):
             state = ET.SubElement(point, "EIGENSTATE", band=str(band), energy_ev=f"{energy:.16e}")
             state.text = " ".join(f"{value:.16e}" for value in values)
@@ -688,35 +768,96 @@ def run_projwfc(
     kernel = _dos_kernel(data.energies_ev, grid, width, ngauss, delta)
     kresolved = bool(options.get("kresolveddos", False))
     if kresolved:
-        dos_by_k = np.sum(kernel, axis=2)
-        projected_by_k = np.einsum(
-            "ekb,kbo->eko", kernel, data.projections
-        )
+        if data.nspin == 2:
+            dos_by_k = np.zeros((len(grid), len(data.weights), 2))
+            projected_by_k = np.zeros(
+                (len(grid), len(data.weights), 2, len(data.orbitals))
+            )
+            raw_dos = np.sum(kernel, axis=2)
+            raw_projected = np.einsum(
+                "ekb,kbo->eko", kernel, data.projections
+            )
+            for spin in (1, 2):
+                selected = data.spin_labels == spin
+                dos_by_k[:, selected, spin - 1] = raw_dos[:, selected]
+                projected_by_k[:, selected, spin - 1] = raw_projected[:, selected]
+        else:
+            dos_by_k = np.sum(kernel, axis=2)
+            projected_by_k = np.einsum(
+                "ekb,kbo->eko", kernel, data.projections
+            )
     else:
-        total = 2.0 * np.einsum("ekb,k->e", kernel, data.weights)
-        projected = 2.0 * np.einsum(
-            "ekb,k,kbo->eo", kernel, data.weights, data.projections
-        )
+        if data.nspin == 2:
+            total = np.empty((2, len(grid)))
+            projected = np.empty((2, len(grid), len(data.orbitals)))
+            for spin in (1, 2):
+                selected = data.spin_labels == spin
+                total[spin - 1] = np.einsum(
+                    "ekb,k->e", kernel[:, selected], data.weights[selected]
+                )
+                projected[spin - 1] = np.einsum(
+                    "ekb,k,kbo->eo",
+                    kernel[:, selected],
+                    data.weights[selected],
+                    data.projections[selected],
+                )
+        else:
+            total = 2.0 * np.einsum("ekb,k->e", kernel, data.weights)
+            projected = 2.0 * np.einsum(
+                "ekb,k,kbo->eo", kernel, data.weights, data.projections
+            )
     base = str(options.get("filpdos", prefix))
     paths = []
     total_path = Path(f"{base}.pdos_tot")
     with total_path.open("w", encoding="utf-8", newline="\n") as stream:
         if kresolved:
-            stream.write("# ik    E (eV)  dos(E)    pdos(E)\n")
+            stream.write(
+                "# ik    E (eV)  dosup(E) dosdw(E) pdosup(E) pdosdw(E)\n"
+                if data.nspin == 2
+                else "# ik    E (eV)  dos(E)    pdos(E)\n"
+            )
             for ik in range(len(data.weights)):
+                values = (
+                    np.column_stack(
+                        (
+                            dos_by_k[:, ik, 0],
+                            dos_by_k[:, ik, 1],
+                            np.sum(projected_by_k[:, ik, 0], axis=1),
+                            np.sum(projected_by_k[:, ik, 1], axis=1),
+                        )
+                    )
+                    if data.nspin == 2
+                    else np.column_stack(
+                        (dos_by_k[:, ik], np.sum(projected_by_k[:, ik], axis=1))
+                    )
+                )
                 _write_qe_pdos_block(
                     stream,
                     grid,
-                    np.column_stack(
-                        (dos_by_k[:, ik], np.sum(projected_by_k[:, ik], axis=1))
-                    ),
+                    values,
                     kpoint=ik + 1,
                 )
                 stream.write("\n")
         else:
-            stream.write("# E (eV)  dos(E)    pdos(E)\n")
+            stream.write(
+                "# E (eV)  dosup(E) dosdw(E) pdosup(E) pdosdw(E)\n"
+                if data.nspin == 2
+                else "# E (eV)  dos(E)    pdos(E)\n"
+            )
+            values = (
+                np.column_stack(
+                    (
+                        total[0],
+                        total[1],
+                        np.sum(projected[0], axis=1),
+                        np.sum(projected[1], axis=1),
+                    )
+                )
+                if data.nspin == 2
+                else np.column_stack((total, np.sum(projected, axis=1)))
+            )
             _write_qe_pdos_block(
-                stream, grid, np.column_stack((total, np.sum(projected, axis=1)))
+                stream, grid, values
             )
     paths.append(total_path)
     lnames = _L_NAMES
@@ -727,32 +868,78 @@ def run_projwfc(
         with path.open("w", encoding="utf-8", newline="\n") as stream:
             if kresolved:
                 stream.write(
-                    "# ik    E (eV)   ldos(E)  "
-                    + " pdos(E)   " * component_count
+                    (
+                        "# ik    E (eV) ldosup(E) ldosdw(E) "
+                        if data.nspin == 2
+                        else "# ik    E (eV)   ldos(E)  "
+                    )
+                    + (
+                        " pdosup(E) pdosdw(E) " * component_count
+                        if data.nspin == 2
+                        else " pdos(E)   " * component_count
+                    )
                     + "\n"
                 )
                 for ik in range(len(data.weights)):
-                    components_k = projected_by_k[:, ik, columns]
+                    if data.nspin == 2:
+                        components_k = projected_by_k[:, ik, :, columns]
+                        component_pairs = np.moveaxis(components_k, 1, 2).reshape(
+                            len(grid), 2 * component_count
+                        )
+                        values = np.column_stack(
+                            (
+                                np.sum(components_k[:, 0], axis=1),
+                                np.sum(components_k[:, 1], axis=1),
+                                component_pairs,
+                            )
+                        )
+                    else:
+                        components_k = projected_by_k[:, ik, columns]
+                        values = np.column_stack(
+                            (np.sum(components_k, axis=1), components_k)
+                        )
                     _write_qe_pdos_block(
                         stream,
                         grid,
-                        np.column_stack(
-                            (np.sum(components_k, axis=1), components_k)
-                        ),
+                        values,
                         kpoint=ik + 1,
                     )
                     stream.write("\n")
             else:
-                components = projected[:, columns]
+                if data.nspin == 2:
+                    components = projected[:, :, columns]
+                    component_pairs = np.moveaxis(components, 0, 2).reshape(
+                        len(grid), 2 * component_count
+                    )
+                    values = np.column_stack(
+                        (
+                            np.sum(components[0], axis=1),
+                            np.sum(components[1], axis=1),
+                            component_pairs,
+                        )
+                    )
+                else:
+                    components = projected[:, columns]
+                    values = np.column_stack(
+                        (np.sum(components, axis=1), components)
+                    )
                 stream.write(
-                    "# E (eV)   ldos(E)  "
-                    + " pdos(E)   " * component_count
+                    (
+                        "# E (eV) ldosup(E) ldosdw(E) "
+                        if data.nspin == 2
+                        else "# E (eV)   ldos(E)  "
+                    )
+                    + (
+                        " pdosup(E) pdosdw(E) " * component_count
+                        if data.nspin == 2
+                        else " pdos(E)   " * component_count
+                    )
                     + "\n"
                 )
                 _write_qe_pdos_block(
                     stream,
                     grid,
-                    np.column_stack((np.sum(components, axis=1), components)),
+                    values,
                 )
         paths.append(path)
     directory = resolve_save_directory(prefix, outdir)
@@ -766,7 +953,12 @@ def run_projwfc(
                 stream.write(f"state # {index}: atom {orbital.atom} ({orbital.symbol}), wfc {orbital.wfc} (l={orbital.l} m={orbital.m + 1})\n")
             for ik, (energies, projections) in enumerate(zip(data.energies_ev, data.projections), start=1):
                 for band, (energy, values) in enumerate(zip(energies, projections), start=1):
-                    stream.write(f"k = {ik:5d} band = {band:5d} e = {energy:12.6f} |psi|^2 = {np.sum(values):8.5f}\n")
+                    spin = int(data.spin_labels[ik - 1])
+                    stream.write(
+                        f"k = {ik:5d}"
+                        + (f" spin = {spin:d}" if data.nspin == 2 else "")
+                        + f" band = {band:5d} e = {energy:12.6f} |psi|^2 = {np.sum(values):8.5f}\n"
+                    )
         paths.append(filproj)
     return data, paths
 
@@ -825,11 +1017,17 @@ def _format_projection_summary(data: ProjectionData, *, diag_basis: bool = False
         )
 
     if data.kpoints is not None:
-        for kpoint, energies, projections in zip(
+        for ik, (kpoint, energies, projections) in enumerate(zip(
             data.kpoints, data.energies_ev, data.projections
-        ):
+        )):
+            spin_suffix = (
+                f" (spin {'up' if data.spin_labels[ik] == 1 else 'down'})"
+                if data.nspin == 2
+                else ""
+            )
             lines.append(
                 "\n k = " + "".join(f"{value:14.10f}" for value in kpoint)
+                + spin_suffix
             )
             for band, (energy, values) in enumerate(
                 zip(energies, projections), start=1
@@ -857,6 +1055,17 @@ def _format_projection_summary(data: ProjectionData, *, diag_basis: bool = False
     charges = np.einsum(
         "k,kb,kbo->o", data.weights, data.occupations, data.projections
     )
+    spin_charges = None
+    if data.nspin == 2:
+        spin_charges = np.asarray([
+            np.einsum(
+                "k,kb,kbo->o",
+                data.weights[data.spin_labels == spin],
+                data.occupations[data.spin_labels == spin],
+                data.projections[data.spin_labels == spin],
+            )
+            for spin in (1, 2)
+        ])
     lines.extend(("", "Lowdin Charges: ", ""))
     atom_numbers = sorted({orbital.atom for orbital in data.orbitals})
     maximum_l = max((orbital.l for orbital in data.orbitals), default=0)
@@ -902,6 +1111,13 @@ def _format_projection_summary(data: ProjectionData, *, diag_basis: bool = False
                     for magnetic, component_label in enumerate(labels)
                 )
             lines.append(line)
+        if spin_charges is not None:
+            up = float(np.sum(spin_charges[0, atom_indices]))
+            down = float(np.sum(spin_charges[1, atom_indices]))
+            lines.append(
+                f"     Atom # {atom:3d}: spin up = {up:8.4f}, "
+                f"spin down = {down:8.4f}, polarization = {up - down:8.4f}"
+            )
 
     electrons = float(np.einsum("k,kb->", data.weights, data.occupations))
     spilling = 1.0 - float(np.sum(charges)) / max(1.0e-14, electrons)
