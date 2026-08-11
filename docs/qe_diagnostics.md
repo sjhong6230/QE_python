@@ -36,7 +36,7 @@ A non-fatal condition uses QE's `infomsg` form:
 | Cards | duplicate cards, malformed `ATOMIC_SPECIES`, duplicate atomic labels, malformed atomic-position columns, nonexistent species, invalid automatic k-point grids and offsets, and unknown k-point options |
 | Units | QE deprecation messages for omitted `ATOMIC_POSITIONS` and `CELL_PARAMETERS` units |
 | Geometry | atoms that overlap directly or through a lattice translation |
-| Implemented subset | spin polarization/noncollinearity, spin-orbit coupling, DFT+U, unsupported XC functionals, and every explicitly supplied but unused QE variable fail with an explicit `is not implemented in PWSCF-PY` message |
+| Implemented subset | incompatible scalar/LSDA/noncollinear flags, scalar-relativistic UPFs in noncollinear runs, `lspinorb` without `noncolin`, DFT+U, unsupported XC functionals, and every explicitly supplied but unused QE variable are diagnosed explicitly |
 
 Warnings are stored as structured `(routine, message)` records in `PWInput`.
 They are emitted once by the root MPI rank.  Input parsing and symmetry
@@ -46,12 +46,11 @@ diagnostic.
 ## Deliberately not claimed as implemented
 
 QE contains many errors that can only arise inside code paths absent from this
-scalar norm-conserving SCF port.  PWSCF-PY does **not** pretend to reproduce
+norm-conserving SCF port.  PWSCF-PY does **not** pretend to reproduce
 those internal diagnostics.  The following categories remain unimplemented:
 
 - ionic and variable-cell dynamics (`relax`, `md`, `vc-relax`, and `vc-md`);
-- LSDA, noncollinear magnetism, constrained magnetization, and spin-orbit
-  coupling;
+- constrained magnetization and noncollinear DFT+U;
 - ultrasoft and PAW augmentation-specific checks;
 - DFT+U, hybrid/exact-exchange, dispersion corrections, SIC, and DMFT;
 - electric fields, Berry-phase polarization, gates, ESM, grand-canonical SCF,

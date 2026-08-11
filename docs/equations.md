@@ -1,6 +1,7 @@
 # Equations and numerical methods
 
-This document summarizes the equations represented by the current scalar SCF
+This document summarizes the equations represented by the current scalar,
+collinear-LSDA, and noncollinear spinor SCF
 implementation. Internal electronic-structure quantities use Hartree atomic
 units unless `Ry` is written explicitly.
 
@@ -327,6 +328,56 @@ $$
 V_{\mathrm{xc}}^\sigma
 =V_{\mathrm{xc,local}}^\sigma-\nabla\cdot\mathbf q_\sigma.
 $$
+
+### 7.0.1 Noncollinear Pauli representation
+
+For `noncolin=.true.`, every Kohn--Sham state is a two-component spinor and
+the local one-particle density matrix is represented by four real fields,
+
+$$
+\rho(\mathbf r)=\frac12\left[n(\mathbf r)I+
+\mathbf m(\mathbf r)\cdot\boldsymbol\sigma\right].
+$$
+
+The local Kohn--Sham potential has the conjugate Pauli decomposition
+
+$$
+V_{\mathrm{KS}}(\mathbf r)=V_0(\mathbf r)I+
+\mathbf B_{\mathrm{xc}}(\mathbf r)\cdot\boldsymbol\sigma.
+$$
+
+The Hartree and ionic local terms enter only $V_0$. For a rotationally
+invariant LSDA, the XC functional is evaluated on the eigenchannel densities
+
+$$
+n_\pm=\frac12(n\pm|\mathbf m|),
+$$
+
+and the difference of the two spin potentials is rotated back along
+$\hat{\mathbf m}$. PBE-family noncollinear GGA follows QE's `compute_ux`
+convention: parallel or antiparallel starting moments define one fixed
+quantization axis $\mathbf u_x$, including channel interchange when
+$\mathbf m\cdot\mathbf u_x<0$; genuinely nonparallel starts use the local
+magnetization direction.
+
+The reciprocal spinor coefficient array is ordered as all up-component plane
+waves followed by all down-component plane waves. Fully relativistic
+nonlocal projectors couple orbital angular momentum and spin into $(j,m_j)$
+channels through the Clebsch--Gordan coefficients. If `lspinorb=.false.`, the
+$j=l\pm\tfrac12$ radial channels and couplings are collapsed with QE's
+degeneracy-weighted `average_pp` formula before duplicating the scalar
+operator in spin space.
+
+Time reversal is the antiunitary operator
+
+$$
+\Theta=i\sigma_y K,\qquad \Theta^2=-1,
+$$
+
+where $K$ denotes complex conjugation. Spatial symmetry rotates
+$\mathbf m$ as an axial vector, so an improper Cartesian operation $R$ acts
+through $\det(R)R$. Operations that reverse all starting moments can be
+retained as antiunitary magnetic symmetries unless `no_t_rev=.true.`.
 
 ### 7.1 Fixed occupations
 

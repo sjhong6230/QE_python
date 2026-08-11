@@ -1,9 +1,10 @@
-_# qepy-pw
+# qepy-pw
 
-`qepy-pw` is a Python implementation of the scalar and collinear-LSDA SCF,
-NSCF, and band-structure paths of Quantum ESPRESSO `pw.x`, together with the
-`bands.x`, `plotband.x`, `dos.x`, scalar `projwfc.x`, and scalar norm-conserving
-`pp.x` post-processing workflows. It reads QE-style input
+`qepy-pw` is a Python implementation of scalar, collinear-LSDA, and
+noncollinear spinor SCF, NSCF, and band-structure paths of Quantum ESPRESSO
+`pw.x`, including fully relativistic norm-conserving spin-orbit coupling.
+It also provides `bands.x`, `plotband.x`, `dos.x`, `projwfc.x`, and
+norm-conserving `pp.x` post-processing workflows. It reads QE-style input
 files and norm-conserving UPF pseudopotentials and produces QE-shaped output.
 
 The project is intended for development and numerical comparison. It is not a

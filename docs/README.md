@@ -1,8 +1,8 @@
 # qepy-pw documentation
 
-This directory documents the implemented scalar, nonmagnetic SCF, NSCF, and
-band-structure subset of Quantum ESPRESSO `pw.x`, plus the associated
-`bands.x` and `plotband.x` post-processing path. The documentation describes
+This directory documents the implemented scalar, collinear-LSDA, and
+noncollinear spinor SCF, NSCF, and band-structure subset of Quantum ESPRESSO
+`pw.x`, plus the associated post-processing paths. The documentation describes
 the current source tree, not the complete feature set of upstream QE.
 
 ## Reading guide
@@ -16,15 +16,15 @@ the current source tree, not the complete feature set of upstream QE.
 | [Validation and performance](validation_and_performance.md) | Regression tests, numerical tolerances, timing interpretation, memory accounting, and benchmarking practice |
 | [Architecture](architecture.md) | Package decomposition, SCF data flow, Cython boundary, distributed FFT design, ownership, and memory lifetime |
 | [QE-compatible diagnostics](qe_diagnostics.md) | Implemented QE-style error and warning conditions and their compatibility boundary |
-| [Band post-processing](band_postprocessing.md) | `bands.py`, scalar irrep classification, overlap ordering, and `plotband.py` formats |
+| [Band post-processing](band_postprocessing.md) | `bands.py`, scalar and double-group irrep classification, overlap ordering, and `plotband.py` formats |
 | [DOS post-processing](dos_postprocessing.md) | `dos.py` smearing and tetrahedron integration, input, and output formats |
-| [Scalar field post-processing](pp_postprocessing.md) | `pp.py` extraction, intermediate files, weighted combinations, interpolation, XSF, and cube output |
+| [Field post-processing](pp_postprocessing.md) | `pp.py` charge, spin, magnetization, potential, intermediate-file, interpolation, XSF, and cube paths |
 | [Projected DOS](projwfc_postprocessing.md) | `projwfc.py` Löwdin atomic projections, charges, spilling, and PDOS files |
 
 ## Scope at a glance
 
-The implemented production path is periodic scalar Kohn–Sham DFT with
-norm-conserving UPF pseudopotentials. It supports LDA and selected semilocal
+The implemented production path is periodic scalar, collinear, or spinor
+Kohn–Sham DFT with norm-conserving UPF pseudopotentials. It supports LDA and selected semilocal
 GGA functionals, fixed and metallic occupations, symmetry reduction,
 distributed plane waves, QE-style stick/slab FFT transposes, several iterative
 diagonalizers, density mixing, selected forces and stress, and QE-shaped
@@ -32,8 +32,7 @@ restart/output files.
 
 The following major QE capabilities are outside the present scope:
 
-- spin polarization, noncollinear magnetism, spin–orbit coupling, and
-  constrained magnetization;
+- constrained magnetization and noncollinear DFT+U;
 - ultrasoft and PAW augmentation, DFT+U, hybrid functionals, exact exchange,
   dispersion corrections, and time-dependent DFT;
 - ionic relaxation, molecular dynamics, variable-cell dynamics, phonons, and

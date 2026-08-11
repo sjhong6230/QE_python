@@ -1,6 +1,6 @@
 # Differences from Quantum ESPRESSO
 
-`qepy-pw` follows the scalar SCF design and many numerical conventions of
+`qepy-pw` follows QE's scalar, collinear, and noncollinear SCF design and many numerical conventions of
 Quantum ESPRESSO `pw.x`, but it is not a drop-in replacement. This document
 states the compatibility boundary explicitly so that numerical agreement is
 not confused with feature equivalence.
@@ -23,13 +23,13 @@ Fortran executable.
 
 | Area | `qepy-pw` | Upstream QE |
 |---|---|---|
-| Ground state | Scalar periodic SCF | Scalar, spin, noncollinear, many additional modes |
-| Pseudopotentials | Norm-conserving UPF subset, including separable nonlocal projectors and NLCC | Norm-conserving, ultrasoft, PAW, broader formats and features |
+| Ground state | Scalar, collinear-LSDA, and noncollinear spinor periodic SCF | These modes plus many additional constraints and methods |
+| Pseudopotentials | Scalar- and fully-relativistic norm-conserving UPF subset, including separable nonlocal projectors and NLCC | Norm-conserving, ultrasoft, PAW, broader formats and features |
 | XC | PZ81, PW92, PBE, PBEsol, revPBE, RPBE | Broad LibXC/internal functional coverage, hybrids, meta-GGA, etc. |
 | Occupations | Fixed, major smearing schemes, linear/optimized tetrahedra | Broader occupation and constraint machinery |
-| Forces/stress | Implemented scalar norm-conserving analytic terms | Full production coverage for supported QE physics |
+| Forces/stress | Implemented scalar, LSDA, and spinor norm-conserving analytic terms | Full production coverage for supported QE physics |
 | Ionic/cell motion | Not implemented | Relaxation, MD, variable-cell dynamics |
-| Magnetism | Collinear LSDA and spin-GGA | PZ81/PW92 LSDA and PBE-family spin-GGA are implemented; noncollinear magnetism, spin–orbit coupling, and general magnetic constraints are absent |
+| Magnetism | Collinear LSDA/spin-GGA, noncollinear Pauli densities, spin–orbit coupling, and time-reversal symmetry | These paths plus general magnetic constraints and broader functionals |
 | Correlated methods | Not implemented | DFT+U, hybrids, exact exchange, and interfaces to further methods |
 | Electric/Berry/Wannier | Not implemented | Electric fields, polarization, Berry phase, Wannier interfaces |
 
@@ -57,7 +57,9 @@ condition is implemented. See [QE-compatible diagnostics](qe_diagnostics.md).
 
 The code reads norm-conserving UPF radial data, local potentials, nonlocal
 projectors, atomic starting orbitals/densities, functional metadata, and
-nonlinear core corrections used by the scalar path. It does not implement
+nonlinear core corrections. Fully relativistic files retain j-resolved
+projectors for spin–orbit runs or use QE's `average_pp` construction when
+`lspinorb=.false.`. It does not implement
 ultrasoft augmentation charges, generalized overlap matrices, or PAW onsite
 terms. A UPF that requires absent physics must not be expected to work merely
 because its XML can be parsed.

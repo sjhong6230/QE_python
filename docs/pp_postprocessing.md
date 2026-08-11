@@ -1,6 +1,6 @@
 # Scalar field post-processing
 
-`pp.py` implements the scalar, nonmagnetic, norm-conserving portion of Quantum
+`pp.py` implements scalar, LSDA, and noncollinear norm-conserving portions of Quantum
 ESPRESSO `pp.x`. It reads `<outdir>/<prefix>.save`, extracts a quantity onto
 the dense FFT grid, writes QE's formatted `filplot` intermediate file, and can
 then combine and render one or more intermediate files through `&PLOT`.
@@ -33,11 +33,14 @@ The following `plot_num` values are implemented:
 | 3 | energy-resolved local density of states |
 | 4 | electronic entropy density from QE's `w1gauss` kernel |
 | 5 | STM-like integrated density in the bias window |
+| 6 | LSDA magnetization density |
 | 7 | selected Kohn-Sham orbital density, optionally signed at Gamma |
 | 8 | electron localization function (ELF) |
 | 9 | self-consistent density minus the superposition of atomic densities |
 | 10 | integrated local density of states from `emin` to `emax` |
 | 11 | local ionic + Hartree potential, in Ry |
+| 13 | noncollinear magnetization magnitude or Cartesian component |
+| 18 | noncollinear exchange-correlation magnetic field magnitude or Cartesian component |
 | 19 | reduced density gradient |
 | 20 | `sign(lambda_2) rho`, using the middle density-Hessian eigenvalue |
 | 22 | positive kinetic-energy density |
@@ -73,10 +76,8 @@ including the `0.xxxxxE+yy` mantissa form.
 
 ## Explicit limitations
 
-Spin density and magnetization (`plot_num=6`, 13, and 18), PAW or ultrasoft
-all-electron reconstruction (17, 21, and 24), electric-field and polarization
+PAW or ultrasoft all-electron reconstruction (17, 21, and 24), electric-field and polarization
 paths (12 and 14--16), and DFT+U projectors (25) are rejected explicitly. The
-same applies to spin-polarized, noncollinear, spinor, ultrasoft, and PAW save
-directories. B-spline interpolation and the optional constant-current STM
+same applies to ultrasoft and PAW save directories. B-spline interpolation and the optional constant-current STM
 surface transform are not implemented; Fourier interpolation and ordinary STM
 density extraction remain available.

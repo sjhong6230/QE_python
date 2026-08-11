@@ -25,20 +25,20 @@ latency-sensitive inner work.
 | `pw/cli.py` | MPI-aware input distribution, QE-shaped progress/output, save dispatch, and exit status. |
 | `pw/input.py` | Namelist/card parser, lattice construction, k-point generation, symmetry setup, and input validation. |
 | `qe_input_schema.py` | QE 7.5 variable-name catalog used to distinguish unknown names from valid but unimplemented options. |
-| `upf.py` | UPF parsing, radial interpolation/transforms, local/nonlocal data, atomic orbitals/densities, and NLCC. |
+| `upf.py` | Scalar/fully-relativistic UPF parsing, radial transforms, j-resolved or averaged projectors, atomic orbitals/densities, and NLCC. |
 | `basis.py` | Global plane-wave catalogs, per-k bases, FFT grids, stick ownership, transpose descriptors, scratch pools, and local-potential/density FFT workspaces. |
 | `_native_fft.pyx` | Mandatory native kernels: FFTW plans, MPI transposes, sparse pack/unpack, Hψ, density accumulation, XC helpers, projector/BLAS bridges, and FFTW-MPI support. |
 | `mpi.py` | Communicators, reductions, slab helpers, reusable exchange buffers, shared-memory windows, and root gathers. |
 | `diagonalization.py` | Matrix-free Hamiltonian, Davidson, CG, ParO, RMM-DIIS, orthogonalization, and preconditioners. |
 | `mixing.py` | Distributed modified-Broyden/Anderson, TF/local-TF, collinear charge/magnetization mixing, history storage, and periodic Pulay. |
 | `occupations.py` | Scalar and spin-resolved fixed/smeared occupations, Fermi search, entropy correction, and tetrahedra. |
-| `xc.py` | LDA/LSDA and PBE-family physical formulas with memory-bounded point blocks. |
-| `symmetry.py`, `point_group.py` | Space-group/star mappings and component-wise density, force, and stress symmetrization. |
+| `xc.py`, `spinor.py` | LDA/LSDA, PBE-family formulas, Pauli-density rotations, and spinor algebra. |
+| `symmetry.py`, `point_group.py`, `double_group.py` | Magnetic/antiunitary space groups, stars, scalar point groups, SU(2) double groups, and tensor symmetrization. |
 | `ewald.py` | Ewald ion–ion energy, force, and stress. |
 | `pw/scf.py` | Top-level setup, SCF/fixed-potential loop, potentials, energies, derivatives, memory model, and result construction. |
 | `pw/save.py` | QE-shaped XML/HDF5 save and restart data. |
 | `pw/output.py` | QE-shaped human-readable setup, iteration, timing, energy, force, stress, and memory reports. |
-| `pp/bands.py` | `bands.x`-style eigenvalue extraction, overlap ordering, scalar little-group irrep classification, and `.rap`/`.gnu` output. |
+| `pp/bands.py` | `bands.x`-style eigenvalue extraction, spinor overlap ordering, scalar/double-group irrep classification, and `.rap`/`.gnu` output. |
 | `pp/plotband.py` | `plotband.x`-style path conversion and PostScript generation. |
 | `pp/dos.py` | `dos.x`-style Gaussian or tetrahedron total-DOS integration. |
 | `pp/projwfc.py` | `projwfc.x`-style Löwdin atomic-orbital projections, populations, and PDOS. |

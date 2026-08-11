@@ -18,8 +18,8 @@ e1(1)=1.0, 0.0, 0.0
 These three inputs are equivalent. This lexical behavior is shared by
 `pw.py` and all namelist-based post-processing executables.
 
-Only variables listed below affect the implemented scalar SCF, NSCF, and
-band-structure calculations.
+Only variables listed below affect the implemented scalar, collinear-LSDA,
+and noncollinear spinor SCF, NSCF, and band-structure calculations.
 Supplying a valid QE 7.5 variable outside this list produces an explicit
 not-implemented error; a misspelled or unknown variable produces a QE-style
 bad-namelist error.
@@ -128,9 +128,14 @@ that map that mesh onto itself.
 | `degauss` | real, `0`, Ry | Required and positive for smearing. It is silently reset to zero for fixed occupations, following QE 7.5 behavior. |
 | `smearing` | string, `'gaussian'` | Gaussian (`gaussian`, `gauss`, `0`), Methfessel–Paxton (`methfessel-paxton`, `m-p`, `mp`), Marzari–Vanderbilt cold (`marzari-vanderbilt`, `cold`, `m-v`, `mv`), or Fermi–Dirac (`fermi-dirac`, `f-d`, `fd`). |
 | `input_dft` | string, pseudo-dependent | Supported canonical families: `LDA`/`PZ`/`PZ81`, `PW`/`PW92`, `PBE`, `PBEsol`, `revPBE`, and `RPBE`. If absent, the UPF functional metadata is used. |
-| `nspin` | integer, `1` | `1` selects a spin-degenerate scalar calculation; `2` selects collinear LSDA. Noncollinear `nspin=4` is not implemented. |
+| `nspin` | integer, `1` | `1` selects a spin-degenerate scalar calculation; `2` selects collinear LSDA. `noncolin=.true.` selects the internal four-component Pauli-density representation (`nspin=4`). |
 | `starting_magnetization(i)` | real, `0` | Initial moment for atomic species `i`. Following QE, if any magnitude is at least one, all supplied values are interpreted in Bohr magnetons and divided by the corresponding valence charge; the resulting fractions are clipped to `[-1,1]`. |
 | `tot_magnetization` | real, `-10000` | `-10000` means unspecified. It must be supplied as an integer for `nspin=2, occupations='fixed'`, and is rejected for every other occupation/spin combination. |
+| `noncolin` | logical, `.false.` | Enable two-component spinor wavefunctions, charge plus Cartesian magnetization density, and unit-capacity bands. Fully relativistic norm-conserving UPFs are required. |
+| `lspinorb` | logical, `.false.` | Retain the UPF's j-resolved spin--orbit projectors. With `.false.`, QE's degeneracy-weighted `average_pp` operator is used. Requires `noncolin=.true.`. |
+| `angle1(i)`, `angle2(i)` | real, `0`, degrees | Polar and azimuthal directions of species `i` starting magnetization. |
+| `starting_spin_angle` | logical, `.false.` | Use j,m_j atomic starting spinors rather than magnetization-axis-paired averaged orbitals. |
+| `no_t_rev` | logical, `.false.` | Disable time-reversal and antiunitary k-point reduction. |
 
 Tetrahedron occupations require an automatic uniform k mesh. Fixed
 occupations are appropriate only when the supplied number of bands can hold
@@ -145,13 +150,13 @@ space-group operations never exchange collinear spin labels. Collinear spin
 functionals include PZ81/PW92 LSDA and the PBE, PBEsol, revPBE, and RPBE GGA
 families.
 
-### Accepted only to diagnose unsupported physics
+### Noncollinear spinors and magnetic symmetry
 
-`noncolin`, `lda_plus_u`, and `lspinorb` are parsed so that requests for
-noncollinearity, DFT+U, or spin–orbit coupling fail with a precise
-unsupported-feature error. The working spin settings are `nspin=1` and
-collinear `nspin=2`; both require `noncolin=.false.`, `lspinorb=.false.`, and
-no Hubbard correction.
+Noncollinear automatic meshes are not duplicated into up/down blocks. Magnetic
+space-group operations rotate magnetization as an axial vector. Operations
+that reverse every initial moment are retained antiunitarily unless
+`no_t_rev=.true.`. If all initial moments vanish, QE's `domag=.false.` and
+global time-reversal convention is used. DFT+U remains unsupported.
 
 ## `&ELECTRONS`
 
@@ -258,7 +263,7 @@ card cannot currently define working band occupations.
 
 The namelist syntax is recognized, but no variables are implemented because
 relaxation, molecular dynamics, and variable-cell dynamics are outside the
-scalar SCF scope. Any supplied variable is rejected explicitly.
+implemented electronic-structure scope. Any supplied variable is rejected explicitly.
 
 ## Error policy
 

@@ -1,6 +1,6 @@
 # Projected DOS and Löwdin populations
 
-`projwfc.py` implements the scalar, nonmagnetic, norm-conserving core of
+`projwfc.py` implements scalar, LSDA, and noncollinear norm-conserving paths of
 Quantum ESPRESSO's `projwfc.x`. It reconstructs the pseudo-atomic orbitals
 from each UPF `PP_CHI`, evaluates them in the saved plane-wave basis, and
 forms the Hermitian overlap matrix
@@ -21,6 +21,12 @@ representation matrix for each angular momentum before averaging. Thus
 directional components such as `px/py/pz` and the five d components obey the
 point-group constraints even when only irreducible k points were calculated.
 The transformation preserves the sum over atoms and m components.
+
+For `noncolin=.true., lspinorb=.true.`, the projection basis follows the UPF
+`PP_RELWFC` channels and is labelled by `j,m_j`; symmetry averaging uses the
+spin-j representation and includes Kramers partners when `domag=.false.`.
+For `lspinorb=.false.`, j partners are averaged with QE's `average_pp` weights
+and the basis transforms as `D^l tensor D^(1/2)` with explicit `s_z` labels.
 
 ```text
 &PROJWFC
@@ -58,9 +64,10 @@ block per k point, `filproj` records every state’s integrated box weights,
 and `plotboxes=.true.` writes `box#N.xsf` indicator grids.
 
 Supported broadening modes are Gaussian, first-order Methfessel–Paxton,
-Marzari–Vanderbilt cold smearing, and Fermi–Dirac. PAW, ultrasoft,
-spin-polarized/noncollinear projection, and projected tetrahedron integration
-are not yet ported.
+Marzari–Vanderbilt cold smearing, and Fermi–Dirac. PAW, ultrasoft, and
+projected tetrahedron integration are not yet ported. `diag_basis=.true.` is
+also unavailable for relativistic `j,m_j` projectors, matching QE's current
+noncollinear restriction.
 For tetrahedron-generated NSCF data, specify `degauss` to request the supported
 smearing path. Set `lsym=.false., kresolveddos=.true.` to retain unsymmetrized
 per-k-point orbital projections.

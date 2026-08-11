@@ -29,6 +29,13 @@ left unavailable instead of assigning a misleading label. With
 `lsym=.false., no_overlap=.false.`, adjacent bands are instead connected by a
 maximum-weight one-to-one assignment of wavefunction overlaps.
 
+For noncollinear wavefunctions, `bands.py` constructs the binary SU(2) cover
+of the unitary little group and decomposes degenerate spinor subspaces into
+QE/Koster double-valued irreps. QE's `.rap` ordering is retained; for example,
+the cubic `O_h` labels are `G_6+`, `G_7+`, `G_8+`, `G_6-`, `G_7-`, and `G_8-`.
+Antiunitary magnetic operations are reduced to their unitary invariant
+subgroup for this classification, as in QE's `find_band_sym_so` path.
+
 With `lp=.true.`, `bands.py` also writes QE's `&p_mat`/`filp` format. For the
 implemented scalar norm-conserving Hamiltonian, this is the squared
 conduction--valence matrix element of the velocity times electron mass,
@@ -47,8 +54,12 @@ One `filband.#` file per band is written with `kx_distance`, `ky_distance`,
 and energy in eV, matching QE's `punch_band_2d` convention. As in QE, this
 mode bypasses symmetry classification, overlap ordering, and `lp` output.
 
-The noncollinear `lsigma` and LSDA `spin_component` paths remain explicitly
-unsupported.
+LSDA `spin_component` selection and noncollinear `lsigma(1:3)` are supported.
+The latter write spin expectations `(S_x,S_y,S_z)` to `filband.1` through
+`.3`. QE 7.5 forcibly resets `lsigma(4)=.false.` after reading input; its
+dormant routine denotes `J_z=L_z+S_z`, not a fourth Pauli component. The
+spin-orbit nonlocal velocity correction needed by noncollinear `lp` remains
+explicitly unsupported.
 
 ## `plotband.py`
 

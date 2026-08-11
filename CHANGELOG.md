@@ -2,6 +2,25 @@
 
 All notable changes to this project are documented in this file.
 
+## Unreleased
+
+### Added
+
+- Noncollinear two-component spinor SCF/NSCF with four-component Pauli
+  densities and Kohn--Sham potentials, PZ81/PW92 LSDA, and PBE-family GGA.
+- Fully relativistic norm-conserving UPF parsing, explicit spin--orbit and
+  QE `average_pp` paths, directional starting magnetization, magnetic and
+  antiunitary symmetry, and `no_t_rev` handling.
+- Spinor restart, forces, stress, bands, DOS, relativistic projected DOS,
+  magnetization/Bxc post-processing, and QE-compatible double-group band
+  irreducible representations.
+
+### Fixed
+
+- Matched QE's fixed noncollinear GGA quantization-axis convention,
+  Clebsch--Gordan channel ordering, Kramers projection averaging, and
+  atom-resolved initial charge/wavefunction construction.
+
 ## [1.0.2] - 2026-08-11
 
 ### Added
