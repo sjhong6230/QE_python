@@ -13,12 +13,15 @@ from scipy.special import spherical_jn
 
 from qepy_pw.errors import QEInputError, UnsupportedFeatureError
 from qepy_pw.occupations import smearing_density, wgauss
+from qepy_pw.pp.namelist import parse_namelist
 from qepy_pw.pp.pp import (
     PlotGrid,
     _formatted_fortran_e,
     _fortran_e,
     _fourier_regular_values,
     _fourier_values,
+    _atomic_density,
+    _atomic_magnetization,
     _miller_and_g,
     _qe_local_dos_weights,
     _read_density,
@@ -470,6 +473,38 @@ def test_pp_lsda_charge_magnetization_and_spin_xc_potentials(lsda_saved_state) -
     assert np.all(np.isfinite(potential_up))
     assert np.all(np.isfinite(potential_down))
     assert not np.allclose(potential_up, potential_down)
+
+
+def test_pp_lsda_unindexed_namelist_spin_component_selects_up_density(
+    lsda_saved_state,
+) -> None:
+    options = parse_namelist(
+        "&INPUTPP plot_num=0, spin_component=1 /", "inputpp"
+    )
+
+    assert options["spin_component(1)"] == 1
+    selected = extract_plot_grids(lsda_saved_state, options)[0][1].values
+    np.testing.assert_allclose(selected, lsda_saved_state.spin_densities[0])
+
+
+def test_pp_lsda_density_difference_uses_starting_magnetization(
+    lsda_saved_state,
+) -> None:
+    state = replace(lsda_saved_state, starting_magnetizations=(0.5,))
+    total = extract_plot_grids(state, {"plot_num": 9})[0][1].values
+    up = extract_plot_grids(
+        state, {"plot_num": 9, "spin_component": 1}
+    )[0][1].values
+    down = extract_plot_grids(
+        state, {"plot_num": 9, "spin_component": 2}
+    )[0][1].values
+
+    np.testing.assert_allclose(up + down, total)
+    np.testing.assert_allclose(
+        up - down,
+        state.magnetization - _atomic_magnetization(state),
+    )
+    assert np.max(np.abs(_atomic_density(state))) > 0.0
 
 
 def test_pp_lsda_gga_potential_retains_spin_dependence(lsda_saved_state) -> None:

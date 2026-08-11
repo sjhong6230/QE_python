@@ -99,6 +99,7 @@ class SavedPPState:
     shape: tuple[int, int, int]
     atoms: tuple[PPAtom, ...]
     species: tuple[tuple[str, float], ...]
+    starting_magnetizations: tuple[float, ...]
     pseudos: dict[str, object]
     density: np.ndarray
     spin_densities: np.ndarray
@@ -359,6 +360,7 @@ def read_saved_pp(prefix: str = "pwscf", outdir: str | None = None) -> SavedPPSt
     }
     pseudos = {}
     species = []
+    starting_magnetizations = []
     for symbol, pseudo_name in pseudo_names.items():
         if not pseudo_name:
             raise QEInputError(f"saved species {symbol} has no pseudopotential", routine="postproc")
@@ -369,6 +371,14 @@ def read_saved_pp(prefix: str = "pwscf", outdir: str | None = None) -> SavedPPSt
             )
         pseudos[symbol] = pseudo
         species.append((symbol, float(pseudo.z_valence)))
+        species_entry = next(
+            entry
+            for entry in species_entries
+            if entry.attrib.get("name", "") == symbol
+        )
+        starting_magnetizations.append(
+            float(findtext(species_entry, "starting_magnetization", "0") or 0.0)
+        )
     species_index = {symbol: index + 1 for index, (symbol, _z) in enumerate(species)}
     atoms = []
     for entry in findall(root, "output/atomic_structure/atomic_positions/atom"):
@@ -449,6 +459,7 @@ def read_saved_pp(prefix: str = "pwscf", outdir: str | None = None) -> SavedPPSt
         shape=shape,
         atoms=tuple(atoms),
         species=tuple(species),
+        starting_magnetizations=tuple(starting_magnetizations),
         pseudos=pseudos,
         density=density,
         spin_densities=spin_densities,
@@ -479,18 +490,31 @@ def _inverse_coefficients(coefficients: np.ndarray) -> np.ndarray:
     return np.real(np.fft.ifftn(coefficients * coefficients.size))
 
 
-def _species_fourier_field(state: SavedPPState, method: str) -> np.ndarray:
+def _species_fourier_field(
+    state: SavedPPState,
+    method: str,
+    species_scales: tuple[float, ...] | None = None,
+) -> np.ndarray:
     _miller, g = _miller_and_g(state.shape, state.reciprocal)
     flat_g = g.reshape(-1, 3)
     q = np.linalg.norm(flat_g, axis=1)
     coefficients = np.zeros(len(flat_g), dtype=np.complex128)
-    for symbol, _z in state.species:
+    scales = (
+        (1.0,) * len(state.species)
+        if species_scales is None
+        else species_scales
+    )
+    if len(scales) != len(state.species):
+        raise QEInputError(
+            "saved species magnetizations are inconsistent", routine="postproc"
+        )
+    for (symbol, _z), scale in zip(state.species, scales):
         pseudo = state.pseudos[symbol]
         positions = np.vstack([atom.position for atom in state.atoms if atom.symbol == symbol])
         structure = np.sum(np.exp(-1j * (flat_g @ positions.T)), axis=1)
         radial = getattr(pseudo, method)(q, state.volume)
         radial[q * q > state.ecutrho_ry * (1.0 + 1.0e-12)] = 0.0
-        coefficients += radial * structure
+        coefficients += float(scale) * radial * structure
     return _inverse_coefficients(coefficients.reshape(state.shape))
 
 
@@ -500,6 +524,14 @@ def _ionic_potential(state: SavedPPState) -> np.ndarray:
 
 def _atomic_density(state: SavedPPState) -> np.ndarray:
     return _species_fourier_field(state, "atomic_density_fourier")
+
+
+def _atomic_magnetization(state: SavedPPState) -> np.ndarray:
+    return _species_fourier_field(
+        state,
+        "atomic_density_fourier",
+        state.starting_magnetizations,
+    )
 
 
 def _core_density(state: SavedPPState) -> np.ndarray:
@@ -828,7 +860,13 @@ def extract_plot_grids(state: SavedPPState, options: dict[str, object]) -> list[
     plot_num = int(options.get("plot_num", -1))
     if plot_num == -1:
         return []
-    spin_component = int(options.get("spin_component", 0))
+    # QE declares INPUTPP%spin_component as a length-three Fortran array.
+    # Consequently an ordinary ``spin_component = 1`` namelist assignment is
+    # parsed as its first element, just like ``spin_component(1) = 1``.
+    # All collinear PP paths consume that first element as a scalar selector.
+    spin_component = int(
+        options.get("spin_component", options.get("spin_component(1)", 0))
+    )
     if plot_num != 7 and spin_component not in {0, 1, 2}:
         raise QEInputError("wrong spin_component", routine="postproc")
     if any(int(options.get(f"nc({index})", 1)) != 1 for index in range(1, 4)):
@@ -864,7 +902,11 @@ def extract_plot_grids(state: SavedPPState, options: dict[str, object]) -> list[
         return [(filplot, _grid_from_state(state, title, plot_num, 2.0 * _ionic_potential(state)))]
     if plot_num == 9:
         density = _selected_density(state, spin_component)
-        atomic = _atomic_density(state) * (0.5 if spin_component else 1.0)
+        atomic = _atomic_density(state)
+        if spin_component:
+            atomic_magnetization = _atomic_magnetization(state)
+            sign = 1.0 if spin_component == 1 else -1.0
+            atomic = 0.5 * (atomic + sign * atomic_magnetization)
         return [(filplot, _grid_from_state(state, title, plot_num, density - atomic))]
     if plot_num == 6:
         if state.nspin != 2:
