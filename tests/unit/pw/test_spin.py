@@ -26,7 +26,7 @@ from qepy_pw.xc import (
 )
 from qepy_pw.scf import SCFResult, run_scf
 from qepy_pw.pw.output import format_footer
-from qepy_pw.pw.scf import _spinor_nonlocal_derivatives
+from qepy_pw.pw.scf import _spinor_nonlocal_derivatives, _xc_energy_potential
 from qepy_pw.pw.save import (
     read_saved_density,
     read_saved_wavefunction,
@@ -202,6 +202,19 @@ def test_lsda_default_band_count_uses_larger_spin_population() -> None:
     ) == 8
 
 
+def test_noncollinear_default_band_count_doubles_qe_scalar_count() -> None:
+    assert default_number_of_bands(
+        19.0,
+        "fixed",
+        nspin=4,
+    ) == 20
+    assert default_number_of_bands(
+        19.0,
+        "smearing",
+        nspin=4,
+    ) == 28
+
+
 @pytest.mark.parametrize(
     ("functional", "unpolarized"),
     [("pz", pz81_unpolarized), ("pw", pw92_lda_unpolarized)],
@@ -340,6 +353,42 @@ def test_spin_gga_reduces_to_unpolarized_gga(functional: str) -> None:
             rtol=2e-5,
             atol=2e-9,
         )
+
+
+def test_nonmagnetic_noncollinear_gga_uses_scalar_xc_driver(
+    monkeypatch,
+) -> None:
+    import qepy_pw.pw.scf as scf_module
+
+    density = np.zeros((4, 2, 2, 2))
+    density[0] = np.linspace(0.1, 0.8, 8).reshape(2, 2, 2)
+    expected_epsilon = 0.25 * density[0]
+    expected_potential = -0.5 * density[0]
+
+    def scalar_driver(values, *_args, **_kwargs):
+        np.testing.assert_array_equal(values, density[0])
+        return expected_epsilon, expected_potential, None
+
+    def spin_driver(*_args, **_kwargs):
+        raise AssertionError("domag=false must not call the spin GGA driver")
+
+    monkeypatch.setattr(
+        scf_module, "_gga_energy_potential_data", scalar_driver
+    )
+    monkeypatch.setattr(
+        scf_module, "_spin_gga_energy_potential_data", spin_driver
+    )
+    epsilon, potential = _xc_energy_potential(
+        density,
+        "pbe",
+        workspace=object(),
+        g_vectors=np.zeros((1, 3)),
+        noncollinear_domag=False,
+    )
+
+    np.testing.assert_array_equal(epsilon, expected_epsilon)
+    np.testing.assert_array_equal(potential[0], expected_potential)
+    np.testing.assert_array_equal(potential[1:], 0.0)
 
 
 @pytest.mark.parametrize("functional", ["pbe", "pbesol", "revpbe", "rpbe"])

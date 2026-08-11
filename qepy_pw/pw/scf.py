@@ -1328,9 +1328,28 @@ def _xc_energy_potential(
     need_epsilon: bool = True,
     energy_density_out: np.ndarray | None = None,
     noncollinear_gga_axis: np.ndarray | None = None,
+    noncollinear_domag: bool = True,
 ) -> tuple[np.ndarray | None, np.ndarray]:
     """Evaluate the selected XC functional on a rank-local FFT slab."""
     if density.ndim >= 4 and density.shape[0] == 4:
+        if not noncollinear_domag:
+            # QE v_of_rho treats nspin=4, domag=.false. as nspin0=1 for both
+            # the local and gradient-correction XC paths.  In particular,
+            # evaluating two equal spin channels is not numerically
+            # interchangeable with the scalar PBE driver at QE's density and
+            # gradient thresholds.  Embed the scalar result in the Pauli
+            # potential while keeping all magnetic components exactly zero.
+            epsilon, scalar_potential = _xc_energy_potential(
+                density[0],
+                functional,
+                workspace=workspace,
+                g_vectors=g_vectors,
+                need_epsilon=need_epsilon,
+                energy_density_out=energy_density_out,
+            )
+            potential = np.zeros_like(density)
+            potential[0] = scalar_potential
+            return epsilon, potential
         channels, direction = eigenchannel_densities(
             density,
             noncollinear_gga_axis if functional in GGA_FUNCTIONALS else None,
@@ -2133,6 +2152,7 @@ def _hellmann_feynman_stress(
     volume = pw.volume
     stress = np.zeros((3, 3))
     noncolin = density.ndim == 4 and density.shape[0] == 4
+    domag = bool(pw.system.get("_domag", False)) if noncolin else False
 
     # Kinetic term: fixed reduced-coordinate coefficients and k points imply
     # d(G+k)/d strain = -(G+k) strain.
@@ -2266,6 +2286,20 @@ def _hellmann_feynman_stress(
                 xc_functional,
                 need_stress=True,
             )
+        elif noncolin and not domag:
+            (
+                epsilon_xc,
+                scalar_potential,
+                gga_stress_tensor,
+            ) = _gga_energy_potential_data(
+                total_density[0],
+                charge_workspace,
+                g_vectors,
+                xc_functional,
+                need_stress=True,
+            )
+            potential_xc = np.zeros_like(total_density)
+            potential_xc[0] = scalar_potential
         elif noncolin:
             gga_axis = _fixed_noncollinear_gga_axis(
                 pw, _starting_magnetization_vectors(pw, pseudos)
@@ -2305,6 +2339,7 @@ def _hellmann_feynman_stress(
             xc_functional,
             workspace=charge_workspace,
             g_vectors=g_vectors,
+            noncollinear_domag=domag,
         )
         gga_stress_tensor = None
     grid_scale = volume / np.prod(shape)
@@ -3813,6 +3848,7 @@ def _run_scf(
                     g_vectors=local_charge_vectors,
                     need_epsilon=False,
                     noncollinear_gga_axis=noncollinear_gga_axis,
+                    noncollinear_domag=domag,
                 )
                 timers.stop("v_xc", xc_started)
                 assert vh is not None
@@ -4641,6 +4677,7 @@ def _run_scf(
                 workspace=charge_workspace,
                 g_vectors=local_charge_vectors,
                 noncollinear_gga_axis=noncollinear_gga_axis,
+                noncollinear_domag=domag,
             )
             assert epsilon_energy is not None
             exc = grid_scale * mpi.sum_scalar(
@@ -4879,6 +4916,7 @@ def _run_scf(
                     workspace=charge_workspace,
                     g_vectors=local_charge_vectors,
                     noncollinear_gga_axis=noncollinear_gga_axis,
+                    noncollinear_domag=domag,
                 )
                 del final_epsilon
                 local_force, core_force = _local_and_core_forces(

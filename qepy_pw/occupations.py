@@ -77,15 +77,6 @@ def default_number_of_bands(
     round-to-nearest behavior, including half-integer ties away from zero.
     """
     nelup, neldw = spin_electron_counts(nelec, tot_magnetization)
-    if nspin == 4:
-        filled = int(np.floor(nelec + 0.5))
-        metallic_modes = {
-            "smearing", "tetrahedra", "tetrahedra_lin", "tetrahedra-lin",
-            "tetrahedra_opt", "tetrahedra-opt",
-        }
-        if str(occupations).strip().lower() not in metallic_modes:
-            return filled
-        return max(filled + 4, int(np.floor(1.2 * nelec + 0.5)))
     filled = max(
         int(np.floor(0.5 * nelec + 0.5)),
         int(np.floor(nelup + 0.5)) if nspin == 2 else 0,
@@ -96,13 +87,19 @@ def default_number_of_bands(
         "tetrahedra_opt", "tetrahedra-opt",
     }
     if str(occupations).strip().lower() not in metallic_modes:
-        return filled
+        return 2 * filled if nspin == 4 else filled
     metallic = max(
         int(np.floor(1.2 * 0.5 * nelec + 0.5)),
         int(np.floor(1.2 * nelup + 0.5)) if nspin == 2 else 0,
         int(np.floor(1.2 * neldw + 0.5)) if nspin == 2 else 0,
     )
-    return max(filled + 4, metallic)
+    bands = max(filled + 4, metallic)
+    # QE setup.f90 first computes the scalar, twofold-degenerate band count
+    # with degspin=2 and only afterwards doubles it for noncollinear spinors,
+    # whose bands are not spin degenerate.  Applying the metallic margin to
+    # nelec spinor bands directly gives too few empty states (23 rather than
+    # QE's 28 for the 19-electron Au regression).
+    return 2 * bands if nspin == 4 else bands
 
 
 def fixed_occupations(
