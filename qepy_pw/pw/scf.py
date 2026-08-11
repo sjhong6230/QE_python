@@ -2105,6 +2105,30 @@ def _run_scf(
         raise QEInputError(str(pseudo_value))
     assert isinstance(pseudo_value, dict)
     pseudo_by_label = pseudo_value
+    noncolin = bool(pw.system.get("noncolin", False))
+    nonrelativistic = [
+        species.pseudo_file
+        for species in pw.species
+        if not pseudo_by_label[species.label].fully_relativistic
+    ]
+    if noncolin and nonrelativistic:
+        raise QEInputError(
+            "noncolin=.true. requires fully relativistic pseudopotentials; "
+            f"scalar-relativistic file: {nonrelativistic[0]}",
+            routine="setup",
+        )
+    if not noncolin:
+        fully_relativistic = [
+            species.pseudo_file
+            for species in pw.species
+            if pseudo_by_label[species.label].fully_relativistic
+        ]
+        if fully_relativistic:
+            raise QEInputError(
+                "fully relativistic pseudopotentials require noncolin=.true.; "
+                f"file: {fully_relativistic[0]}",
+                routine="setup",
+            )
     xc_functional = _resolve_xc_functional(pw, pseudo_by_label)
     pw.system["_resolved_xc"] = xc_functional
     nspin = int(pw.system.get("nspin", 1))

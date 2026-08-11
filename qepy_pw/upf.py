@@ -1,4 +1,4 @@
-"""UPF 2 reader for scalar norm-conserving pseudopotentials.
+"""UPF 2 reader for scalar and fully relativistic NC pseudopotentials.
 
 The reciprocal-space conventions follow QE's ``beta_mod`` and
 ``init_us_2``: beta radial functions include a factor of ``r`` in UPF,
@@ -36,6 +36,7 @@ class RadialProjector:
     angular_momentum: int
     beta: np.ndarray
     cutoff_index: int
+    total_angular_momentum: float | None = None
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,8 @@ class AtomicWavefunction:
     angular_momentum: int
     occupation: float
     chi: np.ndarray
+    total_angular_momentum: float | None = None
+    principal_quantum_number: int | None = None
 
 
 @dataclass
@@ -58,6 +61,8 @@ class LocalPotential:
     coulomb: bool
     generated: str = ""
     pseudo_type: str = "NC"
+    relativistic: str = "scalar"
+    has_spin_orbit: bool = False
     mesh_size: int = 0
     core_density: np.ndarray | None = None
     atomic_density: np.ndarray | None = None
@@ -94,6 +99,7 @@ class LocalPotential:
     _core_density_table_volume: float = field(
         default=-1.0, init=False, repr=False
     )
+
     _local_potential_table: np.ndarray | None = field(
         default=None, init=False, repr=False
     )
@@ -103,6 +109,11 @@ class LocalPotential:
     _local_potential_table_volume: float = field(
         default=-1.0, init=False, repr=False
     )
+
+    @property
+    def fully_relativistic(self) -> bool:
+        """Whether the UPF carries j-resolved, fully relativistic data."""
+        return self.has_spin_orbit or self.relativistic.lower() == "full"
 
     def _ensure_local_potential_table(
         self, maximum_q: float, volume: float
@@ -977,8 +988,8 @@ def read_upf(path: str | Path) -> LocalPotential:
     flag = lambda key: attrs.get(key, "F").upper().startswith("T")
     if flag("is_ultrasoft") or flag("is_paw"):
         raise UnsupportedFeatureError(f"{path.name}: ultrasoft and PAW potentials are not ported")
-    if flag("has_so") or attrs.get("relativistic", "scalar").lower() == "full":
-        raise UnsupportedFeatureError(f"{path.name}: fully relativistic projectors are not ported")
+    has_spin_orbit = flag("has_so")
+    relativistic = attrs.get("relativistic", "scalar").lower()
     nproj = int(float(attrs.get("number_of_proj", "0")))
     coulomb = flag("is_coulomb")
     r = _numbers(root.find(".//PP_R"))
@@ -1010,6 +1021,29 @@ def read_upf(path: str | Path) -> LocalPotential:
         raise QEInputError(
             f"{path.name}: PP_HEADER declares {nproj} projectors, found {len(beta_elements)}"
         )
+    spin_orbit = root.find(".//PP_SPIN_ORB")
+    relative_beta: dict[int, tuple[int, float]] = {}
+    relative_wavefunction: dict[int, tuple[int, int, float]] = {}
+    if spin_orbit is not None:
+        for element in spin_orbit:
+            tag = element.tag.upper()
+            index = int(element.attrib.get("index", "0"))
+            if tag.startswith("PP_RELBETA"):
+                relative_beta[index] = (
+                    int(element.attrib.get("lll", "-1")),
+                    float(element.attrib.get("jjj", "nan")),
+                )
+            elif tag.startswith("PP_RELWFC"):
+                relative_wavefunction[index] = (
+                    int(element.attrib.get("nn", "0")),
+                    int(element.attrib.get("lchi", "-1")),
+                    float(element.attrib.get("jchi", "nan")),
+                )
+    if has_spin_orbit and spin_orbit is None:
+        raise QEInputError(
+            f"{path.name}: PP_HEADER has_so is true but PP_SPIN_ORB is missing"
+        )
+
     projectors: list[RadialProjector] = []
     for position, element in enumerate(beta_elements, start=1):
         beta = _numbers(element)
@@ -1023,13 +1057,29 @@ def read_upf(path: str | Path) -> LocalPotential:
         cutoff = int(element.attrib.get("cutoff_radius_index", str(len(r))))
         if cutoff <= 1 or cutoff > len(r):
             cutoff = len(r)
+        projector_index = int(element.attrib.get("index", position))
+        total_angular_momentum = None
+        if has_spin_orbit:
+            try:
+                relative_l, total_angular_momentum = relative_beta[projector_index]
+            except KeyError as exc:
+                raise QEInputError(
+                    f"{path.name}: missing PP_RELBETA for projector {projector_index}"
+                ) from exc
+            if relative_l != angular_momentum or not np.isfinite(
+                total_angular_momentum
+            ):
+                raise QEInputError(
+                    f"{path.name}: inconsistent relativistic projector {projector_index}"
+                )
         projectors.append(
             RadialProjector(
-                int(element.attrib.get("index", position)),
+                projector_index,
                 element.attrib.get("label", f"beta-{position}"),
                 angular_momentum,
                 beta,
                 cutoff,
+                total_angular_momentum,
             )
         )
     chi_elements = [
@@ -1055,13 +1105,35 @@ def read_upf(path: str | Path) -> LocalPotential:
             raise QEInputError(
                 f"{path.name}: {element.tag} has no angular momentum"
             )
+        wavefunction_index = int(element.attrib.get("index", position))
+        total_angular_momentum = None
+        principal_quantum_number = None
+        if has_spin_orbit:
+            try:
+                (
+                    principal_quantum_number,
+                    relative_l,
+                    total_angular_momentum,
+                ) = relative_wavefunction[wavefunction_index]
+            except KeyError as exc:
+                raise QEInputError(
+                    f"{path.name}: missing PP_RELWFC for wavefunction {wavefunction_index}"
+                ) from exc
+            if relative_l != angular_momentum or not np.isfinite(
+                total_angular_momentum
+            ):
+                raise QEInputError(
+                    f"{path.name}: inconsistent relativistic wavefunction {wavefunction_index}"
+                )
         atomic_wavefunctions.append(
             AtomicWavefunction(
-                int(element.attrib.get("index", position)),
+                wavefunction_index,
                 element.attrib.get("label", f"chi-{position}"),
                 angular_momentum,
                 float(element.attrib.get("occupation", "0.0")),
                 chi,
+                total_angular_momentum,
+                principal_quantum_number,
             )
         )
     dij_values = _numbers(root.find(".//PP_DIJ"))
@@ -1085,6 +1157,8 @@ def read_upf(path: str | Path) -> LocalPotential:
         coulomb=coulomb,
         generated=attrs.get("generated", ""),
         pseudo_type=attrs.get("pseudo_type", "NC"),
+        relativistic=relativistic,
+        has_spin_orbit=has_spin_orbit,
         mesh_size=int(float(attrs.get("mesh_size", str(len(r))))),
         core_density=nlcc,
         atomic_density=rhoatom,

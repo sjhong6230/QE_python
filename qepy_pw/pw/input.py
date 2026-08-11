@@ -64,7 +64,8 @@ _IMPLEMENTED_NAMELIST_VARIABLES = {
         "nosym_evc", "noinv", "use_all_frac", "force_symmorphic",
         "starting_charge", "occupations", "degauss", "smearing", "input_dft",
         "starting_magnetization", "nspin", "noncolin", "lda_plus_u",
-        "lspinorb", "tot_charge", "tot_magnetization",
+        "lspinorb", "no_t_rev", "angle1", "angle2", "tot_charge",
+        "tot_magnetization",
         "space_group", "uniqueb", "origin_choice", "rhombohedral",
     },
     "electrons": {
@@ -1238,12 +1239,28 @@ def read_pw_input(source: str | Path | TextIO) -> PWInput:
     nspin = int(_input_number(system, "nspin", 1, int, "system"))
     if nspin not in {1, 2, 4}:
         raise QEInputError("nspin out of range", routine="iosys")
-    system["nspin"] = nspin
-    if nspin == 4 or system.get("noncolin", False):
-        raise UnsupportedFeatureError(
-            not_implemented("noncollinear calculations"),
+    noncolin = bool(system.get("noncolin", False))
+    lspinorb = bool(system.get("lspinorb", False))
+    if nspin == 2 and noncolin:
+        raise QEInputError(
+            "noncolin .and. nspin==2 are conflicting flags",
             routine="iosys",
         )
+    if nspin == 4:
+        noncolin = True
+    elif noncolin:
+        # QE promotes its public nspin=1 default to the four real density
+        # components (charge, mx, my, mz).  The wavefunctions themselves
+        # have two complex spinor components and k points are not duplicated.
+        nspin = 4
+    if lspinorb and not noncolin:
+        raise QEInputError(
+            "lspinorb requires noncolin=.true.", routine="iosys"
+        )
+    system["nspin"] = nspin
+    system["noncolin"] = noncolin
+    system["lspinorb"] = lspinorb
+    system["no_t_rev"] = bool(system.get("no_t_rev", False))
     tot_magnetization = float(
         _input_number(
             system, "tot_magnetization", -10000.0, float, "system"
@@ -1288,9 +1305,7 @@ def read_pw_input(source: str | Path | TextIO) -> PWInput:
         system, "nbnd", 0, int, "system"
     ) < 1:
         raise QEInputError("nbnd less than 1", routine="iosys")
-    forbidden = {
-        "lda_plus_u": "DFT+U", "lspinorb": "spin-orbit coupling",
-    }
+    forbidden = {"lda_plus_u": "DFT+U"}
     for key, feature in forbidden.items():
         value = system.get(key)
         normalized = value.lower() if isinstance(value, str) else value
@@ -1365,6 +1380,23 @@ def read_pw_input(source: str | Path | TextIO) -> PWInput:
                 routine="iosys",
             )
         system[key] = value
+        for angle_name in ("angle1", "angle2"):
+            angle_key = f"{angle_name}({index})"
+            angle = float(
+                _input_number(system, angle_key, 0.0, float, "system")
+            )
+            if not np.isfinite(angle):
+                raise QEInputError(
+                    f"{angle_key} must be finite", routine="iosys"
+                )
+            system[angle_key] = angle if noncolin else 0.0
+    system["_domag"] = bool(
+        noncolin
+        and any(
+            abs(float(system[f"starting_magnetization({index})"])) > 1.0e-6
+            for index in range(1, declared_ntyp + 1)
+        )
+    )
     pos_unit, rows = cards["ATOMIC_POSITIONS"]
     declared_nat = int(system.get("nat", len(rows)))
     if len(rows) != declared_nat:
@@ -1439,7 +1471,11 @@ def read_pw_input(source: str | Path | TextIO) -> PWInput:
     else:
         kpoint_grid = None
         kpoint_shift = None
-    no_time_reversal = bool(system.get("noinv", False))
+    no_time_reversal = (
+        bool(system.get("no_t_rev", False))
+        if noncolin
+        else bool(system.get("noinv", False))
+    )
     nosym_evc = bool(system.get("nosym_evc", False))
     if nosym_evc:
         # QE uses only the identity in the electronic SCF path, but completes

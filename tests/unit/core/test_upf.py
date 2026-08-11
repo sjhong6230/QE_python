@@ -32,6 +32,42 @@ def test_upf_reader_recovers_normalized_nc_metadata(
     assert np.all(np.diff(pseudo.r) > 0.0)
 
 
+def test_upf_reader_preserves_fully_relativistic_quantum_numbers(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "X.rel.UPF"
+    path.write_text(
+        """<UPF version="2.0.1">
+<PP_HEADER element="X" pseudo_type="NC" relativistic="full"
+ is_ultrasoft="F" is_paw="F" is_coulomb="F" has_so="T"
+ core_correction="F" functional="PBE" z_valence="1"
+ mesh_size="3" number_of_wfc="1" number_of_proj="1"/>
+<PP_MESH><PP_R>0.1 0.2 0.3</PP_R><PP_RAB>0.1 0.1 0.1</PP_RAB></PP_MESH>
+<PP_LOCAL>0.0 0.0 0.0</PP_LOCAL>
+<PP_NONLOCAL>
+ <PP_BETA.1 index="1" label="2P" angular_momentum="1"
+  cutoff_radius_index="3">0.0 0.1 0.0</PP_BETA.1>
+ <PP_DIJ>2.0</PP_DIJ>
+</PP_NONLOCAL>
+<PP_PSWFC><PP_CHI.1 index="1" label="2P" l="1" occupation="1">
+ 0.0 0.2 0.0</PP_CHI.1></PP_PSWFC>
+<PP_RHOATOM>0.0 0.1 0.0</PP_RHOATOM>
+<PP_SPIN_ORB>
+ <PP_RELWFC.1 index="1" nn="2" lchi="1" jchi="1.5"/>
+ <PP_RELBETA.1 index="1" lll="1" jjj="1.5"/>
+</PP_SPIN_ORB>
+</UPF>""",
+        encoding="utf-8",
+    )
+    pseudo = read_upf(path)
+    assert pseudo.fully_relativistic
+    assert pseudo.relativistic == "full"
+    assert pseudo.has_spin_orbit
+    assert pseudo.projectors[0].total_angular_momentum == pytest.approx(1.5)
+    assert pseudo.atomic_wavefunctions[0].total_angular_momentum == pytest.approx(1.5)
+    assert pseudo.atomic_wavefunctions[0].principal_quantum_number == 2
+
+
 def test_qe_simpson_integrates_quadratic_on_uniform_grid() -> None:
     x = np.arange(5, dtype=float)
     integral = _qe_simpson(x * x, np.ones(5))

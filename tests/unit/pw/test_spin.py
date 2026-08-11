@@ -76,6 +76,41 @@ def test_scalar_magnetization_defaults_are_explicit() -> None:
     assert pw.kpoint_spins == (1,)
 
 
+def test_noncollinear_input_promotes_density_components_without_k_duplication() -> None:
+    pw = _read(
+        "noncolin=.true., lspinorb=.true., no_t_rev=.true., "
+        "starting_magnetization(1)=0.4, angle1(1)=90, angle2(1)=35",
+        """K_POINTS crystal
+2
+0.0 0.0 0.0 0.25
+0.5 0.0 0.0 0.75""",
+    )
+    assert pw.system["nspin"] == 4
+    assert pw.system["noncolin"] is True
+    assert pw.system["lspinorb"] is True
+    assert pw.system["no_t_rev"] is True
+    assert pw.system["_domag"] is True
+    assert pw.system["angle1(1)"] == pytest.approx(90.0)
+    assert pw.system["angle2(1)"] == pytest.approx(35.0)
+    assert pw.spatial_kpoint_count == 2
+    assert pw.kpoint_spins == (1, 1)
+    assert len(pw.kpoints) == 2
+
+
+def test_zero_noncollinear_starting_magnetization_disables_domag() -> None:
+    pw = _read("nspin=4, angle1(1)=72, angle2(1)=-15")
+    assert pw.system["noncolin"] is True
+    assert pw.system["_domag"] is False
+    assert pw.system["starting_magnetization(1)"] == 0.0
+
+
+def test_noncollinear_input_rejects_conflicting_spin_flags() -> None:
+    with pytest.raises(QEInputError, match="conflicting flags"):
+        _read("nspin=2, noncolin=.true.")
+    with pytest.raises(QEInputError, match="lspinorb requires noncolin"):
+        _read("lspinorb=.true.")
+
+
 def test_fixed_lsda_requires_integer_total_magnetization() -> None:
     with pytest.raises(
         QEInputError, match="fixed occupations and lsda need tot_magnetization"
