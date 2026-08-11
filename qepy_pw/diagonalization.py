@@ -464,14 +464,43 @@ class SpinorPlaneWaveHamiltonian:
         spinor_vectors = np.reshape(
             vectors, (plane_waves, 2 * bands), order="F"
         )
-        wave_grid = self.local_workspace.coefficients_to_grid(
-            spinor_vectors
+        result = (
+            np.empty_like(vectors, order="F")
+            if out is None
+            else np.asarray(out).reshape(vectors.shape)
         )
-        scalar, x_field, y_field, z_field = self.real_potential
         if self.scalar_only:
-            local_grid = wave_grid
-            local_grid *= scalar[..., None]
+            # QE's nonmagnetic nspin=4 path applies the same scalar vloc to
+            # both spinor components.  Reuse the fused native scalar kernel:
+            # it performs inverse FFT, V(r), forward FFT, and T(G) in bounded
+            # batches instead of materializing the full 2*nband real grid.
+            spinor_result = (
+                np.reshape(
+                    result, (plane_waves, 2 * bands), order="F"
+                )
+                if result.flags.f_contiguous
+                else np.empty_like(spinor_vectors)
+            )
+            vloc_timer = (
+                self.timers.measure("vloc_psi")
+                if self.timers is not None
+                else nullcontext()
+            )
+            with vloc_timer:
+                self.local_workspace.apply(
+                    self.real_potential[0],
+                    spinor_vectors,
+                    out=spinor_result,
+                    diagonal=self.local_kinetic[:plane_waves],
+                )
+            if not result.flags.f_contiguous:
+                result[:plane_waves] = spinor_result[:, 0::2]
+                result[plane_waves:] = spinor_result[:, 1::2]
         else:
+            wave_grid = self.local_workspace.coefficients_to_grid(
+                spinor_vectors
+            )
+            scalar, x_field, y_field, z_field = self.real_potential
             up_grid, down_grid = wave_grid[..., 0::2], wave_grid[..., 1::2]
             local_grid = np.empty_like(wave_grid)
             local_grid[..., 0::2] = (
@@ -482,22 +511,17 @@ class SpinorPlaneWaveHamiltonian:
                 (x_field + 1j * y_field)[..., None] * up_grid
                 + (scalar - z_field)[..., None] * down_grid
             )
-        local_coefficients = self.local_workspace.grid_to_coefficients(
-            local_grid
-        )
-        result = (
-            np.empty_like(vectors, order="F")
-            if out is None
-            else np.asarray(out).reshape(vectors.shape)
-        )
-        if result.flags.f_contiguous:
-            np.reshape(
-                result, (plane_waves, 2 * bands), order="F"
-            )[...] = local_coefficients
-        else:
-            result[:plane_waves] = local_coefficients[:, 0::2]
-            result[plane_waves:] = local_coefficients[:, 1::2]
-        result += self.local_kinetic[:, None] * vectors
+            local_coefficients = self.local_workspace.grid_to_coefficients(
+                local_grid
+            )
+            if result.flags.f_contiguous:
+                np.reshape(
+                    result, (plane_waves, 2 * bands), order="F"
+                )[...] = local_coefficients
+            else:
+                result[:plane_waves] = local_coefficients[:, 0::2]
+                result[plane_waves:] = local_coefficients[:, 1::2]
+            result += self.local_kinetic[:, None] * vectors
         for term in self.projector_terms:
             if isinstance(term, (FactorizedProjectorTerm, PackedProjectorTerm)):
                 raise ValueError(

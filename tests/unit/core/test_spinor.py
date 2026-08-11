@@ -111,7 +111,9 @@ def test_spinor_plane_wave_hamiltonian_uses_doubled_qe_layout() -> None:
     assert operator.diagonal.shape == (4,)
 
 
-def test_spinor_hamiltonian_fortran_batch_view_preserves_qe_band_layout() -> None:
+def test_spinor_hamiltonian_fortran_batch_view_preserves_qe_band_layout(
+    monkeypatch,
+) -> None:
     indices = np.asarray([[0, 0, 0], [1, 0, 0]], dtype=np.int32)
     basis = PlaneWaveBasis(
         indices, indices.astype(float), np.asarray([0.0, 0.5])
@@ -139,6 +141,13 @@ def test_spinor_hamiltonian_fortran_batch_view_preserves_qe_band_layout() -> Non
     expected[[0, 2]] *= 1.25
     expected[[1, 3]] *= 1.75
     output = np.empty_like(coefficients, order="F")
+
+    def fail_if_unfused_fft_is_used(*_args, **_kwargs):
+        raise AssertionError("scalar spinors must use the fused vloc kernel")
+
+    monkeypatch.setattr(
+        workspace, "coefficients_to_grid", fail_if_unfused_fft_is_used
+    )
 
     operator.apply_into(coefficients, output)
 
