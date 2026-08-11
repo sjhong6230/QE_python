@@ -122,6 +122,10 @@ def smearing_dos(energies_ev, weights, grid_ev, width_ev, ngauss):
 def smearing_dos_channels(
     data: DOSData, grid_ev: np.ndarray, width_ev: float, ngauss: int
 ) -> np.ndarray:
+    if ngauss not in {0, 1, -1, -99}:
+        raise QEInputError("ngauss must be 0, 1, -1, or -99")
+    if width_ev <= 0:
+        raise QEInputError("smearing DOS requires positive degauss")
     labels = data.spin_labels
     degeneracy = 2.0 if data.nspin == 1 else 1.0
     channels = []

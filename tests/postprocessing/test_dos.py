@@ -55,6 +55,26 @@ def test_lsda_smearing_dos_preserves_up_and_down_state_counts() -> None:
     assert channels[1, np.argmin(abs(grid - 1.0))] > channels[0, -1]
 
 
+def test_spin_resolved_smearing_reuses_scalar_input_validation() -> None:
+    data = DOSData(
+        np.asarray([[0.0], [0.0]]),
+        np.asarray([1.0, 1.0]),
+        None,
+        "smearing",
+        "gaussian",
+        0.0,
+        None,
+        None,
+        None,
+        np.asarray([1, 2]),
+    )
+
+    with pytest.raises(QEInputError, match="positive degauss"):
+        smearing_dos_channels(data, np.asarray([0.0]), -0.1, 0)
+    with pytest.raises(QEInputError, match="ngauss"):
+        smearing_dos_channels(data, np.asarray([0.0]), 0.1, 2)
+
+
 def test_run_dos_reads_save_and_includes_energy_endpoint(tmp_path: Path, monkeypatch) -> None:
     save = tmp_path / "tmp" / "si.save"
     save.mkdir(parents=True)
