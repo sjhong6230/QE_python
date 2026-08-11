@@ -115,6 +115,27 @@ def test_lsda_pdos_writes_up_down_columns_and_spin_metadata(
     atomic_text = (save / "atomic_proj.xml").read_text(encoding="utf-8")
     assert 'spin="1"' in atomic_text and 'spin="2"' in atomic_text
 
+    run_projwfc(
+        {
+            "prefix": "iron",
+            "outdir": str(tmp_path),
+            "filpdos": "iron-k",
+            "degauss": 0.02,
+            "emin": -2.0,
+            "emax": 2.0,
+            "deltae": 1.0,
+            "lsym": False,
+            "kresolveddos": True,
+        }
+    )
+    kresolved = np.loadtxt(tmp_path / "iron-k.pdos_tot")
+    # QE joins the up/down blocks at each spatial k point instead of
+    # emitting one zero-padded record for every saved spin k point.
+    assert kresolved.shape == (5, 6)
+    np.testing.assert_array_equal(kresolved[:, 0], 1)
+    assert kresolved[1, 2] > kresolved[1, 3]
+    assert kresolved[3, 3] > kresolved[3, 2]
+
 
 def test_lsda_projection_summary_reports_lowdin_polarization() -> None:
     data = ProjectionData(

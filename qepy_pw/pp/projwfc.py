@@ -769,19 +769,23 @@ def run_projwfc(
     kresolved = bool(options.get("kresolveddos", False))
     if kresolved:
         if data.nspin == 2:
-            dos_by_k = np.zeros((len(grid), len(data.weights), 2))
-            projected_by_k = np.zeros(
-                (len(grid), len(data.weights), 2, len(data.orbitals))
-            )
             raw_dos = np.sum(kernel, axis=2)
             raw_projected = np.einsum(
                 "ekb,kbo->eko", kernel, data.projections
             )
-            for spin in (1, 2):
-                selected = data.spin_labels == spin
-                dos_by_k[:, selected, spin - 1] = raw_dos[:, selected]
-                projected_by_k[:, selected, spin - 1] = raw_projected[:, selected]
+            up = np.flatnonzero(data.spin_labels == 1)
+            down = np.flatnonzero(data.spin_labels == 2)
+            if len(up) != len(down):
+                raise QEInputError(
+                    "LSDA projection data contain unequal spin blocks"
+                )
+            spatial_nks = len(up)
+            dos_by_k = np.stack((raw_dos[:, up], raw_dos[:, down]), axis=2)
+            projected_by_k = np.stack(
+                (raw_projected[:, up], raw_projected[:, down]), axis=2
+            )
         else:
+            spatial_nks = len(data.weights)
             dos_by_k = np.sum(kernel, axis=2)
             projected_by_k = np.einsum(
                 "ekb,kbo->eko", kernel, data.projections
@@ -816,7 +820,7 @@ def run_projwfc(
                 if data.nspin == 2
                 else "# ik    E (eV)  dos(E)    pdos(E)\n"
             )
-            for ik in range(len(data.weights)):
+            for ik in range(spatial_nks):
                 values = (
                     np.column_stack(
                         (
@@ -880,7 +884,7 @@ def run_projwfc(
                     )
                     + "\n"
                 )
-                for ik in range(len(data.weights)):
+                for ik in range(spatial_nks):
                     if data.nspin == 2:
                         components_k = projected_by_k[:, ik, :, columns]
                         component_pairs = np.moveaxis(components_k, 1, 2).reshape(
