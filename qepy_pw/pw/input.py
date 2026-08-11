@@ -673,9 +673,9 @@ def _lattice(system: dict[str, Any], cards: dict[str, tuple[str, list[str]]]) ->
     if ibrav == 2:
         return alat * np.array([[-0.5, 0.0, 0.5], [0.0, 0.5, 0.5], [-0.5, 0.5, 0.0]]), alat
     if ibrav == 3:
-        return 0.5 * alat * np.array([[-1.0, 1.0, 1.0], [1.0, -1.0, 1.0], [1.0, 1.0, -1.0]]), alat
-    if ibrav == -3:
         return 0.5 * alat * np.array([[1.0, 1.0, 1.0], [-1.0, 1.0, 1.0], [-1.0, -1.0, 1.0]]), alat
+    if ibrav == -3:
+        return 0.5 * alat * np.array([[-1.0, 1.0, 1.0], [1.0, -1.0, 1.0], [1.0, 1.0, -1.0]]), alat
     b = _length("b", 2, 1.0)
     c = _length("c", 3, 1.0)
     if ibrav == 4:
