@@ -346,6 +346,19 @@ class LocalPotential:
             for projector in self.projectors
         )
 
+    @property
+    def number_of_averaged_projector_channels(self) -> int:
+        """Rank of QE's scalar ``average_pp`` projector basis."""
+        if not self.fully_relativistic:
+            return self.number_of_projector_channels
+        count = 0
+        index = 0
+        while index < len(self.projectors):
+            l_value = self.projectors[index].angular_momentum
+            count += 2 * l_value + 1
+            index += 1 if l_value == 0 else 2
+        return count
+
     def radial_projector_fourier_with_derivative(
         self, q: np.ndarray, volume: float
     ) -> tuple[np.ndarray, np.ndarray]:

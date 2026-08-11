@@ -1,4 +1,4 @@
-"""Scalar implementation of the Quantum ESPRESSO ``bands.x`` workflow."""
+"""Quantum ESPRESSO ``bands.x`` workflow for scalar and spinor states."""
 
 from __future__ import annotations
 
@@ -84,14 +84,22 @@ def _read_wavefunctions(
             with h5py.File(path, "r") as h5:
                 miller = np.asarray(h5["MillerIndices"][:], dtype=np.int32)
                 raw = np.asarray(h5["evc"][:])
+                npol = int(h5.attrs.get("npol", 1))
+                if npol not in {1, 2}:
+                    raise ValueError("invalid spinor dimension")
                 if np.issubdtype(raw.dtype, np.floating):
-                    if raw.ndim != 2 or raw.shape[1] != 2 * len(miller):
+                    if (
+                        raw.ndim != 2
+                        or raw.shape[1] != 2 * npol * len(miller)
+                    ):
                         raise ValueError("invalid interleaved QE evc dataset")
                     coefficients = (
                         raw[:, 0::2] + 1j * raw[:, 1::2]
                     ).astype(np.complex128, copy=False).T
                 else:
                     coefficients = np.asarray(raw, dtype=np.complex128).T
+                if coefficients.shape[0] != npol * len(miller):
+                    raise ValueError("invalid wavefunction row count")
         except (OSError, KeyError, ValueError) as exc:
             raise QEInputError(f"cannot read wavefunctions {path}: {exc}") from exc
         result.append((miller, coefficients))
@@ -109,13 +117,31 @@ def reorder_by_overlap(
         previous_miller, previous = ordered[-1]
         current_miller, current = wavefunctions[kpoint]
         previous_lookup = {tuple(row): i for i, row in enumerate(previous_miller)}
-        pairs = [
+        plane_wave_pairs = [
             (previous_lookup[tuple(row)], current_index)
             for current_index, row in enumerate(current_miller)
             if tuple(row) in previous_lookup
         ]
-        if not pairs:
+        if not plane_wave_pairs:
             raise QEInputError(f"adjacent k points {kpoint} and {kpoint + 1} share no plane waves")
+        previous_npol, remainder = divmod(len(previous), len(previous_miller))
+        current_npol, current_remainder = divmod(len(current), len(current_miller))
+        if (
+            remainder
+            or current_remainder
+            or previous_npol != current_npol
+            or previous_npol not in {1, 2}
+        ):
+            raise QEInputError("adjacent k points have inconsistent spinor dimensions")
+        pairs = []
+        for spin in range(previous_npol):
+            pairs.extend(
+                (
+                    left + spin * len(previous_miller),
+                    right + spin * len(current_miller),
+                )
+                for left, right in plane_wave_pairs
+            )
         left, right = np.asarray(pairs, dtype=int).T
         overlap = previous[left].conj().T @ current[right]
         rows, columns = linear_sum_assignment(-np.abs(overlap) ** 2)
@@ -125,6 +151,41 @@ def reorder_by_overlap(
         ordered.append((current_miller, current[:, permutation]))
     wavefunctions[:] = ordered
     return BandData(data.kpoints, energies, data.spins, data.noncolin)
+
+
+def spin_expectation_values(
+    wavefunctions: list[tuple[np.ndarray, np.ndarray]],
+) -> np.ndarray:
+    """Return ``<S_x>, <S_y>, <S_z>`` for normalized spinor bands.
+
+    QE's ``bands.x`` writes these quantities for ``lsigma(1:3)``.  Atomic
+    units use :math:`S=\\sigma/2`; norm-conserving wavefunctions need no
+    augmentation correction.
+    """
+    values = []
+    for index, (miller, coefficients) in enumerate(wavefunctions, start=1):
+        coefficients = np.asarray(coefficients, dtype=np.complex128)
+        npw = len(miller)
+        if coefficients.ndim != 2 or coefficients.shape[0] != 2 * npw:
+            raise QEInputError(
+                f"lsigma requires spinor wavefunctions at k point {index}"
+            )
+        up, down = coefficients[:npw], coefficients[npw:]
+        norm = np.sum(np.abs(up) ** 2 + np.abs(down) ** 2, axis=0)
+        if np.any(norm <= 1.0e-14):
+            raise QEInputError(f"zero-norm spinor at k point {index}")
+        cross = np.sum(up.conj() * down, axis=0)
+        values.append(np.vstack((
+            np.real(cross) / norm,
+            np.imag(cross) / norm,
+            0.5
+            * (
+                np.sum(np.abs(up) ** 2, axis=0)
+                - np.sum(np.abs(down) ** 2, axis=0)
+            )
+            / norm,
+        )))
+    return np.asarray(values)
 
 
 def _saved_structure(
@@ -160,7 +221,11 @@ def _saved_structure(
                 matrix = matrix.T
             saved_operations.append(
                 SymmetryOperation(
-                    matrix, translation
+                    matrix,
+                    translation,
+                    (findtext(entry, "time_reversal", "false") or "")
+                    .strip().lower()
+                    in {"true", ".true.", "t", "1"},
                 )
             )
     fractional = positions @ np.linalg.inv(lattice)
@@ -565,8 +630,9 @@ def run_bands(
     spin_component = int(options.get("spin_component", 1))
     if spin_component not in {1, 2}:
         raise QEInputError("spin_component must be 1 (up) or 2 (down)")
-    if any(bool(options.get(f"lsigma({i})", False)) for i in range(1, 5)):
-        raise UnsupportedFeatureError("spin-matrix post-processing is not implemented")
+    requested_sigma = tuple(
+        bool(options.get(f"lsigma({i})", False)) for i in range(1, 5)
+    )
     prefix = str(options.get("prefix", "pwscf"))
     outdir = str(options["outdir"]) if "outdir" in options else None
     directory = resolve_save_directory(prefix, outdir)
@@ -577,6 +643,13 @@ def run_bands(
             file=stdout,
         )
     saved_data = read_saved_bands(prefix, outdir)
+    if any(requested_sigma) and not saved_data.noncolin:
+        raise QEInputError("lsigma requires a noncollinear calculation")
+    if requested_sigma[3]:
+        raise UnsupportedFeatureError(
+            "lsigma(4) total J_z requires the real-space orbital-angular-"
+            "momentum operator and is not yet ported"
+        )
     if saved_data.nspin == 1 and spin_component != 1:
         raise QEInputError("spin_component requires an LSDA calculation")
     selected_indices = np.flatnonzero(saved_data.spins == spin_component)
@@ -589,7 +662,17 @@ def run_bands(
     wavefunctions = None
     lsym = bool(options.get("lsym", True))
     lp = bool(options.get("lp", False))
-    if lsym or lp or not bool(options.get("no_overlap", True)):
+    if lsym and saved_data.noncolin:
+        raise UnsupportedFeatureError(
+            "noncollinear lsym band labels require QE double-group irreps; "
+            "use lsym=.false. until that classifier is ported"
+        )
+    if lp and saved_data.noncolin:
+        raise UnsupportedFeatureError(
+            "noncollinear momentum matrices require spin-orbit nonlocal "
+            "velocity terms and are not yet ported"
+        )
+    if lsym or lp or any(requested_sigma) or not bool(options.get("no_overlap", True)):
         wavefunctions = _read_wavefunctions(
             directory, saved_data.nks, selected_indices
         )
@@ -605,6 +688,20 @@ def run_bands(
         )
     write_band_file(filband, plot_data)
     write_gnuplot(f"{filband}.gnu", plot_data)
+    if any(requested_sigma[:3]):
+        assert wavefunctions is not None
+        sigma = spin_expectation_values(wavefunctions)
+        for component, requested in enumerate(requested_sigma[:3], start=1):
+            if not requested:
+                continue
+            sigma_data = BandData(
+                plot_data.kpoints,
+                sigma[:, component - 1, :],
+                plot_data.spins,
+                noncolin=True,
+            )
+            write_band_file(f"{filband}.{component}", sigma_data)
+            write_gnuplot(f"{filband}.{component}.gnu", sigma_data)
     if stdout is not None:
         _report_plottable_bands(stdout, filband, plot_data)
         print(f"     Bands written to file {filband}", file=stdout)

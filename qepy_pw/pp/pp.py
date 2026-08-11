@@ -515,7 +515,11 @@ def read_saved_pp(prefix: str = "pwscf", outdir: str | None = None) -> SavedPPSt
         if upstream_qe_xml(root):
             rotation = rotation.T
             translation = -translation
-        operations.append(SymmetryOperation(rotation, translation))
+        operations.append(SymmetryOperation(
+            rotation,
+            translation,
+            _bool_text(findtext(entry, "time_reversal", "false")),
+        ))
     if not operations:
         operations.append(SymmetryOperation(np.eye(3, dtype=int), np.zeros(3)))
     density, spin_densities, magnetization_density = _read_density(directory, shape)

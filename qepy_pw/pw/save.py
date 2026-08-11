@@ -439,6 +439,7 @@ def _output_xml(root: ET.Element, pw: PWInput, result: SCFResult) -> None:
             " ".join(str(int(value)) for value in operation.matrix.ravel()),
         )
         _text(entry, "fractional_translation", _vector(operation.translation))
+        _text(entry, "time_reversal", operation.time_reversal)
     _text(symmetries, "time_reversal", not bool(pw.system.get("no_t_rev", False)))
     for index, (point, eigenvalues) in enumerate(
         zip(pw.kpoints, result.eigenvalues_ha)

@@ -227,6 +227,40 @@ def test_cubic_rotation_average_equalizes_p_components() -> None:
     assert np.sum(weights) == pytest.approx(np.sum(np.abs(amplitudes) ** 2))
 
 
+def test_soc_projection_symmetry_includes_kramers_partner_when_domag_false() -> None:
+    orbitals = (
+        Orbital(1, "X", 1, 0, 0, "1S", 0.5, -0.5),
+        Orbital(1, "X", 1, 0, 1, "1S", 0.5, 0.5),
+    )
+    amplitudes = np.asarray([[[1.0, 0.0]]], dtype=complex)
+    weights = symmetrize_projection_weights(
+        amplitudes,
+        orbitals,
+        np.eye(3),
+        (("X", np.zeros(3)),),
+        (SymmetryOperation(np.eye(3, dtype=int), np.zeros(3)),),
+        domag=False,
+    )
+    np.testing.assert_allclose(weights, [[[0.5, 0.5]]], atol=1.0e-14)
+
+
+def test_non_soc_spinor_projection_uses_orbital_times_spin_representation() -> None:
+    orbitals = tuple(
+        Orbital(1, "X", 1, 0, 0, "1S", spin_z=spin)
+        for spin in (0.5, -0.5)
+    )
+    amplitudes = np.asarray([[[1.0, 0.0]]], dtype=complex)
+    weights = symmetrize_projection_weights(
+        amplitudes,
+        orbitals,
+        np.eye(3),
+        (("X", np.zeros(3)),),
+        (SymmetryOperation(np.eye(3, dtype=int), np.zeros(3)),),
+        domag=False,
+    )
+    np.testing.assert_allclose(weights, [[[0.5, 0.5]]], atol=1.0e-14)
+
+
 def test_diag_basis_diagonalizes_occupation_block() -> None:
     orbitals = tuple(Orbital(1, "X", 1, 1, m, "2P") for m in range(3))
     amplitudes = np.asarray([[[1.0, 0.0, 0.0], [2**-0.5, 2**-0.5, 0.0]]], dtype=complex)

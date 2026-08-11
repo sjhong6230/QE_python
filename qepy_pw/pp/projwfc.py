@@ -1,4 +1,4 @@
-"""Scalar atomic-orbital projections corresponding to QE ``projwfc.x``."""
+"""Scalar and spinor atomic-orbital projections for QE ``projwfc.x``."""
 
 from __future__ import annotations
 
@@ -55,6 +55,7 @@ class Orbital:
     label: str
     j: float | None = None
     mj: float | None = None
+    spin_z: float | None = None
 
 
 @dataclass(frozen=True)
@@ -72,6 +73,7 @@ class ProjectionData:
     nkb: int = 0
     spins: np.ndarray | None = None
     noncolin: bool = False
+    spinorbit: bool = False
 
     @property
     def spin_labels(self) -> np.ndarray:
@@ -151,10 +153,57 @@ def _saved_geometry(directory: Path):
         translation = np.fromstring(entry.findtext("qes:fractional_translation", default="", namespaces=ns), sep=" ")
         if rotation.size != 9 or translation.shape != (3,):
             raise QEInputError("saved symmetry operation is malformed")
-        operations.append(SymmetryOperation(rotation.reshape(3, 3), translation))
+        time_reversal = (
+            entry.findtext(
+                "qes:time_reversal", default="false", namespaces=ns
+            )
+            or ""
+        ).strip().lower() in {"true", ".true.", "t", "1"}
+        operations.append(SymmetryOperation(
+            rotation.reshape(3, 3), translation, time_reversal
+        ))
     if not operations:
         operations.append(SymmetryOperation(np.eye(3, dtype=int), np.zeros(3)))
     return lattice, reciprocal, atoms, species_files, tuple(operations)
+
+
+def _saved_spin_metadata(directory: Path) -> tuple[bool, bool]:
+    """Return ``(spinorbit, domag)`` from QE/qepy saved input metadata."""
+    try:
+        root = ET.parse(directory / "data-file-schema.xml").getroot()
+    except (OSError, ET.ParseError) as exc:
+        raise QEInputError(f"cannot read saved spin metadata: {exc}") from exc
+    ns = {"qes": QES_NAMESPACE}
+    spinorbit_text = root.findtext(
+        "qes:output/qes:band_structure/qes:spinorbit",
+        default=root.findtext(
+            "qes:input/qes:spin/qes:spinorbit", default="false", namespaces=ns
+        ),
+        namespaces=ns,
+    )
+    spinorbit = (spinorbit_text or "").strip().lower() in {
+        "true", ".true.", "t", "1"
+    }
+    starting = [
+        float(value.text)
+        for value in root.findall(
+            "qes:output/qes:atomic_species/qes:species/"
+            "qes:starting_magnetization",
+            ns,
+        )
+        if (value.text or "").strip()
+    ]
+    if not starting:
+        starting = [
+            float(value.text)
+            for value in root.findall(
+                "qes:input/qes:atomic_species/qes:species/"
+                "qes:starting_magnetization",
+                ns,
+            )
+            if (value.text or "").strip()
+        ]
+    return spinorbit, any(abs(value) > 1.0e-6 for value in starting)
 
 
 def _saved_xc_notice(directory: Path) -> str | None:
@@ -188,6 +237,7 @@ def _orbital_basis(
     geometry=None,
     pseudo_cache: dict | None = None,
     spinor: bool = False,
+    spinorbit: bool = False,
 ):
     lattice, reciprocal, atoms, species_files, _operations = geometry or _saved_geometry(directory)
     volume = abs(float(np.linalg.det(lattice)))
@@ -204,10 +254,40 @@ def _orbital_basis(
             if pseudo.pseudo_type.upper() != "NC":
                 raise UnsupportedFeatureError("projwfc.py currently supports norm-conserving UPFs")
             cache[symbol] = pseudo
-        if spinor:
+        if spinor and spinorbit:
             block = pseudo.spinor_atomic_orbital_basis(gk, volume)
             phase = np.exp(-1j * (gk @ np.asarray(position)))
             block = block * np.concatenate((phase, phase))[:, None]
+        elif spinor:
+            scalar = pseudo.averaged_atomic_orbital_basis(gk, volume)
+            phase = np.exp(-1j * (gk @ np.asarray(position)))
+            scalar = scalar * phase[:, None]
+            component_blocks = []
+            offset = 0
+            for wavefunction in (
+                item
+                for item in pseudo.atomic_wavefunctions
+                if item.occupation >= 0.0
+                and (
+                    item.angular_momentum == 0
+                    or abs(
+                        float(item.total_angular_momentum)
+                        - item.angular_momentum
+                        - 0.5
+                    ) < 1.0e-7
+                )
+            ):
+                count = 2 * wavefunction.angular_momentum + 1
+                orbital_block = scalar[:, offset:offset + count]
+                zeros = np.zeros_like(orbital_block)
+                component_blocks.extend((
+                    np.vstack((orbital_block, zeros)),
+                    np.vstack((zeros, orbital_block)),
+                ))
+                offset += count
+            if offset != scalar.shape[1]:
+                raise QEInputError("averaged relativistic orbitals are inconsistent")
+            block = np.column_stack(component_blocks)
         else:
             block = pseudo.atomic_orbitals(gk, position, volume)
         blocks.append(block)
@@ -215,7 +295,7 @@ def _orbital_basis(
         for wfc_index, wavefunction in enumerate(
             (item for item in pseudo.atomic_wavefunctions if item.occupation >= 0.0), start=1
         ):
-            if spinor:
+            if spinor and spinorbit:
                 j = float(wavefunction.total_angular_momentum)
                 count = int(round(2.0 * j + 1.0))
                 for m in range(count):
@@ -229,6 +309,24 @@ def _orbital_basis(
                         j,
                         -j + m,
                     ))
+            elif spinor:
+                l_value = wavefunction.angular_momentum
+                j_value = float(wavefunction.total_angular_momentum)
+                if l_value > 0 and abs(j_value - l_value - 0.5) > 1.0e-7:
+                    continue
+                count = 2 * (2 * l_value + 1)
+                for spin_z in (0.5, -0.5):
+                    for m in range(2 * l_value + 1):
+                        descriptors.append(Orbital(
+                            atom_index,
+                            symbol,
+                            wfc_index,
+                            l_value,
+                            m,
+                            wavefunction.label,
+                            spin_z=spin_z,
+                        ))
+                column += count
             else:
                 for m in range(2 * wavefunction.angular_momentum + 1):
                     descriptors.append(Orbital(
@@ -240,7 +338,7 @@ def _orbital_basis(
                         wavefunction.label,
                     ))
                 column += 2 * wavefunction.angular_momentum + 1
-            if spinor:
+            if spinor and spinorbit:
                 column += count
         if column != block.shape[1]:
             raise QEInputError("UPF atomic-wavefunction metadata are inconsistent")
@@ -279,6 +377,95 @@ def _real_harmonic_rotation(l: int, cartesian_rotation: np.ndarray) -> np.ndarra
     return left @ right
 
 
+def _spin_rotation(
+    angular_momentum: float, cartesian_rotation: np.ndarray
+) -> np.ndarray:
+    """Return the spin-``j`` matrix for the axial part of a space rotation."""
+    from scipy.linalg import expm
+    from scipy.spatial.transform import Rotation
+
+    j_value = float(angular_momentum)
+    size = int(round(2.0 * j_value + 1.0))
+    m_values = -j_value + np.arange(size, dtype=float)
+    raising = np.zeros((size, size), dtype=np.complex128)
+    for column, m_value in enumerate(m_values[:-1]):
+        raising[column + 1, column] = np.sqrt(
+            (j_value - m_value) * (j_value + m_value + 1.0)
+        )
+    lowering = raising.conj().T
+    generators = (
+        0.5 * (raising + lowering),
+        (raising - lowering) / (2j),
+        np.diag(m_values),
+    )
+    rotation = np.asarray(cartesian_rotation, dtype=float)
+    axial = np.linalg.det(rotation) * rotation
+    # Fractional coordinates and harmonics use row vectors. scipy's Rotation
+    # uses active column-vector matrices, hence the transpose here.
+    rotation_vector = Rotation.from_matrix(axial.T).as_rotvec()
+    generator = sum(
+        component * matrix
+        for component, matrix in zip(rotation_vector, generators)
+    )
+    return expm(-1j * generator)
+
+
+def _time_reversal_matrix_j(j_value: float) -> np.ndarray:
+    size = int(round(2.0 * j_value + 1.0))
+    m_values = -j_value + np.arange(size, dtype=float)
+    matrix = np.zeros((size, size), dtype=np.complex128)
+    for source, m_value in enumerate(m_values):
+        target = size - 1 - source
+        matrix[target, source] = (-1.0) ** int(round(j_value - m_value))
+    return matrix
+
+
+def _spinor_orbital_transform(
+    orbitals: tuple[Orbital, ...],
+    atom_map: np.ndarray,
+    cartesian_rotation: np.ndarray,
+    *,
+    time_reversal: bool = False,
+) -> np.ndarray:
+    """Build the atomic spinor representation of one crystal symmetry."""
+    size = len(orbitals)
+    transform = np.zeros((size, size), dtype=np.complex128)
+    groups: dict[tuple[int, int, int, float | None], list[int]] = {}
+    for index, orbital in enumerate(orbitals):
+        groups.setdefault(
+            (orbital.atom, orbital.wfc, orbital.l, orbital.j), []
+        ).append(index)
+    for (atom, wfc, l_value, j_value), source_indices in groups.items():
+        target_atom = int(atom_map[atom - 1]) + 1
+        target_indices = groups.get((target_atom, wfc, l_value, j_value))
+        if target_indices is None or len(target_indices) != len(source_indices):
+            raise QEInputError("cannot map a spinor atomic-orbital block")
+        if j_value is not None:
+            source_indices = sorted(source_indices, key=lambda i: orbitals[i].mj)
+            target_indices = sorted(target_indices, key=lambda i: orbitals[i].mj)
+            local = _spin_rotation(j_value, cartesian_rotation)
+            if time_reversal:
+                local = local @ _time_reversal_matrix_j(j_value)
+        else:
+            source_indices = sorted(
+                source_indices,
+                key=lambda i: (-float(orbitals[i].spin_z), orbitals[i].m),
+            )
+            target_indices = sorted(
+                target_indices,
+                key=lambda i: (-float(orbitals[i].spin_z), orbitals[i].m),
+            )
+            orbital_rotation = _real_harmonic_rotation(
+                l_value, cartesian_rotation
+            ).T
+            spin_rotation = _spin_rotation(0.5, cartesian_rotation)
+            if time_reversal:
+                spin_rotation = spin_rotation @ _time_reversal_matrix_j(0.5)
+            local = np.kron(spin_rotation, orbital_rotation)
+        transform[np.ix_(target_indices, source_indices)] = local
+    return transform
+
+
 def _atom_mapping(atoms, operation: SymmetryOperation) -> np.ndarray:
     labels = [symbol for symbol, _position in atoms]
     fractional = np.vstack([position for _symbol, position in atoms])
@@ -307,10 +494,19 @@ def symmetrize_projection_weights(
     diag_basis: bool = False,
     kpoint_weights: np.ndarray | None = None,
     occupations: np.ndarray | None = None,
+    domag: bool = True,
 ) -> np.ndarray:
     """Rotate and average the full orbital projection density matrices."""
     values = np.asarray(amplitudes, dtype=np.complex128)
-    if len(operations) <= 1 and not diag_basis:
+    spinor_orbitals = any(
+        orbital.j is not None or orbital.spin_z is not None
+        for orbital in orbitals
+    )
+    if (
+        len(operations) <= 1
+        and not diag_basis
+        and (domag or not spinor_orbitals)
+    ):
         return np.abs(values) ** 2
     inverse_lattice = np.linalg.inv(lattice)
     fractional_atoms = tuple(
@@ -322,10 +518,29 @@ def symmetrize_projection_weights(
         (orbital.atom, orbital.wfc, orbital.l, orbital.m): index
         for index, orbital in enumerate(orbitals)
     }
-    transforms = []
+    transforms: list[tuple[np.ndarray, bool]] = []
     for operation in operations:
         cartesian = inverse_lattice @ operation.matrix @ lattice
         atom_map = _atom_mapping(fractional_atoms, operation)
+        if spinor_orbitals:
+            transform = _spinor_orbital_transform(
+                orbitals,
+                atom_map,
+                cartesian,
+                time_reversal=operation.time_reversal,
+            )
+            transforms.append((transform, operation.time_reversal))
+            if not domag and not operation.time_reversal:
+                transforms.append((
+                    _spinor_orbital_transform(
+                        orbitals,
+                        atom_map,
+                        cartesian,
+                        time_reversal=True,
+                    ),
+                    True,
+                ))
+            continue
         transform = np.zeros((len(orbitals), len(orbitals)), dtype=float)
         representations = {}
         for source, orbital in enumerate(orbitals):
@@ -337,14 +552,15 @@ def symmetrize_projection_weights(
             for target_m in range(2 * orbital.l + 1):
                 target = lookup[(target_atom, orbital.wfc, orbital.l, target_m)]
                 transform[target, source] = representation[orbital.m, target_m]
-        transforms.append(transform)
+        transforms.append((transform, False))
     rotations = None
     if diag_basis:
         if kpoint_weights is None or occupations is None:
             raise ValueError("diag_basis requires k-point weights and occupations")
         density = np.zeros((len(orbitals), len(orbitals)), dtype=np.complex128)
-        for transform in transforms:
-            rotated = np.einsum("...o,po->...p", values, transform)
+        for transform, antiunitary in transforms:
+            source = values.conj() if antiunitary else values
+            rotated = np.einsum("...o,po->...p", source, transform)
             density += np.einsum(
                 "k,kb,kbi,kbj->ij",
                 kpoint_weights,
@@ -359,14 +575,15 @@ def symmetrize_projection_weights(
                 0.5 * (block + block.conj().T)
             )
             rotations[(columns.start, columns.stop)] = eigenvectors
-    for transform in transforms:
-        rotated = np.einsum("...o,po->...p", values, transform)
+    for transform, antiunitary in transforms:
+        source = values.conj() if antiunitary else values
+        rotated = np.einsum("...o,po->...p", source, transform)
         if rotations is not None:
             for key, eigenvectors in rotations.items():
                 columns = slice(*key)
                 rotated[..., columns] = rotated[..., columns] @ eigenvectors
         averaged += np.abs(rotated) ** 2
-    return averaged / len(operations)
+    return averaged / len(transforms)
 
 
 def compute_projections(
@@ -397,6 +614,7 @@ def compute_projections(
     kpoints, plane_wave_counts = [], []
     orbitals = None
     geometry = _saved_geometry(directory)
+    spinorbit, domag = _saved_spin_metadata(directory)
     pseudo_cache = {}
     for index in range(1, len(saved.weights) + 1):
         path = directory / f"wfc{index}.hdf5"
@@ -427,6 +645,7 @@ def compute_projections(
             geometry,
             pseudo_cache,
             spinor=saved.noncolin,
+            spinorbit=spinorbit,
         )
         if orbitals is None:
             orbitals = current_orbitals
@@ -453,14 +672,12 @@ def compute_projections(
             "diag_basis for relativistic j,m_j projectors is not yet ported"
         )
     projections = (
-        np.abs(amplitudes_array) ** 2
-        if saved.noncolin
-        else
         symmetrize_projection_weights(
             amplitudes_array, orbitals, lattice, atoms, projection_operations,
             diag_basis=diag_basis,
             kpoint_weights=saved.weights,
             occupations=occupations,
+            domag=domag,
         )
         if symmetrize or diag_basis
         else np.abs(amplitudes_array) ** 2
@@ -468,6 +685,8 @@ def compute_projections(
     nkb = sum(
         (
             pseudo_cache[symbol].number_of_spinor_projector_channels
+            if saved.noncolin and spinorbit
+            else pseudo_cache[symbol].number_of_averaged_projector_channels
             if saved.noncolin
             else pseudo_cache[symbol].number_of_projector_channels
         )
@@ -487,6 +706,7 @@ def compute_projections(
         nkb,
         saved.spin_labels,
         saved.noncolin,
+        spinorbit,
     )
 
 
@@ -693,6 +913,8 @@ def _write_atomic_proj(path: Path, data: ProjectionData, include_overlaps: bool)
         )
         if orbital.j is not None and orbital.mj is not None:
             attributes.update(j=f"{orbital.j:.1f}", mj=f"{orbital.mj:.1f}")
+        if orbital.spin_z is not None:
+            attributes["spin_z"] = f"{orbital.spin_z:.1f}"
         ET.SubElement(states, "STATE", **attributes)
     for ik, (energies, projections) in enumerate(zip(data.energies_ev, data.projections), start=1):
         point = ET.SubElement(
@@ -1032,7 +1254,11 @@ def run_projwfc(
                 quantum_numbers = (
                     f"l={orbital.l} j={orbital.j:.1f} m_j={orbital.mj:.1f}"
                     if orbital.j is not None and orbital.mj is not None
-                    else f"l={orbital.l} m={orbital.m + 1}"
+                    else (
+                        f"l={orbital.l} m={orbital.m + 1} s_z={orbital.spin_z:.1f}"
+                        if orbital.spin_z is not None
+                        else f"l={orbital.l} m={orbital.m + 1}"
+                    )
                 )
                 stream.write(
                     f"state # {index}: atom {orbital.atom} ({orbital.symbol}), "
@@ -1101,7 +1327,11 @@ def _format_projection_summary(data: ProjectionData, *, diag_basis: bool = False
         quantum_numbers = (
             f"l={orbital.l:d} j={orbital.j:.1f} m_j={orbital.mj:.1f}"
             if orbital.j is not None and orbital.mj is not None
-            else f"l={orbital.l:d} m={orbital.m + 1:2d}"
+            else (
+                f"l={orbital.l:d} m={orbital.m + 1:2d} s_z={orbital.spin_z:.1f}"
+                if orbital.spin_z is not None
+                else f"l={orbital.l:d} m={orbital.m + 1:2d}"
+            )
         )
         lines.append(
             f"     state #{index:4d}: atom {orbital.atom:3d} ({orbital.symbol:<3}), "

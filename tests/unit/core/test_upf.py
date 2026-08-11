@@ -79,6 +79,7 @@ def test_upf_reader_preserves_fully_relativistic_quantum_numbers(
         np.asarray([[0.2, -0.1, 0.4], [0.0, 0.3, -0.2]]), 80.0
     )
     assert pseudo.number_of_spinor_atomic_orbitals == 4
+    assert pseudo.number_of_averaged_projector_channels == 3
     assert atomic.shape == (4, 4)
 
 

@@ -25,6 +25,7 @@ from qepy_pw.pp.bands import (
     main as bands_main,
     reorder_by_overlap,
     run_bands,
+    spin_expectation_values,
     write_band_grid_2d,
     write_irrep_file,
 )
@@ -72,6 +73,33 @@ def test_overlap_ordering_tracks_crossed_states() -> None:
     wavefunctions = [(miller, identity), (miller, identity[:, ::-1])]
     ordered = reorder_by_overlap(data, wavefunctions)
     np.testing.assert_allclose(ordered.energies_ev[1], [0.8, 0.2])
+
+
+def test_spinor_overlap_ordering_uses_both_spin_components() -> None:
+    data = BandData(
+        np.array([[0.0, 0.0, 0.0], [0.5, 0.0, 0.0]]),
+        np.array([[0.0, 1.0], [0.2, 0.8]]),
+        noncolin=True,
+    )
+    miller = np.array([[0, 0, 0]])
+    spinors = np.eye(2, dtype=complex)
+    wavefunctions = [(miller, spinors), (miller, spinors[:, ::-1])]
+    ordered = reorder_by_overlap(data, wavefunctions)
+    np.testing.assert_allclose(ordered.energies_ev[1], [0.8, 0.2])
+
+
+def test_spin_expectations_follow_pauli_spinor_convention() -> None:
+    miller = np.array([[0, 0, 0]])
+    coefficients = np.array([
+        [1.0, 1.0 / np.sqrt(2.0), 1.0 / np.sqrt(2.0)],
+        [0.0, 1.0 / np.sqrt(2.0), 1j / np.sqrt(2.0)],
+    ])
+    values = spin_expectation_values([(miller, coefficients)])
+    np.testing.assert_allclose(
+        values[0],
+        [[0.0, 0.5, 0.0], [0.0, 0.0, 0.5], [0.5, 0.0, 0.0]],
+        atol=1.0e-14,
+    )
 
 
 def test_no_overlap_true_preserves_eigenvalue_order_without_wavefunctions(
@@ -243,6 +271,20 @@ def test_upstream_qe_interleaved_wavefunction_dataset_is_read(tmp_path) -> None:
         )
     miller, coefficients = _read_wavefunctions(tmp_path, 1)[0]
     np.testing.assert_array_equal(miller, [[0, 0, 0], [1, 0, 0]])
+    np.testing.assert_array_equal(
+        coefficients,
+        [[1 + 2j, 5 + 6j], [3 + 4j, 7 + 8j]],
+    )
+
+
+def test_interleaved_spinor_wavefunction_dataset_is_read(tmp_path) -> None:
+    with h5py.File(tmp_path / "wfc1.hdf5", "w") as h5:
+        h5.attrs["npol"] = 2
+        h5.create_dataset("MillerIndices", data=np.array([[0, 0, 0]], np.int32))
+        h5.create_dataset(
+            "evc", data=np.array([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=float)
+        )
+    _miller, coefficients = _read_wavefunctions(tmp_path, 1)[0]
     np.testing.assert_array_equal(
         coefficients,
         [[1 + 2j, 5 + 6j], [3 + 4j, 7 + 8j]],
