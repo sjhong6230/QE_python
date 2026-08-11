@@ -1,7 +1,7 @@
 _# qepy-pw
 
-`qepy-pw` is a Python implementation of the scalar, nonmagnetic SCF, NSCF,
-and band-structure paths of Quantum ESPRESSO `pw.x`, together with the
+`qepy-pw` is a Python implementation of the scalar and collinear-LSDA SCF,
+NSCF, and band-structure paths of Quantum ESPRESSO `pw.x`, together with the
 `bands.x`, `plotband.x`, `dos.x`, scalar `projwfc.x`, and scalar norm-conserving
 `pp.x` post-processing workflows. It reads QE-style input
 files and norm-conserving UPF pseudopotentials and produces QE-shaped output.

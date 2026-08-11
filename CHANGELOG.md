@@ -2,6 +2,41 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.0.2] - 2026-08-11
+
+### Added
+
+- Collinear `nspin=2` SCF, NSCF, force, and stress paths with QE-ordered
+  spin-up/spin-down k-point blocks, spin-resolved occupations, and
+  charge/magnetization density mixing.
+- `starting_magnetization(i)` and `tot_magnetization` input handling, including
+  fixed-occupation validation and spin-polarized atomic density/Hamiltonian
+  initialization.
+- PZ81/PW92 LSDA and PBE-family spin-GGA exchange-correlation functionals.
+- QE-compatible `rhotot_g`/`rhodiff_g` density persistence, spin-tagged
+  wavefunctions, LSDA restart/NSCF support, and magnetization reporting.
+- Spin-resolved `bands.py`, `dos.py`, `projwfc.py`, and `pp.py` support,
+  including magnetization fields and k-resolved LSDA projected DOS.
+- Modular unit and integration coverage organized by numerical kernel, PW
+  runtime, and post-processing subsystem.
+
+### Changed
+
+- Reduced LSDA iteration cost by reusing reciprocal-space spin densities,
+  tiling exchange-correlation evaluation, and avoiding redundant occupation
+  work.
+- Added reproducible bcc Fe comparison workflows for bands, DOS, projected DOS,
+  and spin-resolved real-space fields.
+
+### Fixed
+
+- Corrected spin-density Broyden mixing, LSDA saved-density MPI restarts, and
+  spin-dependent LDA/GGA persistence and reporting.
+- Corrected QE-compatible k-resolved PDOS layout, PP spin-component selection,
+  atomic magnetization subtraction, and DOS comparison grids.
+- Matched QE's `ibrav=3` and `ibrav=-3` primitive-vector conventions, fixing
+  high-symmetry bcc band paths.
+
 ## [1.0.1] - 2026-08-10
 
 ### Added
@@ -50,5 +85,6 @@ All notable changes to this project are documented in this file.
 
 - Initial public release of the scalar, nonmagnetic plane-wave SCF implementation.
 
+[1.0.2]: https://github.com/sjhong6230/QE_python/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/sjhong6230/QE_python/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/sjhong6230/QE_python/releases/tag/v1.0.0

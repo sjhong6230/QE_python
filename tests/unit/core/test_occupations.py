@@ -7,6 +7,7 @@ from math import erf, erfc, exp, log, pi, sqrt
 import numpy as np
 import pytest
 
+import qepy_pw.occupations as occupations_module
 from qepy_pw.basis import _load_native_fft
 from qepy_pw.occupations import (
     _integrated_tetra_fraction,
@@ -156,6 +157,41 @@ def test_non_gaussian_fermi_weights_and_demet_are_consistent(order: int) -> None
         for weight, band in zip(weights, eigenvalues)
     )
     assert demet == pytest.approx(expected_demet, abs=2.0e-15)
+
+
+@pytest.mark.parametrize("order", [1, -1])
+def test_mp_and_cold_fermi_search_does_not_scan_a_dense_grid(
+    monkeypatch: pytest.MonkeyPatch, order: int
+) -> None:
+    """QE's local efermig refinement must stay O(iterations), not O(2001)."""
+    eigenvalues = [
+        np.linspace(-1.2 + 0.01 * ik, 1.5 + 0.01 * ik, 12)
+        for ik in range(432)
+    ]
+    weights = np.full(432, 1.0 / 216.0)
+    original = occupations_module.wgauss
+    calls = 0
+
+    def counted_wgauss(x: np.ndarray | float, ngauss: int) -> np.ndarray:
+        nonlocal calls
+        calls += 1
+        return original(x, ngauss)
+
+    monkeypatch.setattr(occupations_module, "wgauss", counted_wgauss)
+    _fermi, values, _demet = smeared_occupations(
+        eigenvalues,
+        weights,
+        nelec=12.0,
+        degauss_ha=0.005,
+        order=order,
+        spin_degeneracy=1.0,
+    )
+    electron_count = sum(
+        weight * float(np.sum(row))
+        for weight, row in zip(weights, values)
+    )
+    assert electron_count == pytest.approx(12.0, abs=1.0e-9)
+    assert calls < 100
 
 
 def test_vectorized_tetrahedron_moments_match_scalar_qe_path() -> None:

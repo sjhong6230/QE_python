@@ -112,4 +112,4 @@ jobs:
       - name: Run MPI tests
         run: |
           mpiexec --oversubscribe -n 4 \
-            python -m pytest -q tests/test_fft_parallel.py
+            python -m pytest -q tests/integration/test_fft_parallel.py

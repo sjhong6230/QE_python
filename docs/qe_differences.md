@@ -29,7 +29,7 @@ Fortran executable.
 | Occupations | Fixed, major smearing schemes, linear/optimized tetrahedra | Broader occupation and constraint machinery |
 | Forces/stress | Implemented scalar norm-conserving analytic terms | Full production coverage for supported QE physics |
 | Ionic/cell motion | Not implemented | Relaxation, MD, variable-cell dynamics |
-| Magnetism | Not implemented | LSDA, noncollinear, spin–orbit, constraints |
+| Magnetism | Collinear LSDA and spin-GGA | PZ81/PW92 LSDA and PBE-family spin-GGA are implemented; noncollinear magnetism, spin–orbit coupling, and general magnetic constraints are absent |
 | Correlated methods | Not implemented | DFT+U, hybrids, exact exchange, and interfaces to further methods |
 | Electric/Berry/Wannier | Not implemented | Electric fields, polarization, Berry phase, Wannier interfaces |
 

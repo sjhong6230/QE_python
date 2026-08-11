@@ -9,7 +9,13 @@ import pytest
 import qepy_pw.pp.dos as dos_module
 from qepy_pw.constants import EV_PER_HARTREE
 from qepy_pw.errors import QEInputError
-from qepy_pw.pp.dos import DOSData, run_dos, smearing_dos, tetrahedron_dos
+from qepy_pw.pp.dos import (
+    DOSData,
+    run_dos,
+    smearing_dos,
+    smearing_dos_channels,
+    tetrahedron_dos,
+)
 
 
 def test_gaussian_smearing_has_two_scalar_spin_states() -> None:
@@ -22,6 +28,51 @@ def test_gaussian_smearing_has_two_scalar_spin_states() -> None:
 def test_smearing_rejects_unsupported_ngauss() -> None:
     with pytest.raises(QEInputError, match="ngauss"):
         smearing_dos(np.asarray([[0.0]]), np.asarray([1.0]), np.asarray([0.0]), 0.1, 2)
+
+
+def test_lsda_smearing_dos_preserves_up_and_down_state_counts() -> None:
+    grid = np.linspace(-4.0, 4.0, 40001)
+    data = DOSData(
+        np.asarray([[-1.0], [1.0]]),
+        np.asarray([1.0, 1.0]),
+        0.0,
+        "smearing",
+        "gaussian",
+        0.01,
+        None,
+        None,
+        None,
+        np.asarray([1, 2]),
+    )
+
+    channels = smearing_dos_channels(data, grid, 0.2, 0)
+
+    assert channels.shape == (2, len(grid))
+    np.testing.assert_allclose(
+        np.trapezoid(channels, grid, axis=1), [1.0, 1.0], atol=2.0e-6
+    )
+    assert channels[0, np.argmin(abs(grid + 1.0))] > channels[1].max() * 0.99
+    assert channels[1, np.argmin(abs(grid - 1.0))] > channels[0, -1]
+
+
+def test_spin_resolved_smearing_reuses_scalar_input_validation() -> None:
+    data = DOSData(
+        np.asarray([[0.0], [0.0]]),
+        np.asarray([1.0, 1.0]),
+        None,
+        "smearing",
+        "gaussian",
+        0.0,
+        None,
+        None,
+        None,
+        np.asarray([1, 2]),
+    )
+
+    with pytest.raises(QEInputError, match="positive degauss"):
+        smearing_dos_channels(data, np.asarray([0.0]), -0.1, 0)
+    with pytest.raises(QEInputError, match="ngauss"):
+        smearing_dos_channels(data, np.asarray([0.0]), 0.1, 2)
 
 
 def test_run_dos_reads_save_and_includes_energy_endpoint(tmp_path: Path, monkeypatch) -> None:
@@ -72,6 +123,51 @@ def test_linear_tetrahedron_integrates_all_bands() -> None:
     density, integrated = tetrahedron_dos(data, energies, "tetrahedra_lin")
     assert density == pytest.approx([0.0, 0.0])
     assert integrated == pytest.approx([0.0, 4.0])
+
+
+def test_lsda_tetrahedron_uses_both_spin_blocks_without_degeneracy() -> None:
+    grid_shape = (2, 2, 2)
+    spatial_kpoints = int(np.prod(grid_shape))
+    eigenvalues = np.concatenate(
+        (
+            np.full((spatial_kpoints, 1), -1.0),
+            np.full((spatial_kpoints, 1), 1.0),
+        )
+    )
+    data = DOSData(
+        eigenvalues,
+        np.full(2 * spatial_kpoints, 1.0 / (2 * spatial_kpoints)),
+        None,
+        "tetrahedra",
+        "gaussian",
+        0.0,
+        grid_shape,
+        np.arange(spatial_kpoints, dtype=np.int32),
+        np.eye(3),
+    )
+
+    _density, integrated = tetrahedron_dos(
+        data, np.asarray([-2.0, 0.0, 2.0]), "tetrahedra_lin"
+    )
+
+    assert integrated == pytest.approx([0.0, 1.0, 2.0])
+
+
+def test_tetrahedron_rejects_eigenvalues_inconsistent_with_mapping() -> None:
+    data = DOSData(
+        np.zeros((3, 1)),
+        np.full(3, 1.0 / 3.0),
+        None,
+        "tetrahedra",
+        "gaussian",
+        0.0,
+        (2, 2, 2),
+        np.arange(8, dtype=np.int32),
+        np.eye(3),
+    )
+
+    with pytest.raises(QEInputError, match="inconsistent"):
+        tetrahedron_dos(data, np.asarray([0.0]), "tetrahedra")
 
 
 def test_dos_main_uses_qe_environment_output(

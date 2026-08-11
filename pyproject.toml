@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qepy-pw"
-version = "1.0.1"
+version = "1.0.2"
 description = "A small, readable Python port of the scalar SCF path in Quantum ESPRESSO pw.x"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -90,12 +90,26 @@ def _atomic_species(parent: ET.Element, pw: PWInput) -> None:
         _qes("atomic_species"),
         {"ntyp": str(len(pw.species)), "pseudo_dir": str(pw.pseudo_dir)},
     )
-    for species in pw.species:
+    starting_magnetizations = [
+        float(pw.system.get(f"starting_magnetization({index})", 0.0))
+        for index in range(1, len(pw.species) + 1)
+    ]
+    writes_magnetization = (
+        int(pw.system.get("nspin", 1)) == 2
+        and any(value != 0.0 for value in starting_magnetizations)
+    )
+    for species_index, species in enumerate(pw.species):
         entry = ET.SubElement(
             species_element, _qes("species"), {"name": species.label}
         )
         _text(entry, "mass", species.mass)
         _text(entry, "pseudo_file", Path(species.pseudo_file).name)
+        if writes_magnetization:
+            _text(
+                entry,
+                "starting_magnetization",
+                starting_magnetizations[species_index],
+            )
 
 
 def _atomic_structure(parent: ET.Element, pw: PWInput) -> None:
@@ -165,7 +179,8 @@ def _input_xml(root: ET.Element, pw: PWInput, result: SCFResult) -> None:
     _atomic_structure(input_element, pw)
     _dft(input_element, pw)
     spin = ET.SubElement(input_element, _qes("spin"))
-    _text(spin, "lsda", False)
+    lsda = int(pw.system.get("nspin", 1)) == 2
+    _text(spin, "lsda", lsda)
     _text(spin, "noncolin", False)
     _text(spin, "spinorbit", False)
 
@@ -174,6 +189,11 @@ def _input_xml(root: ET.Element, pw: PWInput, result: SCFResult) -> None:
     _text(bands, "tot_charge", float(pw.system.get("tot_charge", 0.0)))
     occupations = str(pw.system.get("occupations", "fixed"))
     _text(bands, "occupations", occupations)
+    tot_magnetization = float(
+        pw.system.get("tot_magnetization", -10000.0)
+    )
+    if tot_magnetization > -9999.0:
+        _text(bands, "tot_magnetization", tot_magnetization)
     if occupations.strip().lower() == "smearing":
         smearing = _text(bands, "smearing", pw.system.get("smearing", "gaussian"))
         smearing.set("degauss", f"{0.5 * float(pw.system.get('degauss', 0.0)):.16e}")
@@ -189,11 +209,12 @@ def _input_xml(root: ET.Element, pw: PWInput, result: SCFResult) -> None:
         "ecutrho",
         0.5 * float(pw.system.get("ecutrho", 4.0 * pw.system["ecutwfc"])),
     )
-    if np.ndim(result.density) == 3:
+    if np.ndim(result.density) in {3, 4}:
+        density_shape = np.asarray(result.density).shape[-3:]
         ET.SubElement(
             basis,
             _qes("fft_grid"),
-            dict(zip(("nr1", "nr2", "nr3"), map(str, result.density.shape))),
+            dict(zip(("nr1", "nr2", "nr3"), map(str, density_shape))),
         )
 
     electrons = ET.SubElement(input_element, _qes("electron_control"))
@@ -256,12 +277,30 @@ def _electron_count(pw: PWInput, result: SCFResult) -> float:
     return 0.0
 
 
-def _charge_data(pw: PWInput, result: SCFResult) -> tuple[np.ndarray, np.ndarray]:
+def _charge_data(
+    pw: PWInput, result: SCFResult
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     density = np.asarray(result.density, dtype=np.float64)
-    if density.ndim != 3:
-        raise QEInputError("the gathered SCF density is not a three-dimensional grid")
-    rho_g_grid = np.fft.fftn(density) / density.size
-    axes = [np.rint(np.fft.fftfreq(n) * n).astype(np.int32) for n in density.shape]
+    if density.ndim == 3:
+        total_density = density
+        difference_density = None
+    elif density.ndim == 4 and density.shape[0] == 2:
+        total_density = density[0] + density[1]
+        difference_density = density[0] - density[1]
+    else:
+        raise QEInputError(
+            "the gathered SCF density is not a scalar or collinear-spin grid"
+        )
+    rho_g_grid = np.fft.fftn(total_density) / total_density.size
+    difference_g_grid = (
+        None
+        if difference_density is None
+        else np.fft.fftn(difference_density) / difference_density.size
+    )
+    axes = [
+        np.rint(np.fft.fftfreq(n) * n).astype(np.int32)
+        for n in total_density.shape
+    ]
     miller_grid = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1)
     cartesian_g = miller_grid @ pw.reciprocal
     ecutrho_ry = float(pw.system.get("ecutrho", 4.0 * pw.system["ecutwfc"]))
@@ -276,7 +315,11 @@ def _charge_data(pw: PWInput, result: SCFResult) -> tuple[np.ndarray, np.ndarray
             (gz == 0) & (gy == 0) & (gx >= 0)
         )
         cutoff_mask &= gamma_half
-    return miller_grid[cutoff_mask], rho_g_grid[cutoff_mask]
+    return (
+        miller_grid[cutoff_mask],
+        rho_g_grid[cutoff_mask],
+        None if difference_g_grid is None else difference_g_grid[cutoff_mask],
+    )
 
 
 def _output_xml(root: ET.Element, pw: PWInput, result: SCFResult) -> None:
@@ -308,13 +351,13 @@ def _output_xml(root: ET.Element, pw: PWInput, result: SCFResult) -> None:
         "ecutrho",
         0.5 * float(pw.system.get("ecutrho", 4.0 * pw.system["ecutwfc"])),
     )
-    shape = np.asarray(result.density).shape
+    shape = np.asarray(result.density).shape[-3:]
     ET.SubElement(
         basis,
         _qes("fft_grid"),
         dict(zip(("nr1", "nr2", "nr3"), map(str, shape))),
     )
-    miller, _ = _charge_data(pw, result)
+    miller, _, _ = _charge_data(pw, result)
     _text(basis, "ngm", len(miller))
     _text(basis, "npwx", max(result.plane_waves_per_k, default=0))
     reciprocal = ET.SubElement(basis, _qes("reciprocal_lattice"))
@@ -333,7 +376,8 @@ def _output_xml(root: ET.Element, pw: PWInput, result: SCFResult) -> None:
         _text(energy, "demet", terms.smearing_ha)
 
     bands = ET.SubElement(output, _qes("band_structure"))
-    _text(bands, "lsda", False)
+    lsda = int(pw.system.get("nspin", 1)) == 2
+    _text(bands, "lsda", lsda)
     _text(bands, "noncolin", False)
     _text(bands, "spinorbit", False)
     _text(bands, "nbnd", max((len(v) for v in result.eigenvalues_ha), default=0))
@@ -605,22 +649,45 @@ def read_saved_density(
             coefficients = np.asarray(h5["rhotot_g"][:], dtype=np.complex128)
             gamma_only = _attribute_bool(h5.attrs.get("gamma_only", False))
             nspin = int(h5.attrs.get("nspin", 1))
+            difference = (
+                np.asarray(h5["rhodiff_g"][:], dtype=np.complex128)
+                if nspin == 2
+                else None
+            )
     except (OSError, KeyError, ValueError) as exc:
         raise QEInputError(f"cannot read saved charge density {path}: {exc}") from exc
-    if nspin != 1 or miller.shape != (len(coefficients), 3):
+    expected_nspin = int(pw.system.get("nspin", 1))
+    if (
+        nspin != expected_nspin
+        or nspin not in {1, 2}
+        or miller.shape != (len(coefficients), 3)
+        or (difference is not None and difference.shape != coefficients.shape)
+    ):
         raise QEInputError("saved charge density has an unsupported layout")
     if len({tuple(row % np.asarray(shape)) for row in miller}) != len(miller):
         raise QEInputError("saved charge density contains aliased Miller indices")
-    grid = np.zeros(shape, dtype=np.complex128)
     slots = tuple((miller % np.asarray(shape)).T)
-    grid[slots] = coefficients
-    if gamma_only:
-        negative = tuple(((-miller) % np.asarray(shape)).T)
-        empty = np.abs(grid[negative]) == 0.0
-        negative_slots = tuple(axis[empty] for axis in negative)
-        grid[negative_slots] = np.conjugate(coefficients[empty])
-    density = np.real(np.fft.ifftn(grid * np.prod(shape)))
-    charge = float(np.sum(density) * pw.volume / np.prod(shape))
+    negative = tuple(((-miller) % np.asarray(shape)).T)
+
+    def transform(values: np.ndarray) -> np.ndarray:
+        grid = np.zeros(shape, dtype=np.complex128)
+        grid[slots] = values
+        if gamma_only:
+            empty = np.abs(grid[negative]) == 0.0
+            negative_slots = tuple(axis[empty] for axis in negative)
+            grid[negative_slots] = np.conjugate(values[empty])
+        return np.real(np.fft.ifftn(grid * np.prod(shape)))
+
+    total_density = transform(coefficients)
+    if difference is None:
+        density = total_density
+    else:
+        difference_density = transform(difference)
+        density = np.stack((
+            0.5 * (total_density + difference_density),
+            0.5 * (total_density - difference_density),
+        ))
+    charge = float(np.sum(total_density) * pw.volume / np.prod(shape))
     if not np.isfinite(charge) or abs(charge - expected_electrons) > 1.0e-7 * max(1.0, expected_electrons):
         raise QEInputError(
             f"saved density contains {charge:.12g} electrons; expected {expected_electrons:.12g}"
@@ -649,9 +716,20 @@ def read_saved_density_coefficients(
                 h5.attrs.get("gamma_only", False)
             )
             nspin = int(h5.attrs.get("nspin", 1))
+            difference = (
+                np.asarray(h5["rhodiff_g"][:], dtype=np.complex128)
+                if nspin == 2
+                else None
+            )
     except (OSError, KeyError, ValueError) as exc:
         raise QEInputError(f"cannot read saved charge density {path}: {exc}") from exc
-    if nspin != 1 or saved_miller.shape != (len(coefficients), 3):
+    expected_nspin = int(pw.system.get("nspin", 1))
+    if (
+        nspin != expected_nspin
+        or nspin not in {1, 2}
+        or saved_miller.shape != (len(coefficients), 3)
+        or (difference is not None and difference.shape != coefficients.shape)
+    ):
         raise QEInputError("saved charge density has an unsupported layout")
 
     requested = np.ascontiguousarray(current_miller, dtype=np.int32).copy()
@@ -664,8 +742,19 @@ def read_saved_density_coefficients(
         conjugate = ~stored_half
         requested[conjugate] *= -1
     order = _miller_row_indices(saved_miller, requested)
-    result = coefficients[order]
-    result[conjugate] = np.conjugate(result[conjugate])
+    total_result = coefficients[order]
+    total_result[conjugate] = np.conjugate(total_result[conjugate])
+    if difference is None:
+        result = total_result
+    else:
+        difference_result = difference[order]
+        difference_result[conjugate] = np.conjugate(
+            difference_result[conjugate]
+        )
+        result = np.stack((
+            0.5 * (total_result + difference_result),
+            0.5 * (total_result - difference_result),
+        ))
     if not np.all(np.isfinite(result)):
         raise QEInputError(f"saved charge density {path} contains non-finite values")
     return result
@@ -694,7 +783,8 @@ def read_saved_wavefunction(
                 saved_xk, expected_xk, rtol=1.0e-10, atol=1.0e-10
             ):
                 raise QEInputError(f"saved wavefunction k vector is wrong in {path}")
-            if int(h5.attrs.get("ispin", -1)) != 1 or int(h5.attrs.get("npol", -1)) != 1:
+            expected_spin = int(pw.kpoint_spins[kpoint_index])
+            if int(h5.attrs.get("ispin", -1)) != expected_spin or int(h5.attrs.get("npol", -1)) != 1:
                 raise QEInputError("only scalar saved wavefunctions are supported")
             if int(h5.attrs.get("nbnd", -1)) != number_of_bands:
                 raise QEInputError(
@@ -736,17 +826,19 @@ def read_saved_wavefunction(
 
 def _write_charge_density(path: Path, pw: PWInput, result: SCFResult) -> None:
     h5py = _hdf5_module()
-    miller, rho_g = _charge_data(pw, result)
+    miller, rho_g, rho_difference_g = _charge_data(pw, result)
     with h5py.File(path, "w") as h5:
         h5.attrs["gamma_only"] = (
             ".TRUE." if pw.kpoint_mode == "gamma" else ".FALSE."
         )
         h5.attrs["ngm_g"] = len(miller)
-        h5.attrs["nspin"] = 1
+        h5.attrs["nspin"] = int(pw.system.get("nspin", 1))
         miller_dataset = h5.create_dataset("MillerIndices", data=miller)
         for index, vector in enumerate(pw.reciprocal, start=1):
             miller_dataset.attrs[f"bg{index}"] = np.asarray(vector, dtype=np.float64)
         h5.create_dataset("rhotot_g", data=rho_g)
+        if rho_difference_g is not None:
+            h5.create_dataset("rhodiff_g", data=rho_difference_g)
 
 
 def _write_wavefunction(
@@ -792,7 +884,7 @@ def _write_wavefunction_data(
         h5.attrs["xk"] = np.asarray(
             point.crystal @ pw.reciprocal, dtype=np.float64
         )
-        h5.attrs["ispin"] = 1
+        h5.attrs["ispin"] = int(pw.kpoint_spins[kpoint_index])
         h5.attrs["gamma_only"] = ".FALSE."
         h5.attrs["scale_factor"] = 1.0
         h5.attrs["ngw"] = len(miller)

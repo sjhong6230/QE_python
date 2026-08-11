@@ -9,6 +9,7 @@ import pytest
 
 import qepy_pw.pp.projwfc as projwfc_module
 from qepy_pw.errors import QEInputError
+from qepy_pw.pp.dos import DOSData
 from qepy_pw.pp.projwfc import (
     Orbital,
     ProjectionData,
@@ -50,6 +51,114 @@ def test_projection_kernel_rejects_unknown_smearing() -> None:
         _dos_kernel(np.asarray([[0.0]]), np.asarray([0.0]), 0.1, 3)
 
 
+def test_lsda_pdos_writes_up_down_columns_and_spin_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    save = tmp_path / "iron.save"
+    save.mkdir()
+    spins = np.asarray([1, 2], dtype=np.int8)
+    saved = DOSData(
+        np.asarray([[-1.0], [1.0]]),
+        np.asarray([1.0, 1.0]),
+        0.0,
+        "smearing",
+        "gaussian",
+        0.01,
+        None,
+        None,
+        None,
+        spins,
+    )
+    orbital = Orbital(1, "Fe", 1, 0, 0, "4S")
+    projections = ProjectionData(
+        energies_ev=saved.eigenvalues_ev,
+        weights=saved.weights,
+        projections=np.ones((2, 1, 1)),
+        amplitudes=np.ones((2, 1, 1), dtype=complex),
+        occupations=np.ones((2, 1)),
+        orbitals=(orbital,),
+        overlaps=(np.eye(1), np.eye(1)),
+        fermi_ev=0.0,
+        spins=spins,
+    )
+    monkeypatch.setattr(projwfc_module, "read_saved_dos", lambda *_args: saved)
+    monkeypatch.setattr(
+        projwfc_module, "compute_projections", lambda *_args, **_kwargs: projections
+    )
+    monkeypatch.chdir(tmp_path)
+
+    data, _paths = run_projwfc(
+        {
+            "prefix": "iron",
+            "outdir": str(tmp_path),
+            "filpdos": "iron",
+            "degauss": 0.02,
+            "emin": -2.0,
+            "emax": 2.0,
+            "deltae": 1.0,
+        }
+    )
+
+    assert data.nspin == 2
+    total_lines = (tmp_path / "iron.pdos_tot").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert "dosup(E) dosdw(E) pdosup(E) pdosdw(E)" in total_lines[0]
+    values = np.loadtxt(tmp_path / "iron.pdos_tot")
+    assert values.shape[1] == 5
+    assert values[1, 1] > values[1, 2]
+    assert values[3, 2] > values[3, 1]
+    orbital_values = np.loadtxt(
+        tmp_path / "iron.pdos_atm#1(Fe)_wfc#1(s)"
+    )
+    assert orbital_values.shape[1] == 5
+    atomic_text = (save / "atomic_proj.xml").read_text(encoding="utf-8")
+    assert 'spin="1"' in atomic_text and 'spin="2"' in atomic_text
+
+    run_projwfc(
+        {
+            "prefix": "iron",
+            "outdir": str(tmp_path),
+            "filpdos": "iron-k",
+            "degauss": 0.02,
+            "emin": -2.0,
+            "emax": 2.0,
+            "deltae": 1.0,
+            "lsym": False,
+            "kresolveddos": True,
+        }
+    )
+    kresolved = np.loadtxt(tmp_path / "iron-k.pdos_tot")
+    # QE joins the up/down blocks at each spatial k point instead of
+    # emitting one zero-padded record for every saved spin k point.
+    assert kresolved.shape == (5, 6)
+    np.testing.assert_array_equal(kresolved[:, 0], 1)
+    assert kresolved[1, 2] > kresolved[1, 3]
+    assert kresolved[3, 3] > kresolved[3, 2]
+
+
+def test_lsda_projection_summary_reports_lowdin_polarization() -> None:
+    data = ProjectionData(
+        energies_ev=np.asarray([[0.0], [0.0]]),
+        weights=np.asarray([1.0, 1.0]),
+        projections=np.asarray([[[0.8]], [[0.3]]]),
+        amplitudes=np.asarray([[[np.sqrt(0.8)]], [[np.sqrt(0.3)]]]),
+        occupations=np.ones((2, 1)),
+        orbitals=(Orbital(1, "Fe", 1, 0, 0, "4S"),),
+        overlaps=(np.eye(1), np.eye(1)),
+        fermi_ev=0.0,
+        kpoints=np.zeros((2, 3)),
+        spins=np.asarray([1, 2]),
+    )
+
+    summary = _format_projection_summary(data)
+
+    assert "(spin up)" in summary and "(spin down)" in summary
+    assert "spin up =   0.8000" in summary
+    assert "spin down =   0.3000" in summary
+    assert "polarization =   0.5000" in summary
+
+
 def test_cubic_rotation_average_equalizes_p_components() -> None:
     orbitals = tuple(Orbital(1, "X", 1, 1, m, "2P") for m in range(3))
     amplitudes = np.asarray([[[1.0 + 0.2j, 0.0, 0.0]]])
@@ -82,7 +191,13 @@ def test_diag_basis_diagonalizes_occupation_block() -> None:
 def test_projwfc_end_to_end_on_saved_scalar_wavefunctions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    source = Path(__file__).parent / "qe_reference" / "upstream" / "pseudo" / "pwscf.save"
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "qe_reference"
+        / "upstream"
+        / "pseudo"
+        / "pwscf.save"
+    )
     shutil.copytree(source, tmp_path / "pwscf.save")
     monkeypatch.chdir(tmp_path)
     stdout = io.StringIO()
@@ -112,7 +227,13 @@ def test_projwfc_end_to_end_on_saved_scalar_wavefunctions(
 def test_kresolved_projwfc_writes_each_energy_and_k_point(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    source = Path(__file__).parent / "qe_reference" / "upstream" / "pseudo" / "pwscf.save"
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "qe_reference"
+        / "upstream"
+        / "pseudo"
+        / "pwscf.save"
+    )
     shutil.copytree(source, tmp_path / "pwscf.save")
     monkeypatch.chdir(tmp_path)
     data, _paths = run_projwfc({
@@ -151,7 +272,13 @@ def test_qe_projection_order_preserves_state_order_for_numerical_ties() -> None:
 def test_box_ldos_full_grid_has_unit_state_weights(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    source = Path(__file__).parent / "qe_reference" / "upstream" / "pseudo" / "pwscf.save"
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "qe_reference"
+        / "upstream"
+        / "pseudo"
+        / "pwscf.save"
+    )
     shutil.copytree(source, tmp_path / "pwscf.save")
     monkeypatch.chdir(tmp_path)
     data, paths = run_projwfc({

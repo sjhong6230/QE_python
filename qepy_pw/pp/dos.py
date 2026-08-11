@@ -27,6 +27,7 @@ from ..qe_format import format_qe_closing, format_qe_opening, format_qe_timing
 from ..version import __version__
 from .band_data import resolve_save_directory
 from .namelist import parse_namelist
+from .spin import normalize_spin_weights, spin_labels, validate_spin_blocks
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,23 @@ class DOSData:
     grid: tuple[int, int, int] | None
     mapping: np.ndarray | None
     reciprocal: np.ndarray | None
+    spins: np.ndarray | None = None
+
+    @property
+    def spin_labels(self) -> np.ndarray:
+        if self.spins is not None:
+            return np.asarray(self.spins, dtype=np.int8)
+        count = len(self.eigenvalues_ev)
+        spatial = (
+            0
+            if self.mapping is None or not len(self.mapping)
+            else int(np.max(self.mapping)) + 1
+        )
+        return spin_labels(spatial > 0 and count == 2 * spatial, count)
+
+    @property
+    def nspin(self) -> int:
+        return int(np.max(self.spin_labels, initial=1))
 
 
 def read_saved_dos(prefix: str, outdir: str | None) -> DOSData:
@@ -50,17 +68,24 @@ def read_saved_dos(prefix: str, outdir: str | None) -> DOSData:
     if bands is None:
         raise QEInputError("saved data contains no band structure")
     records = bands.findall("qes:ks_energies", ns)
-    energies, weights = [], []
+    energies, weights, kpoints = [], [], []
     for record in records:
         energies.append(np.fromstring(record.findtext("qes:eigenvalues", default="", namespaces=ns), sep=" "))
         point = record.find("qes:k_point", ns)
         weights.append(float(point.attrib.get("weight", "nan")) if point is not None else np.nan)
+        kpoints.append(
+            np.fromstring(point.text or "", sep=" ")
+            if point is not None
+            else np.empty(0)
+        )
     if not energies or len({len(row) for row in energies}) != 1:
         raise QEInputError("saved DOS eigenvalues are missing or inconsistent")
-    weights_array = np.asarray(weights, dtype=float)
-    if not np.all(np.isfinite(weights_array)) or np.sum(weights_array) <= 0:
-        raise QEInputError("saved DOS k-point weights are invalid")
-    weights_array /= np.sum(weights_array)
+    lsda = (bands.findtext("qes:lsda", default="false", namespaces=ns) or "").strip().lower() in {
+        "true", ".true.", "t", "1"
+    }
+    spins = spin_labels(lsda, len(records))
+    validate_spin_blocks(np.vstack(kpoints), spins)
+    weights_array = normalize_spin_weights(np.asarray(weights, dtype=float), spins)
     fermi = bands.findtext("qes:fermi_energy", namespaces=ns)
     pack = bands.find("qes:monkhorst_pack", ns)
     grid = None if pack is None else tuple(int(pack.attrib[f"nk{i}"]) for i in range(1, 4))
@@ -80,7 +105,7 @@ def read_saved_dos(prefix: str, outdir: str | None) -> DOSData:
         bands.findtext("qes:occupations_kind", default="fixed", namespaces=ns),
         bands.findtext("qes:smearing", default="gaussian", namespaces=ns),
         float(bands.findtext("qes:degauss", default="0", namespaces=ns)),
-        grid, mapping, reciprocal,
+        grid, mapping, reciprocal, spins,
     )
 
 
@@ -94,7 +119,31 @@ def smearing_dos(energies_ev, weights, grid_ev, width_ev, ngauss):
     return 2.0 * np.einsum("ekb,k->e", kernel, weights)
 
 
-def tetrahedron_dos(
+def smearing_dos_channels(
+    data: DOSData, grid_ev: np.ndarray, width_ev: float, ngauss: int
+) -> np.ndarray:
+    if ngauss not in {0, 1, -1, -99}:
+        raise QEInputError("ngauss must be 0, 1, -1, or -99")
+    if width_ev <= 0:
+        raise QEInputError("smearing DOS requires positive degauss")
+    labels = data.spin_labels
+    degeneracy = 2.0 if data.nspin == 1 else 1.0
+    channels = []
+    for spin in range(1, data.nspin + 1):
+        selected = labels == spin
+        x = (
+            grid_ev[:, None, None]
+            - np.asarray(data.eigenvalues_ev)[None, selected, :]
+        ) / width_ev
+        kernel = smearing_density(x, ngauss) / width_ev
+        channels.append(
+            degeneracy
+            * np.einsum("ekb,k->e", kernel, data.weights[selected])
+        )
+    return np.asarray(channels)
+
+
+def tetrahedron_dos_channels(
     data: DOSData, grid_ev: np.ndarray, method: str
 ) -> tuple[np.ndarray, np.ndarray]:
     if data.grid is None or data.mapping is None or data.reciprocal is None:
@@ -109,19 +158,39 @@ def tetrahedron_dos(
         optimized_connectivity,
         optimized,
     )
-    effective = _tetrahedron_effective_energies(
-        data.eigenvalues_ev, tetra, interpolation
-    )
-    sorted_e = np.ascontiguousarray(
-        np.sort(effective, axis=-1), dtype=np.float64
-    )
+    spatial_kpoints = int(np.max(data.mapping)) + 1
+    labels = data.spin_labels
+    if any(np.count_nonzero(labels == spin) != spatial_kpoints for spin in np.unique(labels)):
+        raise QEInputError(
+            "saved eigenvalues are inconsistent with the tetrahedron k-grid"
+        )
     energy_grid = np.ascontiguousarray(grid_ev, dtype=np.float64)
     from ..basis import _load_native_fft
 
     native = _load_native_fft()
-    dos, integrated = native.tetrahedron_dos_sums(sorted_e, energy_grid)
     ntetra = len(tetra)
-    return 2.0 * dos / ntetra, 2.0 * integrated / ntetra
+    degeneracy = 2.0 if data.nspin == 1 else 1.0
+    densities, integrated_values = [], []
+    for spin in range(1, data.nspin + 1):
+        effective = _tetrahedron_effective_energies(
+            np.asarray(data.eigenvalues_ev)[labels == spin],
+            tetra,
+            interpolation,
+        )
+        sorted_e = np.ascontiguousarray(
+            np.sort(effective, axis=-1), dtype=np.float64
+        )
+        dos, integrated = native.tetrahedron_dos_sums(sorted_e, energy_grid)
+        densities.append(degeneracy * dos / ntetra)
+        integrated_values.append(degeneracy * integrated / ntetra)
+    return np.asarray(densities), np.asarray(integrated_values)
+
+
+def tetrahedron_dos(
+    data: DOSData, grid_ev: np.ndarray, method: str
+) -> tuple[np.ndarray, np.ndarray]:
+    density, integrated = tetrahedron_dos_channels(data, grid_ev, method)
+    return np.sum(density, axis=0), np.sum(integrated, axis=0)
 
 
 def run_dos(
@@ -190,16 +259,33 @@ def run_dos(
     count = int(np.floor((emax - emin) / delta + 1.000001))
     grid_ev = emin + np.arange(count) * delta
     if tetra:
-        density, integrated = tetrahedron_dos(data, grid_ev, method)
+        channels, integrated_channels = tetrahedron_dos_channels(
+            data, grid_ev, method
+        )
     else:
-        density = smearing_dos(data.eigenvalues_ev, data.weights, grid_ev, width_ev, ngauss)
-        integrated = np.cumsum(density) * delta
+        channels = smearing_dos_channels(
+            data, grid_ev, width_ev, ngauss
+        )
+        integrated_channels = np.cumsum(channels, axis=1) * delta
+    density = np.sum(channels, axis=0)
+    integrated = np.sum(integrated_channels, axis=0)
     output = Path(str(options.get("fildos", f"{prefix}.dos")))
     with output.open("w", encoding="utf-8", newline="\n") as stream:
         fermi = "" if data.fermi_ev is None else f" EFermi = {data.fermi_ev:8.3f} eV"
-        stream.write(f"#  E (eV)   dos(E)     Int dos(E){fermi}\n")
-        for energy, value, total in zip(grid_ev, density, integrated):
-            stream.write(f"{energy:8.3f}{value:12.4e}{total:12.4e}\n")
+        if data.nspin == 2:
+            stream.write(
+                f"#  E (eV)   dosup(E)     dosdw(E)   Int dos(E){fermi}\n"
+            )
+            for energy, up, down, total in zip(
+                grid_ev, channels[0], channels[1], integrated
+            ):
+                stream.write(
+                    f"{energy:8.3f}{up:12.4e}{down:12.4e}{total:12.4e}\n"
+                )
+        else:
+            stream.write(f"#  E (eV)   dos(E)     Int dos(E){fermi}\n")
+            for energy, value, total in zip(grid_ev, density, integrated):
+                stream.write(f"{energy:8.3f}{value:12.4e}{total:12.4e}\n")
     return output
 
 

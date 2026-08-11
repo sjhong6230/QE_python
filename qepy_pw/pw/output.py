@@ -1,4 +1,4 @@
-"""QE-shaped text reporting for the spinless SCF driver.
+"""QE-shaped text reporting for scalar and collinear-spin SCF calculations.
 
 Keeping presentation here prevents numerical code from accumulating print
 branches and gives the CLI and regression-reference generator one formatter.
@@ -186,7 +186,12 @@ def format_header(pw: PWInput) -> str:
         pw.system.get(
             "nbnd",
             default_number_of_bands(
-                nelec, pw.system.get("occupations", "fixed")
+                nelec,
+                pw.system.get("occupations", "fixed"),
+                nspin=int(pw.system.get("nspin", 1)),
+                tot_magnetization=float(
+                    pw.system.get("tot_magnetization", -10000.0)
+                ),
             ),
         )
     )
@@ -667,9 +672,16 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
     occupations_mode = str(
         pw.system.get("occupations", "fixed")
     ).strip().lower()
+    lsda = int(pw.system.get("nspin", 1)) == 2
+    spatial_kpoints = int(getattr(pw, "spatial_kpoint_count", len(pw.kpoints)))
     for index, (point, values) in enumerate(
         zip(pw.kpoints, result.eigenvalues_ha)
     ):
+        if lsda and index in {0, spatial_kpoints}:
+            print(
+                "     SPIN UP\n" if index == 0 else "\n     SPIN DOWN\n",
+                file=out,
+            )
         cart = (point.crystal @ pw.reciprocal) / reciprocal_unit
         npw = (
             result.plane_waves_per_k[index]
@@ -692,7 +704,9 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
             )
         print("\n     occupation numbers", file=out)
         if index < len(result.occupations):
-            displayed_occupations = 0.5 * result.occupations[index]
+            displayed_occupations = result.occupations[index]
+            if not lsda:
+                displayed_occupations = 0.5 * displayed_occupations
         else:
             displayed_occupations = np.zeros(len(values))
             displayed_occupations[:occupied] = 1.0
@@ -712,20 +726,35 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
             file=out,
         )
     else:
-        highest_occupied = max(
-            values[occupied - 1] for values in result.eigenvalues_ha
-        )
+        occupied_levels: list[float] = []
+        empty_levels: list[float] = []
+        if result.occupations:
+            for values, band_occupations in zip(
+                result.eigenvalues_ha, result.occupations
+            ):
+                for value, occupation in zip(values, band_occupations):
+                    if float(occupation) > 0.5:
+                        occupied_levels.append(float(value))
+                    else:
+                        empty_levels.append(float(value))
+        else:
+            occupied_levels = [
+                float(value)
+                for values in result.eigenvalues_ha
+                for value in values[:occupied]
+            ]
+            empty_levels = [
+                float(value)
+                for values in result.eigenvalues_ha
+                for value in values[occupied:]
+            ]
+        highest_occupied = max(occupied_levels)
         # For fixed occupations QE reports the fundamental band-edge pair
         # whenever the calculation includes at least one empty state.  The
         # HOMO is the largest occupied eigenvalue over all k points, whereas
         # the LUMO is the smallest first-empty eigenvalue.
-        has_empty_states = all(
-            len(values) > occupied for values in result.eigenvalues_ha
-        )
-        if has_empty_states:
-            lowest_unoccupied = min(
-                values[occupied] for values in result.eigenvalues_ha
-            )
+        if empty_levels:
+            lowest_unoccupied = min(empty_levels)
             print(
                 "\n     highest occupied, lowest unoccupied level (ev):"
                 f"{highest_occupied * EV_PER_HARTREE:11.4f}"
@@ -738,6 +767,26 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
                 f"{highest_occupied * EV_PER_HARTREE:10.4f}",
                 file=out,
             )
+    density = np.asarray(result.density)
+    if lsda and density.ndim == 4 and density.shape[0] == 2:
+        grid_scale = pw.volume / np.prod(density.shape[-3:])
+        magnetization_density = density[0] - density[1]
+        total_magnetization = grid_scale * float(
+            np.sum(magnetization_density)
+        )
+        absolute_magnetization = grid_scale * float(
+            np.sum(np.abs(magnetization_density))
+        )
+        print(
+            "\n     total magnetization       ="
+            f"{total_magnetization:10.2f} Bohr mag/cell",
+            file=out,
+        )
+        print(
+            "     absolute magnetization    ="
+            f"{absolute_magnetization:10.2f} Bohr mag/cell",
+            file=out,
+        )
     marker = "!" if result.converged else " "
     if calculation == "scf":
         print(f"\n{marker}    total energy              ={result.total_energy_ha * 2:17.8f} Ry", file=out)
@@ -948,7 +997,9 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
         print(f"     {name:<13s}:" + _format_timing(result, name), file=out)
     print("     sym_rho:init :" + _format_timing(result, "sym_rho:init"), file=out)
     print("\n     Called by electrons:", file=out)
-    for name in ("c_bands", "sum_band", "v_of_rho", "v_h", "v_xc", "mix_rho"):
+    for name in (
+        "c_bands", "weights", "sum_band", "v_of_rho", "v_h", "v_xc", "mix_rho"
+    ):
         print(f"     {name:<13s}:" + _format_timing(result, name), file=out)
     print("\n     Called by sum_band:", file=out)
     for name in (

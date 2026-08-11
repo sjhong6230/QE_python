@@ -112,7 +112,7 @@ rounded to FFTW-friendly lengths.
 |---|---|---|
 | `nosym` | logical, `.false.` | Disable crystal symmetry, irreducible-k reduction, and density/force symmetrization. |
 | `nosym_evc` | logical, `.false.` | Use identity symmetry in the electronic path after completing the supplied k-point list under the Bravais star. |
-| `noinv` | logical, `.false.` | Disable ordinary inversion/time-reversal k-point reduction in this scalar nonmagnetic implementation. |
+| `noinv` | logical, `.false.` | Disable ordinary inversion/time-reversal k-point reduction. |
 | `force_symmorphic` | logical, `.false.` | Retain only operations with zero fractional translation. |
 | `use_all_frac` | logical, `.false.` | Retain all compatible nonsymmorphic fractional translations in the symmetry representation. |
 
@@ -128,17 +128,30 @@ that map that mesh onto itself.
 | `degauss` | real, `0`, Ry | Required and positive for smearing. It is silently reset to zero for fixed occupations, following QE 7.5 behavior. |
 | `smearing` | string, `'gaussian'` | Gaussian (`gaussian`, `gauss`, `0`), Methfessel–Paxton (`methfessel-paxton`, `m-p`, `mp`), Marzari–Vanderbilt cold (`marzari-vanderbilt`, `cold`, `m-v`, `mv`), or Fermi–Dirac (`fermi-dirac`, `f-d`, `fd`). |
 | `input_dft` | string, pseudo-dependent | Supported canonical families: `LDA`/`PZ`/`PZ81`, `PW`/`PW92`, `PBE`, `PBEsol`, `revPBE`, and `RPBE`. If absent, the UPF functional metadata is used. |
+| `nspin` | integer, `1` | `1` selects a spin-degenerate scalar calculation; `2` selects collinear LSDA. Noncollinear `nspin=4` is not implemented. |
+| `starting_magnetization(i)` | real, `0` | Initial moment for atomic species `i`. Following QE, if any magnitude is at least one, all supplied values are interpreted in Bohr magnetons and divided by the corresponding valence charge; the resulting fractions are clipped to `[-1,1]`. |
+| `tot_magnetization` | real, `-10000` | `-10000` means unspecified. It must be supplied as an integer for `nspin=2, occupations='fixed'`, and is rejected for every other occupation/spin combination. |
 
 Tetrahedron occupations require an automatic uniform k mesh. Fixed
 occupations are appropriate only when the supplied number of bands can hold
-the scalar spin-degenerate electron count without fractional filling.
+the required electron count without fractional filling. In LSDA, each band
+has unit capacity and
+$N_\uparrow=(N_e+M)/2$, $N_\downarrow=(N_e-M)/2$.
+
+For `nspin=2`, every irreducible spatial k point is duplicated in QE order:
+the complete spin-up block precedes the complete spin-down block. The same
+spatial symmetry projector is applied independently to both density channels;
+space-group operations never exchange collinear spin labels. Collinear spin
+functionals include PZ81/PW92 LSDA and the PBE, PBEsol, revPBE, and RPBE GGA
+families.
 
 ### Accepted only to diagnose unsupported physics
 
-`nspin`, `noncolin`, `lda_plus_u`, and `lspinorb` are parsed so that requests
-for spin polarization, noncollinearity, DFT+U, or spin–orbit coupling fail with
-a precise unsupported-feature error. The only working spin setting is
-`nspin=1`, `noncolin=.false.`, `lspinorb=.false.`, and no Hubbard correction.
+`noncolin`, `lda_plus_u`, and `lspinorb` are parsed so that requests for
+noncollinearity, DFT+U, or spin–orbit coupling fail with a precise
+unsupported-feature error. The working spin settings are `nspin=1` and
+collinear `nspin=2`; both require `noncolin=.false.`, `lspinorb=.false.`, and
+no Hubbard correction.
 
 ## `&ELECTRONS`
 
