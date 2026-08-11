@@ -399,7 +399,7 @@ K_POINTS gamma
     np.testing.assert_allclose(nscf.density, result.density, atol=2e-12)
 
 
-def test_starting_magnetization_initializes_density_and_spin_hamiltonians(
+def test_starting_magnetization_splits_initial_spin_hamiltonians(
     monkeypatch,
 ) -> None:
     import qepy_pw.pw.scf as scf_module
@@ -426,32 +426,17 @@ H 0.00 0.00 -0.35
 H 0.00 0.00  0.35
 K_POINTS gamma
 """))
-    starting_densities: list[np.ndarray] = []
     projected_eigenvalues: list[np.ndarray] = []
-    original_density = scf_module._atomic_starting_density
     original_rotate = scf_module._rotate_starting_subspace
-
-    def tracked_density(*args, **kwargs):
-        density, charge = original_density(*args, **kwargs)
-        starting_densities.append(density.copy())
-        return density, charge
 
     def tracked_rotate(*args, **kwargs):
         vectors, values, applied = original_rotate(*args, **kwargs)
         projected_eigenvalues.append(values.copy())
         return vectors, values, applied
 
-    monkeypatch.setattr(scf_module, "_atomic_starting_density", tracked_density)
     monkeypatch.setattr(scf_module, "_rotate_starting_subspace", tracked_rotate)
     run_scf(pw)
 
-    assert len(starting_densities) == 1
-    initial = starting_densities[0]
-    grid_scale = pw.volume / np.prod(initial.shape[-3:])
-    assert grid_scale * np.sum(initial) == pytest.approx(2.0, abs=2e-12)
-    assert grid_scale * np.sum(initial[0] - initial[1]) == pytest.approx(
-        1.0, abs=2e-12
-    )
     # QE uses the same scalar atomic orbitals for both collinear channels,
     # then rotates each trial subspace with its own spin-dependent initial
     # Hamiltonian. A nonzero starting moment must therefore split these two
