@@ -102,6 +102,45 @@ def test_no_overlap_true_preserves_eigenvalue_order_without_wavefunctions(
     )
 
 
+def test_lsda_bands_selects_requested_spin_block(tmp_path, monkeypatch) -> None:
+    namespace = "http://www.quantum-espresso.org/ns/qes/qes-1.0"
+    save = tmp_path / "iron.save"
+    save.mkdir()
+    (save / "data-file-schema.xml").write_text(
+        f"""<qes:espresso xmlns:qes="{namespace}"><qes:output>
+        <qes:band_structure><qes:lsda>true</qes:lsda>
+        <qes:ks_energies><qes:k_point>0 0 0</qes:k_point>
+          <qes:eigenvalues>-0.1 0.2</qes:eigenvalues></qes:ks_energies>
+        <qes:ks_energies><qes:k_point>0.5 0 0</qes:k_point>
+          <qes:eigenvalues>-0.2 0.3</qes:eigenvalues></qes:ks_energies>
+        <qes:ks_energies><qes:k_point>0 0 0</qes:k_point>
+          <qes:eigenvalues>-0.4 0.5</qes:eigenvalues></qes:ks_energies>
+        <qes:ks_energies><qes:k_point>0.5 0 0</qes:k_point>
+          <qes:eigenvalues>-0.6 0.7</qes:eigenvalues></qes:ks_energies>
+        </qes:band_structure></qes:output></qes:espresso>""",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    filband, _gnu = run_bands(
+        {
+            "prefix": "iron",
+            "outdir": str(tmp_path),
+            "filband": "iron.down.bands",
+            "spin_component": 2,
+            "lsym": False,
+            "no_overlap": True,
+        }
+    )
+
+    restored = read_band_file(filband)
+    assert restored.nks == 2
+    np.testing.assert_allclose(
+        restored.energies_ev,
+        np.round(np.asarray([[-0.4, 0.5], [-0.6, 0.7]]) * EV_PER_HARTREE, 3),
+    )
+
+
 def test_plot_2d_writes_one_rectangular_grid_file_per_band(
     tmp_path,
 ) -> None:

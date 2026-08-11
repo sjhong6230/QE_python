@@ -58,3 +58,20 @@ def test_band_reader_reports_truncated_records(tmp_path: Path) -> None:
 
     with pytest.raises(QEInputError, match="truncated"):
         read_band_file(source)
+
+
+def test_band_data_selects_collinear_spin_without_mixing_blocks() -> None:
+    points = np.asarray(
+        [[0.0, 0.0, 0.0], [0.5, 0.0, 0.0]] * 2
+    )
+    data = BandData(
+        points,
+        np.arange(4, dtype=float)[:, None],
+        np.asarray([1, 1, 2, 2]),
+    )
+
+    down = data.select_spin(2)
+
+    assert data.nspin == 2
+    np.testing.assert_array_equal(down.spins, [2, 2])
+    np.testing.assert_array_equal(down.energies_ev[:, 0], [2.0, 3.0])

@@ -13,6 +13,7 @@ import numpy as np
 from ..constants import EV_PER_HARTREE
 from ..errors import QEInputError
 from .xml_data import find, findall, findtext, upstream_qe_xml
+from .spin import spin_labels, validate_spin_blocks
 
 
 @dataclass(frozen=True)
@@ -21,6 +22,7 @@ class BandData:
 
     kpoints: np.ndarray
     energies_ev: np.ndarray
+    spins: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         points = np.asarray(self.kpoints, dtype=float)
@@ -31,8 +33,16 @@ class BandData:
             raise ValueError("energies must have shape (nks, nbnd)")
         if not np.all(np.isfinite(points)) or not np.all(np.isfinite(energies)):
             raise ValueError("band data contains non-finite values")
+        spins = (
+            np.ones(len(points), dtype=np.int8)
+            if self.spins is None
+            else np.asarray(self.spins, dtype=np.int8)
+        )
+        if spins.shape != (len(points),) or not np.all(np.isin(spins, (1, 2))):
+            raise ValueError("spins must contain one collinear-spin label per k point")
         object.__setattr__(self, "kpoints", points)
         object.__setattr__(self, "energies_ev", energies)
+        object.__setattr__(self, "spins", spins)
 
     @property
     def nks(self) -> int:
@@ -41,6 +51,20 @@ class BandData:
     @property
     def nbnd(self) -> int:
         return self.energies_ev.shape[1]
+
+    @property
+    def nspin(self) -> int:
+        return int(np.max(self.spins, initial=1))
+
+    def select_spin(self, component: int) -> "BandData":
+        if component not in {1, 2}:
+            raise QEInputError("spin_component must be 1 (up) or 2 (down)")
+        selected = self.spins == component
+        if not np.any(selected):
+            raise QEInputError("spin_component requires an LSDA calculation")
+        return BandData(
+            self.kpoints[selected], self.energies_ev[selected], self.spins[selected]
+        )
 
     def path_coordinate(self) -> np.ndarray:
         """Return QE's plottable-band path coordinate."""
@@ -108,7 +132,12 @@ def read_saved_bands(prefix: str = "pwscf", outdir: str | None = None) -> BandDa
         if reciprocal_vectors.shape != (3, 3):
             raise QEInputError("upstream QE save contains an invalid reciprocal lattice")
         point_array = point_array @ np.linalg.inv(reciprocal_vectors)
-    return BandData(point_array, np.vstack(energies))
+    lsda = (findtext(root, "output/band_structure/lsda", "false") or "").strip().lower() in {
+        "true", ".true.", "t", "1"
+    }
+    spins = spin_labels(lsda, len(point_array))
+    validate_spin_blocks(point_array, spins)
+    return BandData(point_array, np.vstack(energies), spins)
 
 
 _HEADER = re.compile(r"nbnd\s*=\s*(\d+).*nks\s*=\s*(\d+)", re.IGNORECASE)

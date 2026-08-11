@@ -69,11 +69,16 @@ def _qe_irrep_display_name(table, irrep_index: int, name: str) -> str:
     return aliases[irrep_index - 1] if aliases is not None else name
 
 
-def _read_wavefunctions(directory: Path, nks: int) -> list[tuple[np.ndarray, np.ndarray]]:
+def _read_wavefunctions(
+    directory: Path,
+    nks: int,
+    indices: np.ndarray | None = None,
+) -> list[tuple[np.ndarray, np.ndarray]]:
     import h5py
 
     result = []
-    for index in range(1, nks + 1):
+    file_indices = range(1, nks + 1) if indices is None else (indices + 1)
+    for index in file_indices:
         path = directory / f"wfc{index}.hdf5"
         try:
             with h5py.File(path, "r") as h5:
@@ -119,7 +124,7 @@ def reorder_by_overlap(
         energies[kpoint] = energies[kpoint, permutation]
         ordered.append((current_miller, current[:, permutation]))
     wavefunctions[:] = ordered
-    return BandData(data.kpoints, energies)
+    return BandData(data.kpoints, energies, data.spins)
 
 
 def _saved_structure(
@@ -185,7 +190,7 @@ def _qe_plot_data(directory: Path, data: BandData) -> BandData:
     )
     reciprocal = 2.0 * np.pi * np.linalg.inv(lattice).T
     plot_points = data.kpoints @ reciprocal * (alat / (2.0 * np.pi))
-    return BandData(plot_points, data.energies_ev)
+    return BandData(plot_points, data.energies_ev, data.spins)
 
 
 def _little_group(kpoint: np.ndarray, operations) -> list:
@@ -557,8 +562,9 @@ def run_bands(
     unknown = set(options) - _SUPPORTED_KEYS
     if unknown:
         raise QEInputError(f"unknown &BANDS variable {sorted(unknown)[0]!r}")
-    if int(options.get("spin_component", 1)) != 1:
-        raise UnsupportedFeatureError("spin_component requires an LSDA calculation")
+    spin_component = int(options.get("spin_component", 1))
+    if spin_component not in {1, 2}:
+        raise QEInputError("spin_component must be 1 (up) or 2 (down)")
     if any(bool(options.get(f"lsigma({i})", False)) for i in range(1, 5)):
         raise UnsupportedFeatureError("spin-matrix post-processing is not implemented")
     prefix = str(options.get("prefix", "pwscf"))
@@ -570,7 +576,11 @@ def run_bands(
             f"     {directory}{os.sep}\n",
             file=stdout,
         )
-    data = read_saved_bands(prefix, outdir)
+    saved_data = read_saved_bands(prefix, outdir)
+    if saved_data.nspin == 1 and spin_component != 1:
+        raise QEInputError("spin_component requires an LSDA calculation")
+    selected_indices = np.flatnonzero(saved_data.spins == spin_component)
+    data = saved_data.select_spin(spin_component)
     plot_data = _qe_plot_data(directory, data)
     filband = Path(str(options.get("filband", "bands.out")))
     if bool(options.get("plot_2d", False)):
@@ -580,13 +590,15 @@ def run_bands(
     lsym = bool(options.get("lsym", True))
     lp = bool(options.get("lp", False))
     if lsym or lp or not bool(options.get("no_overlap", True)):
-        wavefunctions = _read_wavefunctions(directory, data.nks)
+        wavefunctions = _read_wavefunctions(
+            directory, saved_data.nks, selected_indices
+        )
     if not lsym and not bool(options.get("no_overlap", True)):
         assert wavefunctions is not None
         data = reorder_by_overlap(data, wavefunctions)
-        plot_data = BandData(plot_data.kpoints, data.energies_ev)
+        plot_data = BandData(plot_data.kpoints, data.energies_ev, data.spins)
     else:
-        plot_data = BandData(plot_data.kpoints, data.energies_ev)
+        plot_data = BandData(plot_data.kpoints, data.energies_ev, data.spins)
     write_band_file(filband, plot_data)
     write_gnuplot(f"{filband}.gnu", plot_data)
     if stdout is not None:
