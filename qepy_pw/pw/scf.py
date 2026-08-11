@@ -2334,6 +2334,12 @@ def _run_scf(
     # persistent SCF arrays even though these buffers are no longer live.
     trim_allocator()
     local_charge_rows = charge_workspace.local_plane_wave_indices
+    # Keep the rank-local Miller indices alive when the full reciprocal-grid
+    # geometry is released below.  NSCF/bands restarts need these indices to
+    # read the saved density directly into the compact MPI charge basis.
+    local_charge_indices = np.ascontiguousarray(
+        charge_indices[local_charge_rows]
+    )
     local_charge_vectors = reciprocal_grid.charge_vectors[local_charge_rows]
     local_charge_g2 = reciprocal_grid.charge_g2[local_charge_rows]
     charge_gvectors = len(charge_indices)
@@ -2823,7 +2829,7 @@ def _run_scf(
         # old root-only full complex grid and NumPy FFT temporaries, whose
         # lifetimes overlapped the persistent SCF FFT workspace.
         saved_coefficients = read_saved_density_coefficients(
-            pw, charge_indices[local_charge_rows]
+            pw, local_charge_indices
         )
         saved_charge_coefficients = (
             saved_coefficients[0] + saved_coefficients[1]
