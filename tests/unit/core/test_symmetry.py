@@ -15,6 +15,7 @@ from qepy_pw.symmetry import (
     symmetrize_forces,
     symmetrize_stress,
 )
+from qepy_pw.double_group import double_group_character_table
 
 
 def _identity() -> SymmetryOperation:
@@ -133,3 +134,16 @@ def test_antiunitary_operation_maps_k_to_minus_rotated_k() -> None:
     )
     assert len(points) == 1
     np.testing.assert_allclose(weights, [1.0])
+
+
+def test_cubic_double_group_has_qe_spinor_irrep_dimensions() -> None:
+    operations = find_space_group(
+        np.eye(3), np.zeros((1, 3)), ["X"]
+    )
+    table = double_group_character_table(np.eye(3), operations, "O_h")
+    np.testing.assert_array_equal(table.dimensions, [2, 2, 4, 2, 2, 4])
+    assert set(table.names) == {
+        "G_6+", "G_7+", "G_8+", "G_6-", "G_7-", "G_8-"
+    }
+    overlap = table.characters @ table.characters.conj().T / len(operations)
+    np.testing.assert_allclose(overlap, np.eye(6), atol=1.0e-12)

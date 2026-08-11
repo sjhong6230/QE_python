@@ -15,6 +15,7 @@ from scipy.optimize import linear_sum_assignment
 
 from ..cli_options import add_input_file_argument
 from ..errors import QEInputError, UnsupportedFeatureError, emit_qe_error
+from ..double_group import double_group_character_table, spin_half_rotation
 from ..qe_format import format_qe_closing, format_qe_opening, format_qe_timing
 from ..point_group import point_group_character_table
 from ..symmetry import SymmetryOperation, find_space_group
@@ -289,6 +290,34 @@ def _symmetry_matrix(kpoint, miller, coefficients, operation) -> np.ndarray:
     return coefficients.conj().T @ transformed_coefficients
 
 
+def _spinor_symmetry_matrix(
+    lattice: np.ndarray, kpoint, miller, coefficients, operation
+) -> np.ndarray:
+    """Representation matrix of a unitary double-group operation."""
+    npw = len(miller)
+    coefficients = np.asarray(coefficients, dtype=np.complex128)
+    if coefficients.shape[0] != 2 * npw:
+        raise QEInputError("double-group analysis requires spinor wavefunctions")
+    transformed = (kpoint + miller) @ np.linalg.inv(operation.matrix).T
+    target = np.rint(transformed - kpoint).astype(np.int32)
+    if not np.allclose(transformed - kpoint, target, atol=1.0e-7):
+        raise QEInputError("little-group operation does not preserve the plane-wave basis")
+    lookup = {tuple(row): index for index, row in enumerate(miller)}
+    try:
+        destination = np.asarray([lookup[tuple(row)] for row in target], dtype=int)
+    except KeyError as exc:
+        raise QEInputError("symmetry-transformed plane wave is absent from saved basis") from exc
+    phase = np.exp(-2j * np.pi * (target @ operation.translation))
+    source = coefficients.reshape(2, npw, coefficients.shape[1])
+    spin_rotated = np.einsum(
+        "ab,bgn->agn", spin_half_rotation(lattice, operation), source
+    )
+    transformed_coefficients = np.empty_like(source)
+    transformed_coefficients[:, destination, :] = phase[None, :, None] * spin_rotated
+    flat = transformed_coefficients.reshape(2 * npw, coefficients.shape[1])
+    return coefficients.conj().T @ flat
+
+
 def _format_group_info(table) -> str:
     out = io.StringIO()
     group = f"{table.schoenflies} ({table.international})"
@@ -328,6 +357,15 @@ def _format_group_info(table) -> str:
     return out.getvalue()
 
 
+def _format_double_group_info(group: str, table) -> str:
+    out = io.StringIO()
+    print(f"     point group {group} double group", file=out)
+    print(f"     there are{len(table.names):3d} double-valued irreps\n", file=out)
+    for name, dimension in zip(table.names, table.dimensions):
+        print(f"     {name:<15s} dimension {int(dimension):2d}", file=out)
+    return out.getvalue()
+
+
 def classify_irreps(
     data: BandData,
     wavefunctions: list[tuple[np.ndarray, np.ndarray]],
@@ -352,10 +390,21 @@ def classify_irreps(
         little = _little_group(point, operations)
         if not little:
             continue
-        table = point_group_character_table(dummy_pw, little)
+        unitary_little = [operation for operation in little if not operation.time_reversal]
+        if not unitary_little:
+            continue
+        table = point_group_character_table(dummy_pw, unitary_little)
+        double_table = (
+            double_group_character_table(
+                lattice, tuple(unitary_little), table.schoenflies
+            )
+            if data.noncolin
+            else None
+        )
         group_signature = (
             table.schoenflies,
-            tuple(item.label for item in table.classes),
+            tuple(double_table.names) if double_table is not None
+            else tuple(item.label for item in table.classes),
         )
         if group_signatures is not None:
             group_signatures[ik - 1] = group_signature
@@ -383,8 +432,14 @@ def classify_irreps(
                 )
             continue
         matrices = [
-            _symmetry_matrix(point, miller, coefficients, operation)
-            for operation in little
+            (
+                _spinor_symmetry_matrix(
+                    lattice, point, miller, coefficients, operation
+                )
+                if data.noncolin
+                else _symmetry_matrix(point, miller, coefficients, operation)
+            )
+            for operation in unitary_little
         ]
         class_members = [
             tuple(index - 1 for index in item.operation_indices)
@@ -393,34 +448,56 @@ def classify_irreps(
         class_sizes = np.asarray([len(items) for items in class_members])
         if reports is not None:
             if group_signature != last_group_signature:
-                reports.append("\n" + _format_group_info(table))
+                reports.append(
+                    "\n"
+                    + (
+                        _format_double_group_info(table.schoenflies, double_table)
+                        if double_table is not None
+                        else _format_group_info(table)
+                    )
+                )
                 last_group_signature = group_signature
             group = f"{table.schoenflies} ({table.international})"
             reports.append(
-                f"\n     Band symmetry, {group:11s} point group:\n\n"
+                f"\n     Band symmetry, {group:11s} "
+                + ("double point group:\n\n" if data.noncolin else "point group:\n\n")
             )
         start = 0
         while start < data.nbnd:
             stop = start + 1
             while stop < data.nbnd and abs(energies[stop] - energies[start]) <= degeneracy_tolerance_ev:
                 stop += 1
-            subspace_characters = np.asarray([
-                np.mean([
-                    np.trace(matrices[index][start:stop, start:stop])
-                    for index in members
-                ])
-                for members in class_members
+            operation_characters = np.asarray([
+                np.trace(matrix[start:stop, start:stop]) for matrix in matrices
             ])
+            subspace_characters = (
+                operation_characters
+                if data.noncolin
+                else np.asarray([
+                    np.mean([operation_characters[index] for index in members])
+                    for members in class_members
+                ])
+            )
             decomposition: list[tuple[int, str, int, int]] = []
             irrep_slots: list[int] = []
-            for irrep_index, (name, characters) in enumerate(
-                table.irreps, start=1
-            ):
-                multiplicity_value = np.sum(
-                    class_sizes
-                    * subspace_characters
-                    * np.conjugate(np.asarray(characters))
-                ) / len(little)
+            irreps = (
+                zip(double_table.names, double_table.characters)
+                if double_table is not None
+                else table.irreps
+            )
+            for irrep_index, (name, characters) in enumerate(irreps, start=1):
+                multiplicity_value = (
+                    np.sum(
+                        subspace_characters
+                        * np.conjugate(np.asarray(characters))
+                    ) / len(unitary_little)
+                    if data.noncolin
+                    else np.sum(
+                        class_sizes
+                        * subspace_characters
+                        * np.conjugate(np.asarray(characters))
+                    ) / len(unitary_little)
+                )
                 multiplicity = int(np.rint(multiplicity_value.real))
                 if (
                     multiplicity <= 0
@@ -428,11 +505,16 @@ def classify_irreps(
                     or abs(multiplicity_value.real - multiplicity) > 2.0e-3
                 ):
                     continue
-                dimension = int(np.rint(characters[0].real))
+                dimension = int(
+                    double_table.dimensions[irrep_index - 1]
+                    if double_table is not None
+                    else np.rint(characters[0].real)
+                )
                 count = multiplicity * dimension
                 irrep_slots.extend([irrep_index] * count)
                 decomposition.append((
                     irrep_index,
+                    name if double_table is not None else
                     _qe_irrep_display_name(table, irrep_index, name),
                     multiplicity,
                     dimension,
@@ -662,11 +744,6 @@ def run_bands(
     wavefunctions = None
     lsym = bool(options.get("lsym", True))
     lp = bool(options.get("lp", False))
-    if lsym and saved_data.noncolin:
-        raise UnsupportedFeatureError(
-            "noncollinear lsym band labels require QE double-group irreps; "
-            "use lsym=.false. until that classifier is ported"
-        )
     if lp and saved_data.noncolin:
         raise UnsupportedFeatureError(
             "noncollinear momentum matrices require spin-orbit nonlocal "

@@ -102,6 +102,32 @@ def test_spin_expectations_follow_pauli_spinor_convention() -> None:
     )
 
 
+def test_noncollinear_identity_little_group_uses_double_group_irrep(
+    tmp_path: Path,
+) -> None:
+    namespace = "http://www.quantum-espresso.org/ns/qes/qes-1.0"
+    save = tmp_path / "spinor.save"
+    save.mkdir()
+    (save / "data-file-schema.xml").write_text(
+        f"""<espresso xmlns="{namespace}"><output>
+        <atomic_structure><cell><a1>1 0 0</a1><a2>0 1 0</a2><a3>0 0 1</a3></cell>
+        <atomic_positions><atom name="X">0 0 0</atom></atomic_positions></atomic_structure>
+        <band_structure><noncolin>true</noncolin><symmetry_operations><symmetry>
+        <rotation>1 0 0 0 1 0 0 0 1</rotation><fractional_translation>0 0 0</fractional_translation>
+        </symmetry></symmetry_operations></band_structure></output></espresso>""",
+        encoding="utf-8",
+    )
+    data = BandData(
+        np.zeros((1, 3)), np.zeros((1, 2)), noncolin=True
+    )
+    labels = classify_irreps(
+        data,
+        [(np.zeros((1, 3), dtype=int), np.eye(2, dtype=complex))],
+        save,
+    )
+    np.testing.assert_array_equal(labels, [[1, 1]])
+
+
 def test_no_overlap_true_preserves_eigenvalue_order_without_wavefunctions(
     tmp_path, monkeypatch
 ) -> None:
