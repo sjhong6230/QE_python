@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import io
 from pathlib import Path
 import shutil
@@ -79,7 +80,26 @@ def test_pp_reads_qe_interleaved_charge_density_hdf5(tmp_path: Path) -> None:
     expected_coefficients = np.zeros(shape, dtype=complex)
     expected_coefficients[tuple(miller.T)] = coefficients
     expected = np.real(np.fft.ifftn(expected_coefficients * np.prod(shape)))
-    np.testing.assert_allclose(_read_density(tmp_path, shape), expected)
+    total, spins = _read_density(tmp_path, shape)
+    np.testing.assert_allclose(total, expected)
+    np.testing.assert_allclose(spins, expected[None, ...])
+
+
+def test_pp_reconstructs_lsda_spin_density_and_magnetization(tmp_path: Path) -> None:
+    shape = (2, 2, 2)
+    with h5py.File(tmp_path / "charge-density.hdf5", "w") as h5:
+        h5.attrs["gamma_only"] = ".FALSE."
+        h5.attrs["nspin"] = 2
+        h5.create_dataset("MillerIndices", data=np.asarray([[0, 0, 0]]))
+        h5.create_dataset("rhotot_g", data=np.asarray([2.0 + 0.0j]))
+        h5.create_dataset("rhodiff_g", data=np.asarray([0.5 + 0.0j]))
+
+    total, spins = _read_density(tmp_path, shape)
+
+    np.testing.assert_allclose(total, 2.0)
+    np.testing.assert_allclose(spins[0], 1.25)
+    np.testing.assert_allclose(spins[1], 0.75)
+    np.testing.assert_allclose(spins[0] - spins[1], 0.5)
 
 
 def test_pp_reads_degauss_from_qe_smearing_attribute() -> None:
@@ -394,7 +414,100 @@ def test_pp_renders_every_multi_orbital_extraction(
     assert all(path.is_file() for path in (*extracted, *output))
 
 
-def test_pp_rejects_unimplemented_magnetization_and_paw_paths(saved_state) -> None:
-    for plot_num in (6, 13, 17, 18, 21, 24):
+def test_pp_rejects_unimplemented_spinor_and_paw_paths(saved_state) -> None:
+    for plot_num in (13, 17, 18, 21, 24):
         with pytest.raises(UnsupportedFeatureError):
             extract_plot_grids(saved_state, {"plot_num": plot_num})
+
+    with pytest.raises(QEInputError, match="LSDA"):
+        extract_plot_grids(saved_state, {"plot_num": 6})
+
+
+@pytest.fixture
+def lsda_saved_state(saved_state):
+    up = 0.65 * saved_state.density
+    down = 0.35 * saved_state.density
+    count = len(saved_state.weights)
+    return replace(
+        saved_state,
+        spin_densities=np.asarray((up, down)),
+        energies_ha=np.concatenate(
+            (saved_state.energies_ha - 0.01, saved_state.energies_ha + 0.01)
+        ),
+        occupations=np.concatenate(
+            (0.5 * saved_state.occupations, 0.5 * saved_state.occupations)
+        ),
+        weights=np.concatenate((saved_state.weights, saved_state.weights)),
+        spins=np.concatenate(
+            (np.ones(count, dtype=np.int8), np.full(count, 2, dtype=np.int8))
+        ),
+    )
+
+
+def test_pp_lsda_charge_magnetization_and_spin_xc_potentials(lsda_saved_state) -> None:
+    total = extract_plot_grids(lsda_saved_state, {"plot_num": 0})[0][1].values
+    up = extract_plot_grids(
+        lsda_saved_state, {"plot_num": 0, "spin_component": 1}
+    )[0][1].values
+    down = extract_plot_grids(
+        lsda_saved_state, {"plot_num": 0, "spin_component": 2}
+    )[0][1].values
+    magnetization = extract_plot_grids(
+        lsda_saved_state, {"plot_num": 6}
+    )[0][1].values
+
+    np.testing.assert_allclose(up + down, total)
+    np.testing.assert_allclose(up - down, magnetization)
+    moment = np.mean(magnetization) * lsda_saved_state.volume
+    assert moment == pytest.approx(0.30 * 8.0, abs=1.0e-8)
+
+    potential_up = extract_plot_grids(
+        lsda_saved_state, {"plot_num": 1, "spin_component": 1}
+    )[0][1].values
+    potential_down = extract_plot_grids(
+        lsda_saved_state, {"plot_num": 1, "spin_component": 2}
+    )[0][1].values
+    assert np.all(np.isfinite(potential_up))
+    assert np.all(np.isfinite(potential_down))
+    assert not np.allclose(potential_up, potential_down)
+
+
+def test_pp_lsda_gga_potential_retains_spin_dependence(lsda_saved_state) -> None:
+    state = replace(lsda_saved_state, functional="pbe")
+
+    averaged = extract_plot_grids(
+        state, {"plot_num": 1, "spin_component": 0}
+    )[0][1].values
+    up = extract_plot_grids(
+        state, {"plot_num": 1, "spin_component": 1}
+    )[0][1].values
+    down = extract_plot_grids(
+        state, {"plot_num": 1, "spin_component": 2}
+    )[0][1].values
+
+    assert np.all(np.isfinite(up)) and np.all(np.isfinite(down))
+    np.testing.assert_allclose(averaged, 0.5 * (up + down), atol=2.0e-12)
+    assert not np.allclose(up, down)
+
+
+def test_pp_lsda_ildos_selects_only_requested_spin_rows(
+    lsda_saved_state, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import qepy_pw.pp.pp as pp_module
+
+    captured: list[np.ndarray] = []
+
+    def fake_density(_state, factors, **_kwargs):
+        captured.append(np.asarray(factors).copy())
+        return np.full(_state.shape, np.sum(factors))
+
+    monkeypatch.setattr(pp_module, "_wave_density_sum", fake_density)
+    bounds = {"plot_num": 10, "emin": -1.0e6, "emax": 1.0e6}
+    extract_plot_grids(lsda_saved_state, {**bounds, "spin_component": 1})
+    extract_plot_grids(lsda_saved_state, {**bounds, "spin_component": 2})
+
+    up_rows = lsda_saved_state.spins == 1
+    assert np.all(captured[0][~up_rows] == 0.0)
+    assert np.any(captured[0][up_rows] > 0.0)
+    assert np.all(captured[1][up_rows] == 0.0)
+    assert np.any(captured[1][~up_rows] > 0.0)
