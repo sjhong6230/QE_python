@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
+import qepy_pw.pw.scf as scf_module
 from qepy_pw.basis import LocalPotentialWorkspace, PlaneWaveBasis
 from qepy_pw.diagonalization import SpinorPlaneWaveHamiltonian
 from qepy_pw.spinor import (
@@ -108,3 +109,77 @@ def test_spinor_plane_wave_hamiltonian_uses_doubled_qe_layout() -> None:
         )
     np.testing.assert_allclose(operator.apply(coefficients), expected, atol=2e-15)
     assert operator.diagonal.shape == (4,)
+
+
+def test_spinor_hamiltonian_fortran_batch_view_preserves_qe_band_layout() -> None:
+    indices = np.asarray([[0, 0, 0], [1, 0, 0]], dtype=np.int32)
+    basis = PlaneWaveBasis(
+        indices, indices.astype(float), np.asarray([0.0, 0.5])
+    )
+    workspace = LocalPotentialWorkspace(basis, (3, 1, 1))
+    fields = np.zeros((4, 3, 1, 1))
+    fields[0].fill(1.25)
+    operator = SpinorPlaneWaveHamiltonian(
+        basis,
+        fields,
+        local_workspace=workspace,
+        scalar_only=True,
+    )
+    coefficients = np.asfortranarray(
+        np.asarray(
+            [
+                [0.2 + 0.1j, -0.3 + 0.4j, 0.7 - 0.2j],
+                [-0.4 + 0.3j, 0.5 + 0.8j, -0.1 + 0.6j],
+                [0.7 - 0.2j, 0.9 + 0.1j, -0.2 - 0.5j],
+                [0.1 + 0.8j, -0.6 + 0.2j, 0.3 + 0.7j],
+            ]
+        )
+    )
+    expected = coefficients.copy(order="F")
+    expected[[0, 2]] *= 1.25
+    expected[[1, 3]] *= 1.75
+    output = np.empty_like(coefficients, order="F")
+
+    operator.apply_into(coefficients, output)
+
+    np.testing.assert_allclose(output, expected, atol=2e-15)
+
+
+def test_nonmagnetic_spinor_density_uses_qe_charge_only_path(monkeypatch) -> None:
+    indices = np.asarray([[0, 0, 0], [1, 0, 0]], dtype=np.int32)
+    basis = PlaneWaveBasis(
+        indices, indices.astype(float), np.asarray([0.0, 0.5])
+    )
+    workspace = LocalPotentialWorkspace(basis, (3, 1, 1))
+    coefficients = np.asfortranarray(
+        np.asarray(
+            (
+                (0.3 + 0.2j,),
+                (-0.4 + 0.1j,),
+                (0.1 - 0.5j,),
+                (0.6 + 0.3j,),
+            )
+        )
+    )
+
+    def fail_if_pauli_density_is_built(*_args, **_kwargs):
+        raise AssertionError("domag=false must not build Pauli magnetization")
+
+    monkeypatch.setattr(
+        scf_module, "spinor_density_components", fail_if_pauli_density_is_built
+    )
+    density = scf_module._density_from_states(
+        [coefficients],
+        [basis],
+        np.asarray([1.0]),
+        [np.asarray([1.0])],
+        (3, 1, 1),
+        volume=3.0,
+        nelec=1.0,
+        workspaces=[workspace],
+        spinor=True,
+        domag=False,
+    )
+
+    np.testing.assert_allclose(density[1:], 0.0, atol=0.0)
+    np.testing.assert_allclose(np.sum(density[0]), 1.0, atol=2e-15)

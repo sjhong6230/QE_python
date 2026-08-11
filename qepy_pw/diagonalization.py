@@ -386,6 +386,7 @@ class SpinorPlaneWaveHamiltonian:
         local_workspace: LocalPotentialWorkspace | None = None,
         timers: TimingRegistry | None = None,
         potential_average: float = 0.0,
+        scalar_only: bool = False,
     ) -> None:
         self.basis = basis
         self.local_workspace = (
@@ -406,7 +407,10 @@ class SpinorPlaneWaveHamiltonian:
             fields = fields[:, :, :, self.local_workspace.local_slab]
         if fields.shape != (4, *local_shape):
             raise ValueError("spinor local potential has the wrong shape")
+        if scalar_only and np.any(fields[1:] != 0.0):
+            raise ValueError("scalar-only spinor potential has magnetic fields")
         self.real_potential = np.ascontiguousarray(fields)
+        self.scalar_only = bool(scalar_only)
         scalar_rows = self.local_workspace.local_plane_wave_indices
         global_rows = len(basis)
         self.local_rows = np.concatenate(
@@ -452,22 +456,32 @@ class SpinorPlaneWaveHamiltonian:
         if vectors.shape[0] % 2:
             raise ValueError("spinor coefficient dimension must be even")
         plane_waves = vectors.shape[0] // 2
-        up, down = vectors[:plane_waves], vectors[plane_waves:]
-        wave_grid = self.local_workspace.coefficients_to_grid(
-            np.concatenate((up, down), axis=1)
-        )
         bands = vectors.shape[1]
-        up_grid, down_grid = wave_grid[..., :bands], wave_grid[..., bands:]
+        # QE stores spinors as (2*npw, nbnd), all up rows followed by all
+        # down rows in each Fortran-contiguous band.  Reinterpreting that
+        # owner as (npw, 2*nbnd) interleaves up/down FFT batches without the
+        # concatenate copy formerly made on every Hamiltonian application.
+        spinor_vectors = np.reshape(
+            vectors, (plane_waves, 2 * bands), order="F"
+        )
+        wave_grid = self.local_workspace.coefficients_to_grid(
+            spinor_vectors
+        )
         scalar, x_field, y_field, z_field = self.real_potential
-        local_grid = np.empty_like(wave_grid)
-        local_grid[..., :bands] = (
-            (scalar + z_field)[..., None] * up_grid
-            + (x_field - 1j * y_field)[..., None] * down_grid
-        )
-        local_grid[..., bands:] = (
-            (x_field + 1j * y_field)[..., None] * up_grid
-            + (scalar - z_field)[..., None] * down_grid
-        )
+        if self.scalar_only:
+            local_grid = wave_grid
+            local_grid *= scalar[..., None]
+        else:
+            up_grid, down_grid = wave_grid[..., 0::2], wave_grid[..., 1::2]
+            local_grid = np.empty_like(wave_grid)
+            local_grid[..., 0::2] = (
+                (scalar + z_field)[..., None] * up_grid
+                + (x_field - 1j * y_field)[..., None] * down_grid
+            )
+            local_grid[..., 1::2] = (
+                (x_field + 1j * y_field)[..., None] * up_grid
+                + (scalar - z_field)[..., None] * down_grid
+            )
         local_coefficients = self.local_workspace.grid_to_coefficients(
             local_grid
         )
@@ -476,8 +490,13 @@ class SpinorPlaneWaveHamiltonian:
             if out is None
             else np.asarray(out).reshape(vectors.shape)
         )
-        result[:plane_waves] = local_coefficients[:, :bands]
-        result[plane_waves:] = local_coefficients[:, bands:]
+        if result.flags.f_contiguous:
+            np.reshape(
+                result, (plane_waves, 2 * bands), order="F"
+            )[...] = local_coefficients
+        else:
+            result[:plane_waves] = local_coefficients[:, 0::2]
+            result[plane_waves:] = local_coefficients[:, 1::2]
         result += self.local_kinetic[:, None] * vectors
         for term in self.projector_terms:
             if isinstance(term, (FactorizedProjectorTerm, PackedProjectorTerm)):

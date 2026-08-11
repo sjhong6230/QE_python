@@ -1700,31 +1700,39 @@ def _density_from_states(
             plane_waves = coeff.shape[0] // 2
             if coeff.shape[0] != 2 * plane_waves:
                 raise ValueError("spinor wavefunction has an odd row count")
+            spinor_coefficients = np.reshape(
+                coeff[:, :band_count],
+                (plane_waves, 2 * band_count),
+                order="F",
+            )
             grids = workspace.coefficients_to_grid(
-                np.concatenate(
-                    (
-                        coeff[:plane_waves, :band_count],
-                        coeff[plane_waves:, :band_count],
-                    ),
-                    axis=1,
-                )
+                spinor_coefficients
             )
-            up = grids[..., :band_count]
-            down = grids[..., band_count:]
-            components = spinor_density_components(
-                np.stack((up, down)), spin_axis=0
-            )
+            up = grids[..., 0::2]
+            down = grids[..., 1::2]
             band_weights = (
                 weight
                 * np.asarray(band_occupations[:band_count], dtype=float)
                 / volume
             )
-            rho_local[0] += np.einsum(
-                "...b,b->...", components[0], band_weights
-            )
             if domag:
+                components = spinor_density_components(
+                    np.stack((up, down)), spin_axis=0
+                )
+                rho_local[0] += np.einsum(
+                    "...b,b->...", components[0], band_weights
+                )
                 rho_local[1:] += np.einsum(
                     "s...b,b->s...", components[1:], band_weights
+                )
+            else:
+                # QE sum_band uses nspin_mag=1 when domag=.false.: only
+                # |psi_up|^2+|psi_down|^2 is accumulated.  Avoid constructing
+                # the three identically discarded Pauli magnetization grids.
+                charge = np.abs(up) ** 2
+                charge += np.abs(down) ** 2
+                rho_local[0] += np.einsum(
+                    "...b,b->...", charge, band_weights
                 )
         else:
             spin = int(kpoint_spins[index]) - 1 if spin_polarized else 0
@@ -2975,6 +2983,9 @@ def _run_scf(
     local_plane_waves = max(local_plane_wave_counts)
     local_hilbert_rows = max(spinor_plane_wave_counts)
     density_components = 4 if noncolin else (2 if lsda else 1)
+    mixing_components = (
+        1 if noncolin and not domag else density_components
+    )
     # This is an array working-set estimate, not an RSS prediction. It covers
     # persistent SCF grids/history, basis metadata, wavefunctions, and the
     # largest Davidson/FFT block. Python, BLAS, FFT, and MPI runtimes are
@@ -2984,7 +2995,7 @@ def _run_scf(
         * (mixing_ndim_estimate + 1)
         * len(local_charge_rows)
         * 16
-        * density_components
+        * mixing_components
         if str(pw.electrons.get("mixing_mode", "plain"))
         .strip()
         .lower()
@@ -3675,7 +3686,7 @@ def _run_scf(
         )
     if lsda:
         density_mixer = SpinDensityMixer(density_mixer, beta=mixing)
-    elif noncolin:
+    elif noncolin and domag:
         density_mixer = PauliDensityMixer(density_mixer, beta=mixing)
     iterations: list[SCFIteration] = []
     old_energy = None
@@ -4057,6 +4068,7 @@ def _run_scf(
                         local_workspace=local_workspace,
                         timers=timers,
                         potential_average=v_ion_average,
+                        scalar_only=not domag,
                     )
                 else:
                     operator = PlaneWaveHamiltonian(
@@ -4538,10 +4550,16 @@ def _run_scf(
             # temporary spin-up owner instead of materializing a column copy.
             up_residual_g[...] = residual_g_local[:, 0]
         elif noncolin:
-            real_grid_workspace = np.subtract(rho_out, rho)
-            residual_g_local = charge_workspace.grid_to_coefficients(
-                np.moveaxis(real_grid_workspace, 0, -1)
-            )
+            if domag:
+                real_grid_workspace = np.subtract(rho_out, rho)
+                residual_g_local = charge_workspace.grid_to_coefficients(
+                    np.moveaxis(real_grid_workspace, 0, -1)
+                )
+            else:
+                real_grid_workspace = np.subtract(rho_out[0], rho[0])
+                residual_g_local = charge_workspace.grid_to_coefficients(
+                    real_grid_workspace
+                )
         else:
             real_grid_workspace = v_eff_grid
             np.subtract(rho_out, rho, out=real_grid_workspace)
@@ -4553,7 +4571,7 @@ def _run_scf(
             )
         if lsda:
             charge_residual_g = up_residual_g
-        elif noncolin:
+        elif noncolin and domag:
             charge_residual_g = np.ascontiguousarray(residual_g_local[:, 0])
         else:
             charge_residual_g = residual_g_local
@@ -4572,7 +4590,7 @@ def _run_scf(
                 ))) / np.pi
             )
             del up_residual_g
-        elif noncolin:
+        elif noncolin and domag:
             accuracy += 0.5 * pw.volume * mpi.sum_scalar(
                 float(
                     np.real(
@@ -4619,6 +4637,17 @@ def _run_scf(
         mix_started = timers.start()
         if converged:
             rho_energy = rho_out
+        elif noncolin and not domag:
+            if isinstance(density_mixer, DistributedBroydenMixer):
+                mixed_charge = density_mixer.mix(
+                    rho[0],
+                    rho_out[0],
+                    residual_coefficients=residual_g_local,
+                )
+            else:
+                mixed_charge = density_mixer.mix(rho[0], rho_out[0])
+            rho_energy = np.zeros_like(rho_out)
+            rho_energy[0] = mixed_charge
         elif isinstance(
             density_mixer,
             (DistributedBroydenMixer, SpinDensityMixer, PauliDensityMixer),
