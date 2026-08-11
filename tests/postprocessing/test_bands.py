@@ -409,7 +409,7 @@ def test_general_k_symmetry_rotates_qe_periodic_part_not_full_bloch_wave() -> No
 def test_scf_nscf_save_order_and_bands_inp_integration(
     tmp_path, capsys
 ) -> None:
-    root = Path(__file__).parent / "qe_reference"
+    root = Path(__file__).resolve().parents[1] / "qe_reference"
     source = root / "upstream" / "pw_scf" / "scf.in"
     pseudo_dir = root / "upstream" / "pseudo"
 
@@ -539,7 +539,10 @@ def test_bands_lp_writes_p_matrix_from_saved_upf_and_wavefunctions(
     save = tmp_path / "si.save"
     save.mkdir()
     pseudo_source = (
-        Path(__file__).parent / "qe_reference" / "upstream" / "pseudo"
+        Path(__file__).resolve().parents[1]
+        / "qe_reference"
+        / "upstream"
+        / "pseudo"
         / "Si.pz-vbc.UPF"
     )
     shutil.copy2(pseudo_source, save / pseudo_source.name)

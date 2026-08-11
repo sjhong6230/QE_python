@@ -82,7 +82,13 @@ def test_diag_basis_diagonalizes_occupation_block() -> None:
 def test_projwfc_end_to_end_on_saved_scalar_wavefunctions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    source = Path(__file__).parent / "qe_reference" / "upstream" / "pseudo" / "pwscf.save"
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "qe_reference"
+        / "upstream"
+        / "pseudo"
+        / "pwscf.save"
+    )
     shutil.copytree(source, tmp_path / "pwscf.save")
     monkeypatch.chdir(tmp_path)
     stdout = io.StringIO()
@@ -112,7 +118,13 @@ def test_projwfc_end_to_end_on_saved_scalar_wavefunctions(
 def test_kresolved_projwfc_writes_each_energy_and_k_point(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    source = Path(__file__).parent / "qe_reference" / "upstream" / "pseudo" / "pwscf.save"
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "qe_reference"
+        / "upstream"
+        / "pseudo"
+        / "pwscf.save"
+    )
     shutil.copytree(source, tmp_path / "pwscf.save")
     monkeypatch.chdir(tmp_path)
     data, _paths = run_projwfc({
@@ -151,7 +163,13 @@ def test_qe_projection_order_preserves_state_order_for_numerical_ties() -> None:
 def test_box_ldos_full_grid_has_unit_state_weights(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    source = Path(__file__).parent / "qe_reference" / "upstream" / "pseudo" / "pwscf.save"
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "qe_reference"
+        / "upstream"
+        / "pseudo"
+        / "pwscf.save"
+    )
     shutil.copytree(source, tmp_path / "pwscf.save")
     monkeypatch.chdir(tmp_path)
     data, paths = run_projwfc({

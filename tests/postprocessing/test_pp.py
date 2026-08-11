@@ -42,7 +42,12 @@ from qepy_pw.pp.pp import (
 
 @pytest.fixture(scope="module")
 def saved_state():
-    outdir = Path(__file__).parent / "qe_reference" / "upstream" / "pseudo"
+    outdir = (
+        Path(__file__).resolve().parents[1]
+        / "qe_reference"
+        / "upstream"
+        / "pseudo"
+    )
     return read_saved_pp("pwscf", str(outdir))
 
 
@@ -332,7 +337,13 @@ def test_pp_combines_formatted_files_and_writes_xsf_and_cube(
 def test_pp_run_supports_extraction_and_plotting_in_one_input(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    source = Path(__file__).parent / "qe_reference" / "upstream" / "pseudo" / "pwscf.save"
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "qe_reference"
+        / "upstream"
+        / "pseudo"
+        / "pwscf.save"
+    )
     shutil.copytree(source, tmp_path / "pwscf.save")
     monkeypatch.chdir(tmp_path)
     stdout = io.StringIO()
@@ -358,7 +369,13 @@ def test_pp_run_supports_extraction_and_plotting_in_one_input(
 def test_pp_renders_every_multi_orbital_extraction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    source = Path(__file__).parent / "qe_reference" / "upstream" / "pseudo" / "pwscf.save"
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "qe_reference"
+        / "upstream"
+        / "pseudo"
+        / "pwscf.save"
+    )
     shutil.copytree(source, tmp_path / "pwscf.save")
     monkeypatch.chdir(tmp_path)
     extracted, output = run_pp(
