@@ -10,6 +10,7 @@ import numpy as np
 from qepy_pw.pp.bands import _format_group_info
 from qepy_pw.pw.output import (
     _format_force_component,
+    _format_scf_accuracy_ry,
     _format_stress_component,
     format_progress,
 )
@@ -53,6 +54,12 @@ def test_nscf_kpoint_progress_uses_qe_9001_and_9000_formats() -> None:
     ) == (
         "     total cpu time spent up to now is      123.5 secs\n"
     )
+
+
+def test_scf_accuracy_switches_at_qe_eps8_boundary() -> None:
+    assert _format_scf_accuracy_ry(1.0000001e-8) == "       0.00000001"
+    assert _format_scf_accuracy_ry(1.0e-8) == "          1.0E-08"
+    assert _format_scf_accuracy_ry(2.0e-13) == "          2.0E-13"
 
 
 def test_force_component_uses_qe_9035_layout_without_extra_blank_lines() -> None:

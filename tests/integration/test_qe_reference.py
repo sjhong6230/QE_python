@@ -84,6 +84,33 @@ def test_qe_diamond_character_classes_use_the_printed_symmetry_indices():
         assert f"     {point_class.label:<5s}{rendered_indices}" in output
 
 
+@pytest.mark.parametrize(
+    ("lspinorb", "domag", "message"),
+    [
+        (False, False, "Noncollinear calculation without spin-orbit"),
+        (True, True, "Noncollinear calculation with spin-orbit"),
+        (True, False, "Non magnetic calculation with spin-orbit"),
+    ],
+)
+def test_noncollinear_spin_mode_banner_is_in_qe_header(
+    lspinorb: bool, domag: bool, message: str
+) -> None:
+    case = CASES["scf_baseline"]
+    pw = read_pw_input(input_path(case))
+    pw.control["pseudo_dir"] = str(input_path(case).parents[1] / "pseudo")
+    pw.system.update(
+        {
+            "nspin": 4,
+            "noncolin": True,
+            "lspinorb": lspinorb,
+            "_domag": domag,
+        }
+    )
+
+    output = format_header(pw)
+    assert f"\n     {message}\n\n" in output
+
+
 def test_c2v_mirror_classes_follow_qe_double_group_axis_order():
     """QE fixes B1/B2 by mirror normals, not discovery order."""
     operations = (

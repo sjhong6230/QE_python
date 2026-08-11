@@ -25,7 +25,7 @@ from qepy_pw.xc import (
     pz81_unpolarized,
 )
 from qepy_pw.scf import SCFResult, run_scf
-from qepy_pw.pw.output import format_footer
+from qepy_pw.pw.output import _spin_mode_message, format_footer
 from qepy_pw.pw.scf import _spinor_nonlocal_derivatives, _xc_energy_potential
 from qepy_pw.pw.save import (
     read_saved_density,
@@ -117,6 +117,24 @@ def test_zero_noncollinear_starting_magnetization_disables_domag() -> None:
     assert pw.system["noncolin"] is True
     assert pw.system["_domag"] is False
     assert pw.system["starting_magnetization(1)"] == 0.0
+
+
+def test_qe_spin_mode_messages_cover_all_noncollinear_cases() -> None:
+    assert _spin_mode_message(
+        SimpleNamespace(system={"nspin": 4, "lspinorb": False})
+    ) == "Noncollinear calculation without spin-orbit"
+    assert _spin_mode_message(
+        SimpleNamespace(
+            system={"nspin": 4, "lspinorb": True, "_domag": True}
+        )
+    ) == "Noncollinear calculation with spin-orbit"
+    assert _spin_mode_message(
+        SimpleNamespace(
+            system={"nspin": 4, "lspinorb": True, "_domag": False}
+        )
+    ) == "Non magnetic calculation with spin-orbit"
+    assert _spin_mode_message(SimpleNamespace(system={"nspin": 2})) is None
+    assert _spin_mode_message(SimpleNamespace(system={"nspin": 1})) is None
 
 
 def test_noncollinear_input_rejects_gamma_only_representation() -> None:

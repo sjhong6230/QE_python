@@ -40,6 +40,23 @@ def _clean_zero(value: float, tolerance: float = 5.0e-12) -> float:
     return 0.0 if abs(value) < tolerance else float(value)
 
 
+def _format_scf_accuracy_ry(value: float) -> str:
+    """Format QE's F17.8/1PE17.1 SCF-accuracy field in Ry."""
+    accuracy = float(value)
+    return f"{accuracy:17.8f}" if accuracy > 1.0e-8 else f"{accuracy:17.1E}"
+
+
+def _spin_mode_message(pw: PWInput) -> str | None:
+    """Return the spinor calculation banner printed by QE summary.f90."""
+    if int(pw.system.get("nspin", 1)) != 4:
+        return None
+    if not bool(pw.system.get("lspinorb", False)):
+        return "Noncollinear calculation without spin-orbit"
+    if bool(pw.system.get("_domag", False)):
+        return "Noncollinear calculation with spin-orbit"
+    return "Non magnetic calculation with spin-orbit"
+
+
 def _qe_symmetry_operations(pw: PWInput):
     """Return operations in a stable, QE-like order, with identity first."""
     identity = np.eye(3, dtype=int)
@@ -268,6 +285,9 @@ def format_header(pw: PWInput) -> str:
         for index in range(2, 7)
     ]
     print(file=out)
+    spin_mode = _spin_mode_message(pw)
+    if spin_mode is not None:
+        print(f"     {spin_mode}\n", file=out)
     for start in (0, 3):
         print(
             "   "
@@ -597,7 +617,7 @@ def format_iteration(step: SCFIteration) -> str:
     if np.isfinite(step.estimated_accuracy_ha):
         print(
             f"     estimated scf accuracy    <"
-            f"{step.estimated_accuracy_ha * 2:17.8f} Ry\n",
+            f"{_format_scf_accuracy_ry(step.estimated_accuracy_ha * 2)} Ry\n",
             file=out,
         )
     return out.getvalue()
@@ -814,9 +834,12 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
     if calculation == "scf":
         print(f"\n{marker}    total energy              ={result.total_energy_ha * 2:17.8f} Ry", file=out)
     if result.iterations:
+        last_accuracy_ry = (
+            2.0 * result.iterations[-1].estimated_accuracy_ha
+        )
         print(
             f"     estimated scf accuracy    <"
-            f"{2.0 * result.iterations[-1].estimated_accuracy_ha:17.8f} Ry",
+            f"{_format_scf_accuracy_ry(last_accuracy_ry)} Ry",
             file=out,
         )
     if occupations_mode == "smearing" and result.energy_terms is not None:
