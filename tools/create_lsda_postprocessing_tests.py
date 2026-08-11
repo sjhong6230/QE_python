@@ -148,40 +148,96 @@ K_POINTS automatic
 BAND_PLOT = r'''
 from pathlib import Path
 import io
+import re
 import numpy as np
 import matplotlib.pyplot as plt
 
 ROOT = Path(__file__).resolve().parent
+LABELS = [r"$\Gamma$", "H", "N", r"$\Gamma$", "P", "H", "P", "N"]
+VERTICES_CRYSTAL = np.asarray([
+    [0.00, 0.00, 0.00],
+    [0.00, 0.00, 1.00],
+    [0.00, 0.50, 0.00],
+    [0.00, 0.00, 0.00],
+    [0.25, 0.25, 0.25],
+    [0.00, 0.00, 1.00],
+    [0.25, 0.25, 0.25],
+    [0.00, 0.50, 0.00],
+])
+POINTS_PER_SEGMENT = 30
+Y_LIMITS_EV = (-10.0, 15.0)
 
 def blocks(path):
     chunks = path.read_text(encoding="utf-8").strip().split("\n\n")
     return [np.loadtxt(io.StringIO(chunk)) for chunk in chunks if chunk.strip()]
 
+def requested_path():
+    # QE may print a symmetry-equivalent representative for each input k point.
+    # Construct the plotting coordinate from the requested crystal_b path so
+    # both implementations use exactly the same reciprocal-space abscissa.
+    cell = 0.5 * np.asarray([
+        [1.0, 1.0, 1.0],
+        [-1.0, 1.0, 1.0],
+        [-1.0, -1.0, 1.0],
+    ])
+    reciprocal = 2.0 * np.pi * np.linalg.inv(cell).T
+    cartesian = VERTICES_CRYSTAL @ reciprocal
+    vertex_x = np.concatenate((
+        [0.0],
+        np.cumsum(np.linalg.norm(np.diff(cartesian, axis=0), axis=1)),
+    ))
+    samples = [
+        np.linspace(vertex_x[index], vertex_x[index + 1],
+                    POINTS_PER_SEGMENT, endpoint=False)
+        for index in range(len(vertex_x) - 1)
+    ]
+    return np.concatenate((*samples, vertex_x[-1:])), vertex_x
+
+def fermi_energy(path):
+    matches = re.findall(
+        r"the Fermi energy is\s+([-+0-9.eEdD]+)\s+ev",
+        path.read_text(encoding="utf-8"),
+        flags=re.IGNORECASE,
+    )
+    if not matches:
+        raise RuntimeError(f"Fermi energy not found in {path}")
+    return float(matches[-1].replace("D", "E").replace("d", "e"))
+
+x, vertex_x = requested_path()
+plot_data = {"x": x, "vertex_x": vertex_x}
 fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharex=True, sharey=True,
                          constrained_layout=True)
-labels = [r"$\Gamma$", "H", "N", r"$\Gamma$", "P", "H", "P", "N"]
 for axis, implementation in zip(axes, ("QE", "python")):
     up = blocks(ROOT / implementation / "Fe.bands.up.dat.gnu")
     down = blocks(ROOT / implementation / "Fe.bands.down.dat.gnu")
-    for index, band in enumerate(up):
-        axis.plot(band[:, 0], band[:, 1], color="red", lw=0.9,
+    if len(up) != len(down) or any(len(band) != len(x) for band in (*up, *down)):
+        raise RuntimeError(f"incomplete band data for {implementation}")
+    fermi = fermi_energy(ROOT / implementation / "Fe.scf.out")
+    up_energies = np.asarray([band[:, 1] - fermi for band in up])
+    down_energies = np.asarray([band[:, 1] - fermi for band in down])
+    plot_data[f"{implementation}_fermi_ev"] = np.asarray(fermi)
+    plot_data[f"{implementation}_up_ev"] = up_energies
+    plot_data[f"{implementation}_down_ev"] = down_energies
+    for index, energy in enumerate(up_energies):
+        axis.plot(x, energy, color="red", lw=0.9,
                   label="spin up" if index == 0 else None)
-    for index, band in enumerate(down):
-        axis.plot(band[:, 0], band[:, 1], color="blue", lw=0.9,
+    for index, energy in enumerate(down_energies):
+        axis.plot(x, energy, color="blue", lw=0.9,
                   label="spin down" if index == 0 else None)
-    x = up[0][:, 0]
-    vertices = np.linspace(0, len(x) - 1, len(labels)).round().astype(int)
-    axis.set_xticks(x[vertices], labels)
-    for value in x[vertices]:
+    axis.set_xticks(vertex_x, LABELS)
+    for value in vertex_x:
         axis.axvline(value, color="0.75", lw=0.7)
     axis.axhline(0.0, color="0.5", lw=0.7, ls="--")
+    axis.set_xlim(x[0], x[-1])
+    axis.set_ylim(*Y_LIMITS_EV)
     axis.set_title(implementation)
     axis.set_xlabel("bcc Fe high-symmetry path")
     axis.grid(alpha=0.15)
-axes[0].set_ylabel("Kohn-Sham energy (eV)")
+axes[0].set_ylabel(r"$E-E_F$ (eV)")
 axes[0].legend(loc="best")
 fig.suptitle("LSDA bcc Fe bands: red=up, blue=down")
 fig.savefig(ROOT / "bands_qe_python.svg", format="svg")
+np.savez_compressed(ROOT / "bands_plot_data.npz", **plot_data)
 '''
 
 
@@ -197,8 +253,9 @@ py_up = np.interp(qe[:, 0], py[:, 0], py[:, 1])
 py_down = np.interp(qe[:, 0], py[:, 0], py[:, 2])
 
 def relative(candidate, reference):
-    floor = max(1.0e-12, 1.0e-4 * np.max(np.abs(reference)))
-    return (candidate - reference) / np.maximum(np.abs(reference), floor)
+    # Follow the stabilized denominator used by Si_dos_test so the empty DOS
+    # tails do not dominate the relative-error plot.
+    return (candidate - reference) / (np.abs(reference) + 1.0e-3)
 
 errors = np.column_stack((qe[:, 0], relative(py_up, qe[:, 1]),
                           relative(py_down, qe[:, 2])))
@@ -206,6 +263,7 @@ np.savetxt(ROOT / "dos_relative_error.dat", errors,
            header="energy_eV rel_error_up rel_error_down")
 fig, axes = plt.subplots(1, 2, figsize=(14, 5.5), sharex=True, sharey=True,
                          constrained_layout=True)
+limit = max(1.0e-6, float(np.percentile(np.abs(errors[:, 1:]), 99.5)))
 for axis, column, color, title in zip(
     axes, (1, 2), ("red", "blue"), ("spin up", "spin down")
 ):
@@ -213,6 +271,7 @@ for axis, column, color, title in zip(
     axis.axhline(0.0, color="black", lw=0.7)
     axis.set_title(title)
     axis.set_xlabel("Energy (eV)")
+    axis.set_ylim(-limit, limit)
     axis.grid(alpha=0.25)
 axes[0].set_ylabel("Stabilized relative error (Python-QE)/|QE|")
 fig.suptitle("LSDA bcc Fe DOS relative error")
@@ -232,8 +291,8 @@ FILES = {
 }
 
 def relative(candidate, reference):
-    floor = max(1.0e-12, 1.0e-4 * np.max(np.abs(reference)))
-    return (candidate - reference) / np.maximum(np.abs(reference), floor)
+    # Match the absolute stabilization used by Si_projwfc_test.
+    return (candidate - reference) / (np.abs(reference) + 1.0e-4)
 
 records = {}
 for orbital, filename in FILES.items():
@@ -263,12 +322,16 @@ mesh = None
 for row, (orbital, (energy, up, down)) in enumerate(records.items()):
     for column, (spin, error) in enumerate((("up", up), ("down", down))):
         axis = axes[row, column]
-        mesh = axis.pcolormesh(np.arange(1, energy.shape[0] + 1), energy[:, 0],
+        mesh = axis.pcolormesh(np.arange(1, energy.shape[0] + 1), energy[0],
                                error.T, shading="auto", cmap="bwr",
-                               vmin=-limit, vmax=limit)
+                               vmin=-limit, vmax=limit, rasterized=True)
         axis.set_title(f"{orbital}, spin {spin}")
         axis.set_ylabel("Energy (eV)")
         axis.set_xlabel("k-point index along path")
+        axis.set_xticks(
+            [1, 31, 61, 91, 121, 151, 181, 211],
+            [r"$\Gamma$", "H", "N", r"$\Gamma$", "P", "H", "P", "N"],
+        )
 fig.colorbar(mesh, ax=axes, label="Stabilized relative error")
 fig.suptitle("LSDA bcc Fe orbital PDOS: Python vs QE")
 fig.savefig(ROOT / "pdos_relative_error.svg", format="svg")
@@ -395,6 +458,7 @@ done
 
 echo "[7/8] Verify expected plots and raw comparison data"
 test -s "$BAND/bands_qe_python.svg"
+test -s "$BAND/bands_plot_data.npz"
 test -s "$DOS/dos_relative_error.svg"
 test -s "$DOS/dos_relative_error.dat"
 test -s "$PROJ/pdos_relative_error.svg"
@@ -417,6 +481,35 @@ for directory in \
   esac
 done
 echo "All LSDA post-processing comparisons completed."
+'''
+
+
+RUN_PP_ONLY = r'''
+#!/bin/bash
+set -euo pipefail
+
+PP=/home/sjhong6230/QE_python_test/lsda_pp_test
+QE_BIN=/home/sjhong6230/qe-7.5/bin
+PY_BIN=/home/sjhong6230/miniconda3/envs/DFT/bin
+
+run_qe() {
+  (cd "$PP/QE" && OMP_NUM_THREADS=1 mpirun -np 2 \
+    "$QE_BIN/pp.x" -in "$1" > "$2")
+}
+run_python() {
+  (cd "$PP/python" && QEPY_NUM_THREADS=2 OMP_NUM_THREADS=2 \
+    OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+    "$PY_BIN/pp.py" -in "$1" > "$2")
+}
+
+for input_path in "$PP/QE"/Fe.*.pp.in; do
+  input_name=$(basename "$input_path")
+  output_name=${input_name%.in}.out
+  echo "pp.x: $input_name"
+  run_qe "$input_name" "$output_name"
+  run_python "$input_name" "$output_name"
+done
+"$PY_BIN/python" "$PP/plot_comparison.py"
 '''
 
 
@@ -523,6 +616,7 @@ def main() -> None:
     write(ROOT / "lsda_projwfc_test" / "plot_comparison.py", PROJWFC_PLOT)
     write(ROOT / "lsda_pp_test" / "plot_comparison.py", PP_PLOT)
     write(ROOT / "run_lsda_postprocessing_tests.sh", RUN_ALL, executable=True)
+    write(ROOT / "run_lsda_pp_only.sh", RUN_PP_ONLY, executable=True)
 
 
 if __name__ == "__main__":
