@@ -249,8 +249,18 @@ import matplotlib.pyplot as plt
 ROOT = Path(__file__).resolve().parent
 qe = np.loadtxt(ROOT / "QE" / "Fe.dos.dat")
 py = np.loadtxt(ROOT / "python" / "Fe.dos.dat")
-py_up = np.interp(qe[:, 0], py[:, 0], py[:, 1])
-py_down = np.interp(qe[:, 0], py[:, 0], py[:, 2])
+if qe.shape != py.shape or not np.array_equal(qe[:, 0], py[:, 0]):
+    maximum_offset = (
+        np.inf
+        if qe.shape != py.shape
+        else float(np.max(np.abs(qe[:, 0] - py[:, 0])))
+    )
+    raise RuntimeError(
+        f"QE/Python DOS energy grids differ: {qe.shape} vs {py.shape}, "
+        f"max offset={maximum_offset:.6e} eV"
+    )
+py_up = py[:, 1]
+py_down = py[:, 2]
 
 def relative(candidate, reference):
     # Follow the stabilized denominator used by Si_dos_test so the empty DOS
@@ -591,6 +601,8 @@ def main() -> None:
   bz_sum = 'smearing'
   ngauss = 1
   degauss = 0.01
+  Emin = -71.0
+  Emax = 43.0
   DeltaE = 0.02
 /
 """)
