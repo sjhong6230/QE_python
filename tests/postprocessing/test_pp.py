@@ -28,6 +28,7 @@ from qepy_pw.pp.pp import (
     _spherical_average_values,
     _saved_smearing_metadata,
     _stm_window_weights,
+    _spinor_grid_quantity,
     _symmetrize_wave_field,
     _wave_density_sum,
     _wave_grid,
@@ -83,9 +84,10 @@ def test_pp_reads_qe_interleaved_charge_density_hdf5(tmp_path: Path) -> None:
     expected_coefficients = np.zeros(shape, dtype=complex)
     expected_coefficients[tuple(miller.T)] = coefficients
     expected = np.real(np.fft.ifftn(expected_coefficients * np.prod(shape)))
-    total, spins = _read_density(tmp_path, shape)
+    total, spins, magnetization = _read_density(tmp_path, shape)
     np.testing.assert_allclose(total, expected)
     np.testing.assert_allclose(spins, expected[None, ...])
+    np.testing.assert_allclose(magnetization, 0.0)
 
 
 def test_pp_reconstructs_lsda_spin_density_and_magnetization(tmp_path: Path) -> None:
@@ -97,12 +99,96 @@ def test_pp_reconstructs_lsda_spin_density_and_magnetization(tmp_path: Path) -> 
         h5.create_dataset("rhotot_g", data=np.asarray([2.0 + 0.0j]))
         h5.create_dataset("rhodiff_g", data=np.asarray([0.5 + 0.0j]))
 
-    total, spins = _read_density(tmp_path, shape)
+    total, spins, magnetization = _read_density(tmp_path, shape)
 
     np.testing.assert_allclose(total, 2.0)
     np.testing.assert_allclose(spins[0], 1.25)
     np.testing.assert_allclose(spins[1], 0.75)
     np.testing.assert_allclose(spins[0] - spins[1], 0.5)
+    np.testing.assert_allclose(magnetization, 0.0)
+
+
+def test_pp_reconstructs_noncollinear_pauli_density(tmp_path: Path) -> None:
+    shape = (2, 2, 2)
+    with h5py.File(tmp_path / "charge-density.hdf5", "w") as h5:
+        h5.attrs["gamma_only"] = ".FALSE."
+        h5.attrs["nspin"] = 4
+        h5.create_dataset("MillerIndices", data=np.asarray([[0, 0, 0]]))
+        h5.create_dataset("rhotot_g", data=np.asarray([2.0 + 0.0j]))
+        h5.create_dataset("m_x", data=np.asarray([0.25 + 0.0j]))
+        h5.create_dataset("m_y", data=np.asarray([-0.5 + 0.0j]))
+        h5.create_dataset("m_z", data=np.asarray([0.75 + 0.0j]))
+
+    total, spins, magnetization = _read_density(tmp_path, shape)
+
+    np.testing.assert_allclose(total, 2.0)
+    np.testing.assert_allclose(spins, total[None, ...])
+    np.testing.assert_allclose(
+        magnetization,
+        np.broadcast_to(
+            np.asarray((0.25, -0.5, 0.75))[:, None, None, None],
+            (3,) + shape,
+        ),
+    )
+
+
+def test_pp_spinor_grid_charge_and_magnetization_components() -> None:
+    up = np.asarray([[[1.0 + 0.5j]]])
+    down = np.asarray([[[-0.25 + 0.75j]]])
+    wave = np.asarray((up, down))
+    coherence = np.conjugate(up) * down
+
+    np.testing.assert_allclose(
+        _spinor_grid_quantity(wave, 0), np.abs(up) ** 2 + np.abs(down) ** 2
+    )
+    np.testing.assert_allclose(
+        _spinor_grid_quantity(wave, 1), 2.0 * np.real(coherence)
+    )
+    np.testing.assert_allclose(
+        _spinor_grid_quantity(wave, 2), 2.0 * np.imag(coherence)
+    )
+    np.testing.assert_allclose(
+        _spinor_grid_quantity(wave, 3), np.abs(up) ** 2 - np.abs(down) ** 2
+    )
+
+
+def test_pp_noncollinear_magnetization_and_xc_field_plots(saved_state) -> None:
+    magnetization = np.asarray(
+        (
+            0.10 * saved_state.density,
+            -0.20 * saved_state.density,
+            0.30 * saved_state.density,
+        )
+    )
+    state = replace(
+        saved_state,
+        noncolin=True,
+        spinorbit=True,
+        magnetization_density=magnetization,
+    )
+
+    magnitude = extract_plot_grids(
+        state, {"plot_num": 13, "spin_component": 0}
+    )[0][1].values
+    y_component = extract_plot_grids(
+        state, {"plot_num": 13, "spin_component": 2}
+    )[0][1].values
+    np.testing.assert_allclose(magnitude, np.linalg.norm(magnetization, axis=0))
+    np.testing.assert_allclose(y_component, magnetization[1])
+
+    field_magnitude = extract_plot_grids(
+        state, {"plot_num": 18, "spin_component": 0}
+    )[0][1].values
+    field_components = np.asarray([
+        extract_plot_grids(
+            state, {"plot_num": 18, "spin_component": component}
+        )[0][1].values
+        for component in (1, 2, 3)
+    ])
+    assert np.all(np.isfinite(field_components))
+    np.testing.assert_allclose(
+        field_magnitude, np.linalg.norm(field_components, axis=0), atol=2.0e-13
+    )
 
 
 def test_pp_reads_degauss_from_qe_smearing_attribute() -> None:
@@ -418,8 +504,11 @@ def test_pp_renders_every_multi_orbital_extraction(
 
 
 def test_pp_rejects_unimplemented_spinor_and_paw_paths(saved_state) -> None:
-    for plot_num in (13, 17, 18, 21, 24):
+    for plot_num in (17, 21, 24):
         with pytest.raises(UnsupportedFeatureError):
+            extract_plot_grids(saved_state, {"plot_num": plot_num})
+    for plot_num in (13, 18):
+        with pytest.raises(QEInputError, match="noncollinear"):
             extract_plot_grids(saved_state, {"plot_num": plot_num})
 
     with pytest.raises(QEInputError, match="LSDA"):

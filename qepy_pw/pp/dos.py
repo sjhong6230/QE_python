@@ -42,6 +42,7 @@ class DOSData:
     mapping: np.ndarray | None
     reciprocal: np.ndarray | None
     spins: np.ndarray | None = None
+    noncolin: bool = False
 
     @property
     def spin_labels(self) -> np.ndarray:
@@ -57,6 +58,8 @@ class DOSData:
 
     @property
     def nspin(self) -> int:
+        if self.noncolin:
+            return 4
         return int(np.max(self.spin_labels, initial=1))
 
 
@@ -83,6 +86,9 @@ def read_saved_dos(prefix: str, outdir: str | None) -> DOSData:
     lsda = (bands.findtext("qes:lsda", default="false", namespaces=ns) or "").strip().lower() in {
         "true", ".true.", "t", "1"
     }
+    noncolin = (
+        bands.findtext("qes:noncolin", default="false", namespaces=ns) or ""
+    ).strip().lower() in {"true", ".true.", "t", "1"}
     spins = spin_labels(lsda, len(records))
     validate_spin_blocks(np.vstack(kpoints), spins)
     weights_array = normalize_spin_weights(np.asarray(weights, dtype=float), spins)
@@ -105,7 +111,7 @@ def read_saved_dos(prefix: str, outdir: str | None) -> DOSData:
         bands.findtext("qes:occupations_kind", default="fixed", namespaces=ns),
         bands.findtext("qes:smearing", default="gaussian", namespaces=ns),
         float(bands.findtext("qes:degauss", default="0", namespaces=ns)),
-        grid, mapping, reciprocal, spins,
+        grid, mapping, reciprocal, spins, noncolin,
     )
 
 
@@ -129,7 +135,7 @@ def smearing_dos_channels(
     labels = data.spin_labels
     degeneracy = 2.0 if data.nspin == 1 else 1.0
     channels = []
-    for spin in range(1, data.nspin + 1):
+    for spin in np.unique(labels):
         selected = labels == spin
         x = (
             grid_ev[:, None, None]
@@ -171,7 +177,7 @@ def tetrahedron_dos_channels(
     ntetra = len(tetra)
     degeneracy = 2.0 if data.nspin == 1 else 1.0
     densities, integrated_values = [], []
-    for spin in range(1, data.nspin + 1):
+    for spin in np.unique(labels):
         effective = _tetrahedron_effective_energies(
             np.asarray(data.eigenvalues_ev)[labels == spin],
             tetra,

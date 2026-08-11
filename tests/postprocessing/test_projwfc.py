@@ -137,6 +137,59 @@ def test_lsda_pdos_writes_up_down_columns_and_spin_metadata(
     assert kresolved[3, 3] > kresolved[3, 2]
 
 
+def test_noncollinear_pdos_uses_one_state_per_spinor_band(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    save = tmp_path / "gold.save"
+    save.mkdir()
+    saved = DOSData(
+        np.asarray([[0.0]]),
+        np.asarray([1.0]),
+        0.0,
+        "smearing",
+        "gaussian",
+        0.01,
+        None,
+        None,
+        None,
+        np.asarray([1], dtype=np.int8),
+        True,
+    )
+    orbital = Orbital(1, "Au", 1, 2, 0, "5D+", 2.5, -2.5)
+    projections = ProjectionData(
+        energies_ev=saved.eigenvalues_ev,
+        weights=saved.weights,
+        projections=np.ones((1, 1, 1)),
+        amplitudes=np.ones((1, 1, 1), dtype=complex),
+        occupations=np.ones((1, 1)),
+        orbitals=(orbital,),
+        overlaps=(np.eye(1),),
+        fermi_ev=0.0,
+        spins=np.asarray([1], dtype=np.int8),
+        noncolin=True,
+    )
+    monkeypatch.setattr(projwfc_module, "read_saved_dos", lambda *_args: saved)
+    monkeypatch.setattr(
+        projwfc_module, "compute_projections", lambda *_args, **_kwargs: projections
+    )
+    monkeypatch.chdir(tmp_path)
+
+    data, paths = run_projwfc({
+        "prefix": "gold",
+        "outdir": str(tmp_path),
+        "filpdos": "gold",
+        "degauss": 0.02,
+        "emin": -5.0,
+        "emax": 5.0,
+        "deltae": 0.01,
+    })
+
+    values = np.loadtxt(tmp_path / "gold.pdos_tot")
+    assert data.nspin == 4
+    assert np.trapezoid(values[:, 1], values[:, 0]) == pytest.approx(1.0, abs=2e-3)
+    assert any("d_j2.5" in str(path) for path in paths)
+
+
 def test_lsda_projection_summary_reports_lowdin_polarization() -> None:
     data = ProjectionData(
         energies_ev=np.asarray([[0.0], [0.0]]),

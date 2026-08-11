@@ -24,6 +24,10 @@ from ..errors import QEInputError, UnsupportedFeatureError, emit_qe_error
 from ..occupations import smearing_density, smearing_order, w1gauss
 from ..qe_format import format_qe_closing, format_qe_opening, format_qe_timing
 from ..symmetry import DensitySymmetrizer, SymmetryOperation
+from ..spinor import (
+    eigenchannel_densities,
+    potential_components as noncollinear_potential_components,
+)
 from ..threads import hybrid_thread_count
 from ..upf import read_upf
 from ..version import __version__
@@ -115,6 +119,10 @@ class SavedPPState:
     symmetry_operations: tuple[SymmetryOperation, ...]
     gamma_only: bool
     spins: np.ndarray
+    noncolin: bool = False
+    spinorbit: bool = False
+    magnetization_density: np.ndarray | None = None
+    noncollinear_gga_axis: np.ndarray | None = None
     ibrav: int = 0
     celldm: tuple[float, float, float, float, float, float] = (0.0,) * 6
 
@@ -128,10 +136,19 @@ class SavedPPState:
 
     @property
     def nspin(self) -> int:
+        if self.noncolin:
+            return 4
         return int(np.max(self.spins, initial=1))
 
     @property
     def magnetization(self) -> np.ndarray:
+        if self.noncolin:
+            if self.magnetization_density is None:
+                raise QEInputError(
+                    "saved noncollinear magnetization density is missing",
+                    routine="postproc",
+                )
+            return np.linalg.norm(self.magnetization_density, axis=0)
         if self.nspin == 1:
             return np.zeros_like(self.density)
         return self.spin_densities[0] - self.spin_densities[1]
@@ -269,7 +286,7 @@ def _saved_smearing_metadata(
 
 def _read_density(
     directory: Path, shape: tuple[int, int, int]
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     import h5py
 
     path = directory / "charge-density.hdf5"
@@ -281,6 +298,11 @@ def _read_density(
             nspin = int(h5.attrs.get("nspin", 1))
             raw_difference = (
                 np.asarray(h5["rhodiff_g"][:]) if nspin == 2 else None
+            )
+            raw_magnetization = (
+                tuple(np.asarray(h5[name][:]) for name in ("m_x", "m_y", "m_z"))
+                if nspin == 4
+                else ()
             )
     except (OSError, KeyError, ValueError) as exc:
         raise QEInputError(f"cannot read charge density {path}: {exc}", routine="postproc") from exc
@@ -296,7 +318,7 @@ def _read_density(
         return result
 
     total_coefficients = coefficients(raw)
-    if miller.shape != (len(total_coefficients), 3) or nspin not in {1, 2}:
+    if miller.shape != (len(total_coefficients), 3) or nspin not in {1, 2, 4}:
         raise QEInputError("saved charge density has an unsupported layout", routine="postproc")
 
     def real_field(values: np.ndarray) -> np.ndarray:
@@ -311,11 +333,23 @@ def _read_density(
 
     total = real_field(total_coefficients)
     if nspin == 1:
-        return total, total[None, ...]
+        return total, total[None, ...], np.zeros((3,) + shape)
+    if nspin == 4:
+        if len(raw_magnetization) != 3:
+            raise QEInputError(
+                "saved noncollinear charge density has no magnetization components",
+                routine="postproc",
+            )
+        magnetization = np.asarray(
+            [real_field(coefficients(component)) for component in raw_magnetization]
+        )
+        return total, total[None, ...], magnetization
     assert raw_difference is not None
     difference = real_field(coefficients(raw_difference))
-    return total, np.asarray(
-        (0.5 * (total + difference), 0.5 * (total - difference))
+    return (
+        total,
+        np.asarray((0.5 * (total + difference), 0.5 * (total - difference))),
+        np.zeros((3,) + shape),
     )
 
 
@@ -333,9 +367,12 @@ def read_saved_pp(prefix: str = "pwscf", outdir: str | None = None) -> SavedPPSt
     if _bool_text(findtext(root, "output/algorithmic_info/uspp")):
         raise UnsupportedFeatureError("ultrasoft pp.x post-processing", routine="postproc")
     lsda = _bool_text(findtext(root, "output/band_structure/lsda"))
-    for name in ("noncolin", "spinorbit"):
-        if _bool_text(findtext(root, f"output/band_structure/{name}")):
-            raise UnsupportedFeatureError("spinor pp.x post-processing", routine="postproc")
+    noncolin = _bool_text(findtext(root, "output/band_structure/noncolin"))
+    spinorbit = _bool_text(findtext(root, "output/band_structure/spinorbit"))
+    if lsda and noncolin:
+        raise QEInputError(
+            "saved data cannot be both LSDA and noncollinear", routine="postproc"
+        )
 
     structure = find(root, "output/atomic_structure")
     if structure is None:
@@ -358,13 +395,21 @@ def read_saved_pp(prefix: str = "pwscf", outdir: str | None = None) -> SavedPPSt
         entry.attrib.get("name", ""): findtext(entry, "pseudo_file", "") or ""
         for entry in species_entries
     }
+    saved_pseudo_dir_text = (
+        findtext(root, "input/control_variables/pseudo_dir", "") or ""
+    ).strip()
+    saved_pseudo_dir = Path(saved_pseudo_dir_text).expanduser()
     pseudos = {}
     species = []
     starting_magnetizations = []
+    starting_vectors: dict[str, np.ndarray] = {}
     for symbol, pseudo_name in pseudo_names.items():
         if not pseudo_name:
             raise QEInputError(f"saved species {symbol} has no pseudopotential", routine="postproc")
-        pseudo = read_upf(directory / Path(pseudo_name).name)
+        pseudo_path = directory / Path(pseudo_name).name
+        if not pseudo_path.is_file() and saved_pseudo_dir_text:
+            pseudo_path = saved_pseudo_dir / Path(pseudo_name).name
+        pseudo = read_upf(pseudo_path)
         if pseudo.pseudo_type.upper() != "NC":
             raise UnsupportedFeatureError(
                 f"{pseudo.pseudo_type} pp.x post-processing", routine="postproc"
@@ -376,8 +421,18 @@ def read_saved_pp(prefix: str = "pwscf", outdir: str | None = None) -> SavedPPSt
             for entry in species_entries
             if entry.attrib.get("name", "") == symbol
         )
-        starting_magnetizations.append(
-            float(findtext(species_entry, "starting_magnetization", "0") or 0.0)
+        starting_magnetization = float(
+            findtext(species_entry, "starting_magnetization", "0") or 0.0
+        )
+        starting_magnetizations.append(starting_magnetization)
+        theta = float(findtext(species_entry, "spin_teta", "0") or 0.0)
+        phi = float(findtext(species_entry, "spin_phi", "0") or 0.0)
+        starting_vectors[symbol] = starting_magnetization * np.asarray(
+            (
+                np.sin(theta) * np.cos(phi),
+                np.sin(theta) * np.sin(phi),
+                np.cos(theta),
+            )
         )
     species_index = {symbol: index + 1 for index, (symbol, _z) in enumerate(species)}
     atoms = []
@@ -387,6 +442,18 @@ def read_saved_pp(prefix: str = "pwscf", outdir: str | None = None) -> SavedPPSt
             raise QEInputError(f"saved atom has unknown species {symbol!r}", routine="postproc")
         position = np.fromstring(entry.text or "", sep=" ")
         atoms.append(PPAtom(symbol, position, species_index[symbol], float(pseudos[symbol].z_valence)))
+    gga_axis = None
+    atom_vectors = [starting_vectors[atom.symbol] for atom in atoms]
+    for atom_index, vector in enumerate(atom_vectors):
+        if float(np.dot(vector, vector)) <= 1.0e-12:
+            continue
+        if all(
+            float(np.dot(np.cross(vector, other), np.cross(vector, other)))
+            < 1.0e-6
+            for other in atom_vectors[atom_index + 1 :]
+        ):
+            gga_axis = vector / np.linalg.norm(vector)
+        break
 
     bands = find(root, "output/band_structure")
     smearing, degauss_ha = _saved_smearing_metadata(bands)
@@ -411,7 +478,7 @@ def read_saved_pp(prefix: str = "pwscf", outdir: str | None = None) -> SavedPPSt
     # Upstream QE's scalar XML stores per-spin occupations in [0, 1], while
     # qepy-pw stores the already spin-degenerate [0, 2] occupations used by
     # its SCF density builder.  Normalize both representations to [0, 2].
-    if upstream_qe_xml(root) and not lsda:
+    if upstream_qe_xml(root) and not lsda and not noncolin:
         occupation_array *= 2.0
     spins = spin_labels(lsda, len(records))
     validate_spin_blocks(np.vstack(kpoints), spins)
@@ -432,6 +499,11 @@ def read_saved_pp(prefix: str = "pwscf", outdir: str | None = None) -> SavedPPSt
     symmetry_entries = findall(root, "output/band_structure/symmetry_operations/symmetry")
     if not symmetry_entries:
         symmetry_entries = findall(root, "output/symmetries/symmetry")
+        symmetry_count = int(
+            findtext(root, "output/symmetries/nsym", str(len(symmetry_entries)))
+            or len(symmetry_entries)
+        )
+        symmetry_entries = symmetry_entries[:symmetry_count]
     for entry in symmetry_entries:
         rotation_values = np.fromstring(findtext(entry, "rotation", "") or "", sep=" ")
         translation = np.fromstring(findtext(entry, "fractional_translation", "") or "", sep=" ")
@@ -446,8 +518,10 @@ def read_saved_pp(prefix: str = "pwscf", outdir: str | None = None) -> SavedPPSt
         operations.append(SymmetryOperation(rotation, translation))
     if not operations:
         operations.append(SymmetryOperation(np.eye(3, dtype=int), np.zeros(3)))
-    density, spin_densities = _read_density(directory, shape)
-    if (len(spin_densities) == 2) != lsda:
+    density, spin_densities, magnetization_density = _read_density(directory, shape)
+    if (len(spin_densities) == 2) != lsda or (
+        np.any(magnetization_density) and not noncolin
+    ):
         raise QEInputError(
             "XML spin metadata disagrees with the saved charge density",
             routine="postproc",
@@ -463,6 +537,7 @@ def read_saved_pp(prefix: str = "pwscf", outdir: str | None = None) -> SavedPPSt
         pseudos=pseudos,
         density=density,
         spin_densities=spin_densities,
+        magnetization_density=magnetization_density,
         energies_ha=energy_array,
         occupations=occupation_array,
         weights=weight_array,
@@ -475,6 +550,9 @@ def read_saved_pp(prefix: str = "pwscf", outdir: str | None = None) -> SavedPPSt
         symmetry_operations=tuple(operations),
         gamma_only=_bool_text(findtext(root, "output/basis_set/gamma_only", "false")),
         spins=spins,
+        noncolin=noncolin,
+        spinorbit=spinorbit,
+        noncollinear_gga_axis=gga_axis,
         ibrav=ibrav,
         celldm=celldm,
     )
@@ -589,7 +667,44 @@ def _spectral_hessian(values: np.ndarray, lattice: np.ndarray) -> np.ndarray:
 
 def _xc_potentials(state: SavedPPState) -> np.ndarray:
     core = _core_density(state)
-    if state.nspin == 1:
+    direction = None
+    if state.noncolin:
+        if state.magnetization_density is None:
+            raise QEInputError(
+                "saved noncollinear magnetization density is missing",
+                routine="postproc",
+            )
+        pauli_density = np.concatenate(
+            ((state.density + core)[None, ...], state.magnetization_density),
+            axis=0,
+        )
+        densities, direction = eigenchannel_densities(
+            pauli_density, state.noncollinear_gga_axis
+        )
+        if state.functional in {"pz", "pw"}:
+            _epsilon, channel_potentials = lsda_lda(
+                densities, state.functional
+            )
+            return noncollinear_potential_components(
+                channel_potentials, direction
+            )
+        gradients = np.asarray([
+            _spectral_gradient(density, state.lattice) for density in densities
+        ])
+        _epsilon, local_potentials, exchange, correlation = pbe_spin_components(
+            densities, gradients, functional=state.functional
+        )
+        total_gradient = gradients[0] + gradients[1]
+        fluxes = np.asarray([
+            np.moveaxis(
+                exchange[spin][None, ...] * gradients[spin]
+                + correlation[None, ...] * total_gradient,
+                0,
+                -1,
+            )
+            for spin in range(2)
+        ])
+    elif state.nspin == 1:
         density = state.density + core
         if state.functional == "pz":
             return pz81_unpolarized(density)[1][None, ...]
@@ -631,12 +746,14 @@ def _xc_potentials(state: SavedPPState) -> np.ndarray:
             component = np.fft.fftn(fluxes[spin, ..., axis]) / state.density.size
             divergence += _inverse_coefficients(1j * g[..., axis] * component)
         potentials[spin] = local_potentials[spin] - divergence
+    if direction is not None:
+        return noncollinear_potential_components(potentials, direction)
     return potentials
 
 
 def _xc_potential(state: SavedPPState, spin_component: int = 0) -> np.ndarray:
     potentials = _xc_potentials(state)
-    if state.nspin == 1:
+    if state.nspin in {1, 4}:
         return potentials[0]
     if spin_component == 0:
         return 0.5 * (potentials[0] + potentials[1])
@@ -652,21 +769,64 @@ def _read_wavefunction(state: SavedPPState, kpoint: int) -> tuple[np.ndarray, np
             miller = np.asarray(h5["MillerIndices"][:], dtype=np.int64)
             raw = np.asarray(h5["evc"][:])
             xk = np.asarray(h5.attrs.get("xk", np.zeros(3)), dtype=float)
+            npol = int(h5.attrs.get("npol", 2 if state.noncolin else 1))
     except (OSError, KeyError, ValueError) as exc:
         raise QEInputError(f"cannot read wavefunctions {path}: {exc}", routine="punch_plot") from exc
     if np.issubdtype(raw.dtype, np.floating):
-        if raw.ndim != 2 or raw.shape[1] != 2 * len(miller):
+        if raw.ndim != 2 or raw.shape[1] != 2 * npol * len(miller):
             raise QEInputError(f"invalid interleaved wavefunctions in {path}", routine="punch_plot")
         coefficients = (raw[:, 0::2] + 1j * raw[:, 1::2]).T
     else:
         coefficients = np.asarray(raw, dtype=np.complex128).T
+    if npol not in {1, 2} or coefficients.shape[0] != npol * len(miller):
+        raise QEInputError(f"invalid spinor layout in {path}", routine="punch_plot")
+    if state.noncolin != (npol == 2):
+        raise QEInputError(
+            f"wavefunction spinor metadata disagrees with {path}",
+            routine="punch_plot",
+        )
     return miller, coefficients, xk
 
 
 def _wave_grid(miller: np.ndarray, coefficients: np.ndarray, shape: tuple[int, int, int], volume: float) -> np.ndarray:
-    grid = np.zeros(shape, dtype=np.complex128)
-    grid[tuple((miller % np.asarray(shape)).T)] = coefficients
-    return np.fft.ifftn(grid) * grid.size / np.sqrt(volume)
+    rows = len(miller)
+    if len(coefficients) not in {rows, 2 * rows}:
+        raise QEInputError(
+            "wavefunction coefficients do not match Miller indices",
+            routine="punch_plot",
+        )
+    components = len(coefficients) // rows
+    grids = np.zeros((components,) + shape, dtype=np.complex128)
+    slots = tuple((miller % np.asarray(shape)).T)
+    for component in range(components):
+        grids[(component,) + slots] = coefficients[
+            component * rows : (component + 1) * rows
+        ]
+    waves = np.fft.ifftn(grids, axes=(-3, -2, -1))
+    waves *= int(np.prod(shape)) / np.sqrt(volume)
+    return waves[0] if components == 1 else waves
+
+
+def _spinor_grid_quantity(wave: np.ndarray, spin_component: int) -> np.ndarray:
+    """Return QE's charge or Pauli component for one real-space spinor."""
+    if wave.ndim == 3:
+        if spin_component:
+            raise QEInputError(
+                "spin_component requires a noncollinear calculation",
+                routine="punch_plot",
+            )
+        return np.abs(wave) ** 2
+    up, down = wave
+    if spin_component == 0:
+        return np.abs(up) ** 2 + np.abs(down) ** 2
+    coherence = np.conjugate(up) * down
+    if spin_component == 1:
+        return 2.0 * np.real(coherence)
+    if spin_component == 2:
+        return 2.0 * np.imag(coherence)
+    if spin_component == 3:
+        return np.abs(up) ** 2 - np.abs(down) ** 2
+    raise QEInputError("wrong spin_component", routine="postproc")
 
 
 def _wave_density_sum(
@@ -684,7 +844,7 @@ def _wave_density_sum(
         miller, coefficients, xk = _read_wavefunction(state, ik)
         for band in np.flatnonzero(factors[ik]):
             wave = _wave_grid(miller, coefficients[:, band], state.shape, state.volume)
-            result += factors[ik, band] * np.abs(wave) ** 2
+            result += factors[ik, band] * _spinor_grid_quantity(wave, 0)
     return result
 
 
@@ -693,8 +853,9 @@ def _kinetic_density_sum(state: SavedPPState, factors: np.ndarray) -> np.ndarray
     workers = hybrid_thread_count()
     shape_array = np.asarray(state.shape)
     point_count = int(np.prod(state.shape))
+    spin_components = 2 if state.noncolin else 1
     wave_scale_squared = point_count**2 / state.volume
-    bytes_per_band = 3 * point_count * (16 + 16 + 8)
+    bytes_per_band = spin_components * 3 * point_count * (16 + 16 + 8)
     # Bound all concurrent complex FFT buffers and modulus workspaces to
     # approximately 256 MiB, independently of the requested thread count.
     per_worker_budget = (256 * 1024**2) // workers
@@ -708,6 +869,9 @@ def _kinetic_density_sum(state: SavedPPState, factors: np.ndarray) -> np.ndarray
             return contribution
         miller, coefficients, xk = _read_wavefunction(state, ik)
         gk = miller @ state.reciprocal + xk
+        coefficient_components = coefficients.reshape(
+            spin_components, len(miller), coefficients.shape[1]
+        )
         indices = tuple((miller % shape_array).T)
         plans = getattr(thread_data, "plans", None)
         if plans is None:
@@ -715,10 +879,11 @@ def _kinetic_density_sum(state: SavedPPState, factors: np.ndarray) -> np.ndarray
             thread_data.plans = plans
         for begin in range(0, len(bands), bands_per_chunk):
             selected = bands[begin : begin + bands_per_chunk]
-            plan_data = plans.get(len(selected))
+            fft_batch = spin_components * len(selected)
+            plan_data = plans.get(fft_batch)
             if plan_data is None:
                 reciprocal_grids = pyfftw.empty_aligned(
-                    (len(selected), 3) + state.shape, dtype="complex128"
+                    (fft_batch, 3) + state.shape, dtype="complex128"
                 )
                 derivatives = pyfftw.empty_aligned(
                     reciprocal_grids.shape, dtype="complex128"
@@ -733,17 +898,22 @@ def _kinetic_density_sum(state: SavedPPState, factors: np.ndarray) -> np.ndarray
                     normalise_idft=True,
                 )
                 plan_data = reciprocal_grids, derivatives, fft_plan
-                plans[len(selected)] = plan_data
+                plans[fft_batch] = plan_data
             reciprocal_grids, derivatives, fft_plan = plan_data
             reciprocal_grids.fill(0.0)
+            selected_coefficients = coefficient_components[:, :, selected]
+            selected_coefficients = selected_coefficients.transpose(0, 2, 1)
+            selected_coefficients = selected_coefficients.reshape(
+                fft_batch, len(miller)
+            )
             for axis in range(3):
                 reciprocal_grids[(slice(None), axis) + indices] = (
-                    1j * gk[:, axis, None] * coefficients[:, selected]
-                ).T
+                    1j * gk[:, axis][None, :] * selected_coefficients
+                )
             fft_plan()
             contribution += np.einsum(
                 "b,baxyz->xyz",
-                factors[ik, selected],
+                np.tile(factors[ik, selected], spin_components),
                 np.abs(derivatives) ** 2 * wave_scale_squared,
                 optimize=True,
             )
@@ -867,22 +1037,25 @@ def extract_plot_grids(state: SavedPPState, options: dict[str, object]) -> list[
     spin_component = int(
         options.get("spin_component", options.get("spin_component(1)", 0))
     )
-    if plot_num != 7 and spin_component not in {0, 1, 2}:
+    allowed_spin_components = (
+        {0, 1, 2, 3} if plot_num in {7, 13, 18} else {0, 1, 2}
+    )
+    if spin_component not in allowed_spin_components:
         raise QEInputError("wrong spin_component", routine="postproc")
     if any(int(options.get(f"nc({index})", 1)) != 1 for index in range(1, 4)):
         raise QEInputError("nc can be used only for plot_num=25", routine="postproc")
     if any(int(options.get(f"n0({index})", 0)) != 0 for index in range(1, 4)):
         raise QEInputError("n0 can be used only for plot_num=25", routine="postproc")
     unsupported = {
-        12: "sawtooth electric-field potential", 13: "noncollinear magnetization",
+        12: "sawtooth electric-field potential",
         14: "polarization", 15: "polarization",
         16: "polarization", 17: "PAW all-electron valence density",
-        18: "noncollinear XC magnetic field", 21: "PAW all-electron density",
+        21: "PAW all-electron density",
         24: "ultrasoft all-electron reconstruction", 25: "DFT+U Hubbard projectors",
     }
     if plot_num in unsupported:
         raise UnsupportedFeatureError(f"pp.x plot_num={plot_num} ({unsupported[plot_num]})", routine="punch_plot")
-    if plot_num not in {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 19, 20, 22, 23, 123}:
+    if plot_num not in {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 18, 19, 20, 22, 23, 123}:
         raise QEInputError("Wrong plot_num", routine="postproc")
     filplot = Path(str(options.get("filplot", "tmp.pp")))
     title = str(options.get("title", " "))
@@ -915,6 +1088,32 @@ def extract_plot_grids(state: SavedPPState, options: dict[str, object]) -> list[
             filplot,
             _grid_from_state(state, title, plot_num, state.magnetization),
         )]
+    if plot_num == 13:
+        if not state.noncolin or state.magnetization_density is None:
+            raise QEInputError(
+                "plot_num=13 requires a noncollinear calculation",
+                routine="postproc",
+            )
+        values = (
+            np.linalg.norm(state.magnetization_density, axis=0)
+            if spin_component == 0
+            else state.magnetization_density[spin_component - 1]
+        )
+        return [(filplot, _grid_from_state(state, title, plot_num, values))]
+    if plot_num == 18:
+        if not state.noncolin:
+            raise QEInputError(
+                "plot_num=18 requires a noncollinear calculation",
+                routine="postproc",
+            )
+        magnetic_potential = _xc_potentials(state)[1:]
+        values = (
+            np.linalg.norm(magnetic_potential, axis=0)
+            if spin_component == 0
+            else magnetic_potential[spin_component - 1]
+        )
+        # Internal XC potentials are Hartree; pp.x writes Rydberg fields.
+        return [(filplot, _grid_from_state(state, title, plot_num, 2.0 * values))]
     if plot_num == 11:
         values = 2.0 * (_ionic_potential(state) + _hartree_potential(state))
         return [(filplot, _grid_from_state(state, title, plot_num, values))]
@@ -928,8 +1127,13 @@ def extract_plot_grids(state: SavedPPState, options: dict[str, object]) -> list[
             miller, coefficients, _xk = _read_wavefunction(state, kpoint - 1)
             for band in range(first_b, last_b + 1):
                 wave = _wave_grid(miller, coefficients[:, band - 1], state.shape, state.volume)
-                values = np.abs(wave) ** 2
+                values = _spinor_grid_quantity(wave, spin_component)
                 if bool(options.get("lsign", False)):
+                    if wave.ndim != 3:
+                        raise QEInputError(
+                            "lsign is not defined for spinor orbitals",
+                            routine="local_dos",
+                        )
                     if np.linalg.norm(_xk) > 1.0e-9:
                         raise QEInputError("k must be zero", routine="local_dos")
                     largest = np.unravel_index(np.argmax(np.abs(wave)), wave.shape)

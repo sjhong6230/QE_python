@@ -75,3 +75,13 @@ def test_band_data_selects_collinear_spin_without_mixing_blocks() -> None:
     assert data.nspin == 2
     np.testing.assert_array_equal(down.spins, [2, 2])
     np.testing.assert_array_equal(down.energies_ev[:, 0], [2.0, 3.0])
+
+
+def test_noncollinear_band_data_has_no_collinear_spin_block() -> None:
+    data = BandData(
+        np.zeros((2, 3)), np.zeros((2, 1)), np.ones(2, dtype=np.int8), True
+    )
+
+    assert data.nspin == 4
+    with pytest.raises(QEInputError, match="LSDA"):
+        data.select_spin(2)

@@ -53,6 +53,8 @@ class Orbital:
     l: int
     m: int
     label: str
+    j: float | None = None
+    mj: float | None = None
 
 
 @dataclass(frozen=True)
@@ -69,6 +71,7 @@ class ProjectionData:
     plane_waves: np.ndarray | None = None
     nkb: int = 0
     spins: np.ndarray | None = None
+    noncolin: bool = False
 
     @property
     def spin_labels(self) -> np.ndarray:
@@ -80,6 +83,8 @@ class ProjectionData:
 
     @property
     def nspin(self) -> int:
+        if self.noncolin:
+            return 4
         return int(np.max(self.spin_labels, initial=1))
 
 
@@ -182,6 +187,7 @@ def _orbital_basis(
     kpoint: np.ndarray,
     geometry=None,
     pseudo_cache: dict | None = None,
+    spinor: bool = False,
 ):
     lattice, reciprocal, atoms, species_files, _operations = geometry or _saved_geometry(directory)
     volume = abs(float(np.linalg.det(lattice)))
@@ -198,15 +204,44 @@ def _orbital_basis(
             if pseudo.pseudo_type.upper() != "NC":
                 raise UnsupportedFeatureError("projwfc.py currently supports norm-conserving UPFs")
             cache[symbol] = pseudo
-        block = pseudo.atomic_orbitals(gk, position, volume)
+        if spinor:
+            block = pseudo.spinor_atomic_orbital_basis(gk, volume)
+            phase = np.exp(-1j * (gk @ np.asarray(position)))
+            block = block * np.concatenate((phase, phase))[:, None]
+        else:
+            block = pseudo.atomic_orbitals(gk, position, volume)
         blocks.append(block)
         column = 0
         for wfc_index, wavefunction in enumerate(
             (item for item in pseudo.atomic_wavefunctions if item.occupation >= 0.0), start=1
         ):
-            for m in range(2 * wavefunction.angular_momentum + 1):
-                descriptors.append(Orbital(atom_index, symbol, wfc_index, wavefunction.angular_momentum, m, wavefunction.label))
-                column += 1
+            if spinor:
+                j = float(wavefunction.total_angular_momentum)
+                count = int(round(2.0 * j + 1.0))
+                for m in range(count):
+                    descriptors.append(Orbital(
+                        atom_index,
+                        symbol,
+                        wfc_index,
+                        wavefunction.angular_momentum,
+                        m,
+                        wavefunction.label,
+                        j,
+                        -j + m,
+                    ))
+            else:
+                for m in range(2 * wavefunction.angular_momentum + 1):
+                    descriptors.append(Orbital(
+                        atom_index,
+                        symbol,
+                        wfc_index,
+                        wavefunction.angular_momentum,
+                        m,
+                        wavefunction.label,
+                    ))
+                column += 2 * wavefunction.angular_momentum + 1
+            if spinor:
+                column += count
         if column != block.shape[1]:
             raise QEInputError("UPF atomic-wavefunction metadata are inconsistent")
     if not blocks or sum(block.shape[1] for block in blocks) == 0:
@@ -368,12 +403,30 @@ def compute_projections(
         try:
             with h5py.File(path, "r") as h5:
                 miller = np.asarray(h5["MillerIndices"][:], dtype=np.int32)
-                wavefunctions = np.asarray(h5["evc"][:], dtype=np.complex128).T
+                raw_wavefunctions = np.asarray(h5["evc"][:])
+                npol = int(h5.attrs.get("npol", 2 if saved.noncolin else 1))
                 kpoint = np.asarray(h5.attrs["xk"], dtype=float)
         except (OSError, KeyError, ValueError) as exc:
             raise QEInputError(f"cannot read projection wavefunctions {path}: {exc}") from exc
+        if np.issubdtype(raw_wavefunctions.dtype, np.floating):
+            if raw_wavefunctions.shape[1] != 2 * npol * len(miller):
+                raise QEInputError(f"invalid interleaved wavefunctions in {path}")
+            wavefunctions = (
+                raw_wavefunctions[:, 0::2] + 1j * raw_wavefunctions[:, 1::2]
+            ).T
+        else:
+            wavefunctions = np.asarray(
+                raw_wavefunctions, dtype=np.complex128
+            ).T
+        if npol != (2 if saved.noncolin else 1) or wavefunctions.shape[0] != npol * len(miller):
+            raise QEInputError(f"invalid spinor wavefunction layout in {path}")
         atomic, current_orbitals = _orbital_basis(
-            directory, miller, kpoint, geometry, pseudo_cache
+            directory,
+            miller,
+            kpoint,
+            geometry,
+            pseudo_cache,
+            spinor=saved.noncolin,
         )
         if orbitals is None:
             orbitals = current_orbitals
@@ -395,7 +448,14 @@ def compute_projections(
         if symmetrize
         else (SymmetryOperation(np.eye(3, dtype=int), np.zeros(3)),)
     )
+    if saved.noncolin and diag_basis:
+        raise UnsupportedFeatureError(
+            "diag_basis for relativistic j,m_j projectors is not yet ported"
+        )
     projections = (
+        np.abs(amplitudes_array) ** 2
+        if saved.noncolin
+        else
         symmetrize_projection_weights(
             amplitudes_array, orbitals, lattice, atoms, projection_operations,
             diag_basis=diag_basis,
@@ -406,7 +466,11 @@ def compute_projections(
         else np.abs(amplitudes_array) ** 2
     )
     nkb = sum(
-        pseudo_cache[symbol].number_of_projector_channels
+        (
+            pseudo_cache[symbol].number_of_spinor_projector_channels
+            if saved.noncolin
+            else pseudo_cache[symbol].number_of_projector_channels
+        )
         for symbol, _position in atoms
     )
     return ProjectionData(
@@ -422,6 +486,7 @@ def compute_projections(
         np.asarray(plane_wave_counts, dtype=np.int32),
         nkb,
         saved.spin_labels,
+        saved.noncolin,
     )
 
 
@@ -621,7 +686,14 @@ def _write_atomic_proj(path: Path, data: ProjectionData, include_overlaps: bool)
     root = ET.Element("ATOMIC_PROJECTIONS")
     states = ET.SubElement(root, "ATOMIC_WFC", number_of_wfc=str(len(data.orbitals)))
     for index, orbital in enumerate(data.orbitals, start=1):
-        ET.SubElement(states, "STATE", index=str(index), atom=str(orbital.atom), species=orbital.symbol, wfc=str(orbital.wfc), l=str(orbital.l), m=str(orbital.m + 1), label=orbital.label)
+        attributes = dict(
+            index=str(index), atom=str(orbital.atom), species=orbital.symbol,
+            wfc=str(orbital.wfc), l=str(orbital.l), m=str(orbital.m + 1),
+            label=orbital.label,
+        )
+        if orbital.j is not None and orbital.mj is not None:
+            attributes.update(j=f"{orbital.j:.1f}", mj=f"{orbital.mj:.1f}")
+        ET.SubElement(states, "STATE", **attributes)
     for ik, (energies, projections) in enumerate(zip(data.energies_ev, data.projections), start=1):
         point = ET.SubElement(
             root,
@@ -806,8 +878,9 @@ def run_projwfc(
                     data.projections[selected],
                 )
         else:
-            total = 2.0 * np.einsum("ekb,k->e", kernel, data.weights)
-            projected = 2.0 * np.einsum(
+            degeneracy = 2.0 if data.nspin == 1 else 1.0
+            total = degeneracy * np.einsum("ekb,k->e", kernel, data.weights)
+            projected = degeneracy * np.einsum(
                 "ekb,k,kbo->eo", kernel, data.weights, data.projections
             )
     base = str(options.get("filpdos", prefix))
@@ -867,6 +940,8 @@ def run_projwfc(
     lnames = _L_NAMES
     for orbital, columns in _groups(data.orbitals):
         label = lnames[orbital.l] if orbital.l < len(lnames) else f"l{orbital.l}"
+        if orbital.j is not None:
+            label += f"_j{orbital.j:.1f}"
         path = Path(f"{base}.pdos_atm#{orbital.atom}({orbital.symbol})_wfc#{orbital.wfc}({label})")
         component_count = columns.stop - columns.start
         with path.open("w", encoding="utf-8", newline="\n") as stream:
@@ -954,7 +1029,15 @@ def run_projwfc(
         filproj = Path(str(options["filproj"]))
         with filproj.open("w", encoding="utf-8", newline="\n") as stream:
             for index, orbital in enumerate(data.orbitals, start=1):
-                stream.write(f"state # {index}: atom {orbital.atom} ({orbital.symbol}), wfc {orbital.wfc} (l={orbital.l} m={orbital.m + 1})\n")
+                quantum_numbers = (
+                    f"l={orbital.l} j={orbital.j:.1f} m_j={orbital.mj:.1f}"
+                    if orbital.j is not None and orbital.mj is not None
+                    else f"l={orbital.l} m={orbital.m + 1}"
+                )
+                stream.write(
+                    f"state # {index}: atom {orbital.atom} ({orbital.symbol}), "
+                    f"wfc {orbital.wfc} ({quantum_numbers})\n"
+                )
             for ik, (energies, projections) in enumerate(zip(data.energies_ev, data.projections), start=1):
                 for band, (energy, values) in enumerate(zip(energies, projections), start=1):
                     spin = int(data.spin_labels[ik - 1])
@@ -1015,9 +1098,14 @@ def _format_projection_summary(data: ProjectionData, *, diag_basis: bool = False
         "",
     ]
     for index, orbital in enumerate(data.orbitals, start=1):
+        quantum_numbers = (
+            f"l={orbital.l:d} j={orbital.j:.1f} m_j={orbital.mj:.1f}"
+            if orbital.j is not None and orbital.mj is not None
+            else f"l={orbital.l:d} m={orbital.m + 1:2d}"
+        )
         lines.append(
             f"     state #{index:4d}: atom {orbital.atom:3d} ({orbital.symbol:<3}), "
-            f"wfc {orbital.wfc:2d} (l={orbital.l:d} m={orbital.m + 1:2d})"
+            f"wfc {orbital.wfc:2d} ({quantum_numbers})"
         )
 
     if data.kpoints is not None:

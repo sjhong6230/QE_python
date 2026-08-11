@@ -23,6 +23,7 @@ class BandData:
     kpoints: np.ndarray
     energies_ev: np.ndarray
     spins: np.ndarray | None = None
+    noncolin: bool = False
 
     def __post_init__(self) -> None:
         points = np.asarray(self.kpoints, dtype=float)
@@ -54,6 +55,8 @@ class BandData:
 
     @property
     def nspin(self) -> int:
+        if self.noncolin:
+            return 4
         return int(np.max(self.spins, initial=1))
 
     def select_spin(self, component: int) -> "BandData":
@@ -63,7 +66,10 @@ class BandData:
         if not np.any(selected):
             raise QEInputError("spin_component requires an LSDA calculation")
         return BandData(
-            self.kpoints[selected], self.energies_ev[selected], self.spins[selected]
+            self.kpoints[selected],
+            self.energies_ev[selected],
+            self.spins[selected],
+            self.noncolin,
         )
 
     def path_coordinate(self) -> np.ndarray:
@@ -135,9 +141,12 @@ def read_saved_bands(prefix: str = "pwscf", outdir: str | None = None) -> BandDa
     lsda = (findtext(root, "output/band_structure/lsda", "false") or "").strip().lower() in {
         "true", ".true.", "t", "1"
     }
+    noncolin = (
+        findtext(root, "output/band_structure/noncolin", "false") or ""
+    ).strip().lower() in {"true", ".true.", "t", "1"}
     spins = spin_labels(lsda, len(point_array))
     validate_spin_blocks(point_array, spins)
-    return BandData(point_array, np.vstack(energies), spins)
+    return BandData(point_array, np.vstack(energies), spins, noncolin)
 
 
 _HEADER = re.compile(r"nbnd\s*=\s*(\d+).*nks\s*=\s*(\d+)", re.IGNORECASE)

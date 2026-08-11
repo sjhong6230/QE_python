@@ -55,6 +55,29 @@ def test_lsda_smearing_dos_preserves_up_and_down_state_counts() -> None:
     assert channels[1, np.argmin(abs(grid - 1.0))] > channels[0, -1]
 
 
+def test_noncollinear_smearing_has_one_state_per_spinor_band() -> None:
+    grid = np.linspace(-4.0, 4.0, 40001)
+    data = DOSData(
+        np.asarray([[0.0]]),
+        np.asarray([1.0]),
+        0.0,
+        "smearing",
+        "gaussian",
+        0.01,
+        None,
+        None,
+        None,
+        np.asarray([1]),
+        True,
+    )
+
+    channels = smearing_dos_channels(data, grid, 0.2, 0)
+
+    assert data.nspin == 4
+    assert channels.shape == (1, len(grid))
+    assert np.trapezoid(channels[0], grid) == pytest.approx(1.0, abs=2.0e-6)
+
+
 def test_spin_resolved_smearing_reuses_scalar_input_validation() -> None:
     data = DOSData(
         np.asarray([[0.0], [0.0]]),

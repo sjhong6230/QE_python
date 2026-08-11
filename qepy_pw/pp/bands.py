@@ -124,7 +124,7 @@ def reorder_by_overlap(
         energies[kpoint] = energies[kpoint, permutation]
         ordered.append((current_miller, current[:, permutation]))
     wavefunctions[:] = ordered
-    return BandData(data.kpoints, energies, data.spins)
+    return BandData(data.kpoints, energies, data.spins, data.noncolin)
 
 
 def _saved_structure(
@@ -190,7 +190,7 @@ def _qe_plot_data(directory: Path, data: BandData) -> BandData:
     )
     reciprocal = 2.0 * np.pi * np.linalg.inv(lattice).T
     plot_points = data.kpoints @ reciprocal * (alat / (2.0 * np.pi))
-    return BandData(plot_points, data.energies_ev, data.spins)
+    return BandData(plot_points, data.energies_ev, data.spins, data.noncolin)
 
 
 def _little_group(kpoint: np.ndarray, operations) -> list:
@@ -596,9 +596,13 @@ def run_bands(
     if not lsym and not bool(options.get("no_overlap", True)):
         assert wavefunctions is not None
         data = reorder_by_overlap(data, wavefunctions)
-        plot_data = BandData(plot_data.kpoints, data.energies_ev, data.spins)
+        plot_data = BandData(
+            plot_data.kpoints, data.energies_ev, data.spins, data.noncolin
+        )
     else:
-        plot_data = BandData(plot_data.kpoints, data.energies_ev, data.spins)
+        plot_data = BandData(
+            plot_data.kpoints, data.energies_ev, data.spins, data.noncolin
+        )
     write_band_file(filband, plot_data)
     write_gnuplot(f"{filband}.gnu", plot_data)
     if stdout is not None:
