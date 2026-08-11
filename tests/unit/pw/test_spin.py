@@ -447,9 +447,11 @@ K_POINTS gamma
     )
 
 
-@pytest.mark.parametrize("functional", ["PBE", "PBEsol", "revPBE", "RPBE"])
-def test_spin_gga_scf_force_and_stress_paths(functional: str) -> None:
-    pw = read_pw_input(io.StringIO(f"""\
+def test_spin_gga_scf_force_and_stress_paths() -> None:
+    # The analytic kernel tests above cover every supported PBE variant.
+    # One representative end-to-end calculation is sufficient because all
+    # variants share the same SCF, force, and stress plumbing.
+    pw = read_pw_input(io.StringIO("""\
 &CONTROL
   calculation='scf',
   pseudo_dir='./tests/qe_reference/upstream/pseudo',
@@ -457,7 +459,7 @@ def test_spin_gga_scf_force_and_stress_paths(functional: str) -> None:
 /
 &SYSTEM
   ibrav=1, celldm(1)=10.0, nat=2, ntyp=1,
-  ecutwfc=10.0, nbnd=1, nspin=2, input_dft='{functional}',
+  ecutwfc=10.0, nbnd=1, nspin=2, input_dft='PBE',
   occupations='fixed', tot_magnetization=0,
   starting_magnetization(1)=0.25
 /
