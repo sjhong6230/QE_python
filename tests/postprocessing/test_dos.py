@@ -74,6 +74,51 @@ def test_linear_tetrahedron_integrates_all_bands() -> None:
     assert integrated == pytest.approx([0.0, 4.0])
 
 
+def test_lsda_tetrahedron_uses_both_spin_blocks_without_degeneracy() -> None:
+    grid_shape = (2, 2, 2)
+    spatial_kpoints = int(np.prod(grid_shape))
+    eigenvalues = np.concatenate(
+        (
+            np.full((spatial_kpoints, 1), -1.0),
+            np.full((spatial_kpoints, 1), 1.0),
+        )
+    )
+    data = DOSData(
+        eigenvalues,
+        np.full(2 * spatial_kpoints, 1.0 / (2 * spatial_kpoints)),
+        None,
+        "tetrahedra",
+        "gaussian",
+        0.0,
+        grid_shape,
+        np.arange(spatial_kpoints, dtype=np.int32),
+        np.eye(3),
+    )
+
+    _density, integrated = tetrahedron_dos(
+        data, np.asarray([-2.0, 0.0, 2.0]), "tetrahedra_lin"
+    )
+
+    assert integrated == pytest.approx([0.0, 1.0, 2.0])
+
+
+def test_tetrahedron_rejects_eigenvalues_inconsistent_with_mapping() -> None:
+    data = DOSData(
+        np.zeros((3, 1)),
+        np.full(3, 1.0 / 3.0),
+        None,
+        "tetrahedra",
+        "gaussian",
+        0.0,
+        (2, 2, 2),
+        np.arange(8, dtype=np.int32),
+        np.eye(3),
+    )
+
+    with pytest.raises(QEInputError, match="inconsistent"):
+        tetrahedron_dos(data, np.asarray([0.0]), "tetrahedra")
+
+
 def test_dos_main_uses_qe_environment_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

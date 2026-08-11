@@ -109,8 +109,26 @@ def tetrahedron_dos(
         optimized_connectivity,
         optimized,
     )
+    spatial_kpoints = int(np.max(data.mapping)) + 1
+    eigenvalues = np.asarray(data.eigenvalues_ev)
+    if eigenvalues.shape[0] == 2 * spatial_kpoints:
+        # QE stores LSDA k points as one complete spin-up block followed by
+        # one complete spin-down block.  Tetrahedra describe only the spatial
+        # grid, so expose spin as an additional band axis and do not apply the
+        # scalar-spin degeneracy below.
+        eigenvalues = np.concatenate(
+            (eigenvalues[:spatial_kpoints], eigenvalues[spatial_kpoints:]),
+            axis=1,
+        )
+        spin_degeneracy = 1.0
+    elif eigenvalues.shape[0] == spatial_kpoints:
+        spin_degeneracy = 2.0
+    else:
+        raise QEInputError(
+            "saved eigenvalues are inconsistent with the tetrahedron k-grid"
+        )
     effective = _tetrahedron_effective_energies(
-        data.eigenvalues_ev, tetra, interpolation
+        eigenvalues, tetra, interpolation
     )
     sorted_e = np.ascontiguousarray(
         np.sort(effective, axis=-1), dtype=np.float64
@@ -121,7 +139,7 @@ def tetrahedron_dos(
     native = _load_native_fft()
     dos, integrated = native.tetrahedron_dos_sums(sorted_e, energy_grid)
     ntetra = len(tetra)
-    return 2.0 * dos / ntetra, 2.0 * integrated / ntetra
+    return spin_degeneracy * dos / ntetra, spin_degeneracy * integrated / ntetra
 
 
 def run_dos(
