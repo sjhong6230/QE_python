@@ -601,29 +601,35 @@ class LocalPotential:
                 if abs(j_value - l_value - 0.5) < 1.0e-8:
                     up_coefficient = np.sqrt((l_value + m_value + 1.0) / denominator)
                     down_coefficient = np.sqrt((l_value - m_value) / denominator)
+                    up_m = m_value
+                    down_m = m_value + 1
                 elif abs(j_value - l_value + 0.5) < 1.0e-8:
                     if m_value < -l_value + 1:
                         continue
                     up_coefficient = np.sqrt((l_value - m_value + 1.0) / denominator)
                     down_coefficient = -np.sqrt((l_value + m_value) / denominator)
+                    # QE sph_ind.f90: the j=l-1/2 spinor couples orbital
+                    # m-1 to spin up and orbital m to spin down.
+                    up_m = m_value - 1
+                    down_m = m_value
                 else:
                     raise QEInputError(
                         f"incompatible l={l_value}, j={j_value} in relativistic projector"
                     )
                 up_harmonic = np.zeros(len(q), dtype=np.complex128)
-                if -l_value <= m_value <= l_value:
-                    key = (l_value, m_value)
+                if -l_value <= up_m <= l_value:
+                    key = (l_value, up_m)
                     if key not in harmonics:
                         harmonics[key] = _complex_spherical_harmonic(
-                            l_value, m_value, theta, phi
+                            l_value, up_m, theta, phi
                         )
                     up_harmonic = harmonics[key]
                 down_harmonic = np.zeros(len(q), dtype=np.complex128)
-                if -l_value <= m_value + 1 <= l_value:
-                    key = (l_value, m_value + 1)
+                if -l_value <= down_m <= l_value:
+                    key = (l_value, down_m)
                     if key not in harmonics:
                         harmonics[key] = _complex_spherical_harmonic(
-                            l_value, m_value + 1, theta, phi
+                            l_value, down_m, theta, phi
                         )
                     down_harmonic = harmonics[key]
                 column = np.concatenate(
@@ -832,6 +838,26 @@ class LocalPotential:
         self, gk: np.ndarray, volume: float
     ) -> np.ndarray:
         """Return species-centered atomic trial orbitals without atom phases."""
+        selected, q, radial_values = self._atomic_wavefunction_radials(
+            gk, volume
+        )
+        gk = np.asarray(gk, dtype=float)
+        if not selected:
+            return np.empty((len(gk), 0), dtype=complex)
+        columns: list[np.ndarray] = []
+        for wavefunction, radial in zip(selected, radial_values.T):
+            harmonics = _qe_real_spherical_harmonics(
+                wavefunction.angular_momentum, gk, q
+            )
+            angular_phase = (1j) ** wavefunction.angular_momentum
+            for channel in range(2 * wavefunction.angular_momentum + 1):
+                columns.append(radial * harmonics[:, channel] * angular_phase)
+        return np.column_stack(columns)
+
+    def _atomic_wavefunction_radials(
+        self, gk: np.ndarray, volume: float
+    ) -> tuple[list[AtomicWavefunction], np.ndarray, np.ndarray]:
+        """Interpolate reciprocal radial functions shared by scalar/spinor trials."""
         gk = np.asarray(gk, dtype=float)
         selected = [
             wavefunction
@@ -839,7 +865,7 @@ class LocalPotential:
             if wavefunction.occupation >= 0.0
         ]
         if not selected:
-            return np.empty((len(gk), 0), dtype=complex)
+            return selected, np.linalg.norm(gk, axis=1), np.empty((len(gk), 0))
         assert self.r is not None and self.rab is not None
         q = np.linalg.norm(gk, axis=1)
         prefactor = 4.0 * np.pi / np.sqrt(volume)
@@ -891,7 +917,7 @@ class LocalPotential:
             self._atomic_wfc_table_qmax = maximum_q
             self._atomic_wfc_table_volume = float(volume)
         assert self._atomic_wfc_table is not None
-        columns: list[np.ndarray] = []
+        radial_columns: list[np.ndarray] = []
         for wavefunction, table in zip(
             selected, self._atomic_wfc_table
         ):
@@ -901,17 +927,75 @@ class LocalPotential:
                 - table[lower + 2] * fraction * u * w / 2.0
                 + table[lower + 3] * fraction * u * v / 6.0
             )
-            harmonics = _qe_real_spherical_harmonics(
-                wavefunction.angular_momentum, gk, q
-            )
-            angular_phase = (1j) ** wavefunction.angular_momentum
-            for channel in range(2 * wavefunction.angular_momentum + 1):
-                columns.append(
-                    radial
-                    * harmonics[:, channel]
-                    * angular_phase
-                )
-        return np.column_stack(columns)
+            radial_columns.append(radial)
+        return selected, q, np.column_stack(radial_columns)
+
+    @property
+    def number_of_spinor_atomic_orbitals(self) -> int:
+        """Number of QE j,mj atomic trials supplied by a full-relativistic UPF."""
+        return sum(
+            int(round(2.0 * float(wavefunction.total_angular_momentum) + 1.0))
+            for wavefunction in self.atomic_wavefunctions
+            if wavefunction.occupation >= 0.0
+        )
+
+    def spinor_atomic_orbital_basis(
+        self, gk: np.ndarray, volume: float
+    ) -> np.ndarray:
+        """Build QE ``atomic_wfc_so`` j,mj trial spinors for ``domag=.false.``."""
+        if not self.fully_relativistic:
+            raise QEInputError("spinor atomic orbitals require a fully relativistic UPF")
+        vectors = np.asarray(gk, dtype=float)
+        selected, q, radial_values = self._atomic_wavefunction_radials(
+            vectors, volume
+        )
+        if not selected:
+            return np.empty((2 * len(vectors), 0), dtype=np.complex128)
+        safe = q > 1.0e-14
+        theta = np.zeros(len(q))
+        theta[safe] = np.arccos(np.clip(vectors[safe, 2] / q[safe], -1.0, 1.0))
+        phi = np.arctan2(vectors[:, 1], vectors[:, 0])
+        harmonics: dict[tuple[int, int], np.ndarray] = {}
+        columns: list[np.ndarray] = []
+        for wavefunction, radial in zip(selected, radial_values.T):
+            l_value = wavefunction.angular_momentum
+            j_value = float(wavefunction.total_angular_momentum)
+            denominator = float(2 * l_value + 1)
+            phase = (1j) ** l_value
+            for m_value in range(-l_value - 1, l_value + 1):
+                if abs(j_value - l_value - 0.5) < 1.0e-8:
+                    up_coefficient = np.sqrt((l_value + m_value + 1.0) / denominator)
+                    down_coefficient = np.sqrt((l_value - m_value) / denominator)
+                    up_m, down_m = m_value, m_value + 1
+                elif abs(j_value - l_value + 0.5) < 1.0e-8:
+                    if m_value < -l_value + 1:
+                        continue
+                    up_coefficient = np.sqrt((l_value - m_value + 1.0) / denominator)
+                    down_coefficient = -np.sqrt((l_value + m_value) / denominator)
+                    up_m, down_m = m_value - 1, m_value
+                else:
+                    raise QEInputError(
+                        f"incompatible l={l_value}, j={j_value} in relativistic atomic orbital"
+                    )
+                spin_components = []
+                for orbital_m, coefficient in (
+                    (up_m, up_coefficient), (down_m, down_coefficient)
+                ):
+                    if not -l_value <= orbital_m <= l_value:
+                        spin_components.append(
+                            np.zeros(len(vectors), dtype=np.complex128)
+                        )
+                        continue
+                    key = (l_value, orbital_m)
+                    if key not in harmonics:
+                        harmonics[key] = _complex_spherical_harmonic(
+                            l_value, orbital_m, theta, phi
+                        )
+                    spin_components.append(
+                        phase * radial * coefficient * harmonics[key]
+                    )
+                columns.append(np.concatenate(spin_components))
+        return np.asfortranarray(np.column_stack(columns))
 
 
 def _unique_radial_arguments(q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

@@ -955,17 +955,29 @@ def _spinor_starting_orbitals(
     domag = bool(pw.system.get("_domag", False))
     blocks: list[np.ndarray] = []
     if starting_wfc != "random":
-        centered_by_label: dict[str, np.ndarray] = {}
+        centered_by_label: dict[tuple[str, bool], np.ndarray] = {}
         for atom in pw.atoms:
-            centered = centered_by_label.get(atom.label)
+            uses_j_basis = not domag
+            cache_key = (atom.label, uses_j_basis)
+            centered = centered_by_label.get(cache_key)
             if centered is None:
-                centered = pseudos[atom.label].atomic_orbital_basis(
-                    basis_vectors, pw.volume
+                centered = (
+                    pseudos[atom.label].spinor_atomic_orbital_basis(
+                        basis_vectors, pw.volume
+                    )
+                    if uses_j_basis
+                    else pseudos[atom.label].atomic_orbital_basis(
+                        basis_vectors, pw.volume
+                    )
                 )
-                centered_by_label[atom.label] = centered
+                centered_by_label[cache_key] = centered
             if centered.shape[1] == 0:
                 continue
             phase = np.exp(-1j * (basis_vectors @ atom.position))
+            if uses_j_basis:
+                spinor_phase = np.concatenate((phase, phase))
+                blocks.append(centered * spinor_phase[:, None])
+                continue
             scalar = centered * phase[:, None]
             index = species_index[atom.label]
             if domag:
@@ -2659,7 +2671,11 @@ def _run_scf(
         )
     )
     atomic_orbitals = sum(
-        pseudo_by_label[atom.label].number_of_atomic_orbitals
+        (
+            pseudo_by_label[atom.label].number_of_spinor_atomic_orbitals
+            if noncolin
+            else pseudo_by_label[atom.label].number_of_atomic_orbitals
+        )
         for atom in pw.atoms
     )
     starting_charge_scales = _starting_charge_scales(

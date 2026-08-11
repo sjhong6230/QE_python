@@ -74,6 +74,11 @@ def test_upf_reader_preserves_fully_relativistic_quantum_numbers(
     assert beta.shape == (4, 4)
     assert coupling.shape == (4, 4)
     np.testing.assert_allclose(coupling, coupling.T)
+    atomic = pseudo.spinor_atomic_orbital_basis(
+        np.asarray([[0.2, -0.1, 0.4], [0.0, 0.3, -0.2]]), 80.0
+    )
+    assert pseudo.number_of_spinor_atomic_orbitals == 4
+    assert atomic.shape == (4, 4)
 
 
 def test_disabling_lspinorb_uses_qe_j_averaged_spin_diagonal_projectors() -> None:
@@ -104,6 +109,17 @@ def test_disabling_lspinorb_uses_qe_j_averaged_spin_diagonal_projectors() -> Non
 
     resolved, _ = pseudo.spinor_projector_basis(vectors, 80.0)
     assert not np.allclose(np.abs(resolved), np.abs(averaged))
+
+    # At +z only Y_10 survives. For j=l-1/2 the two mj columns therefore
+    # place it in down and up respectively: (Y_{1,-1} up, Y_10 down), then
+    # (Y_10 up, Y_11 down). This guards QE sph_ind's m-1/m convention.
+    axial, _ = pseudo.spinor_projector_basis(
+        np.asarray([[0.0, 0.0, 0.4]]), 80.0
+    )
+    assert abs(axial[0, 0]) < 1.0e-14
+    assert abs(axial[1, 0]) > 1.0e-10
+    assert abs(axial[0, 1]) > 1.0e-10
+    assert abs(axial[1, 1]) < 1.0e-14
 
 
 def test_qe_simpson_integrates_quadratic_on_uniform_grid() -> None:
