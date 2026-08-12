@@ -1,4 +1,4 @@
-"""MPI microbenchmark for the persistent-stick and FFTW-MPI FFT paths.
+"""MPI microbenchmark for slab, pencil, and FFTW-MPI FFT paths.
 
 Run, for example:
 
@@ -14,6 +14,7 @@ import time
 import numpy as np
 
 from qepy_pw.basis import FFTGridDescriptor, FFTScratchPool, LocalPotentialWorkspace
+from qepy_pw.fft_engine import FFTTaskTopology, PencilFFT3D
 from qepy_pw.memory import current_pss_bytes
 from qepy_pw.mpi import MPIContext
 
@@ -34,6 +35,7 @@ def _stick_benchmark(
     shape: tuple[int, int, int],
     bands: int,
     iterations: int,
+    band_tile: int | None,
 ) -> tuple[float, float, int, int]:
     indices = _sphere_indices(shape, 0.38)
     descriptor = FFTGridDescriptor.build(
@@ -46,6 +48,7 @@ def _stick_benchmark(
         mpi=mpi,
         scratch_pool=pool,
         descriptor=descriptor,
+        distributed_fft_batch_size=band_tile,
     )
     global_rows = workspace.local_plane_wave_indices.astype(np.float64)
     band_indices = np.arange(bands, dtype=np.float64)
@@ -130,30 +133,132 @@ def _fftw_mpi_benchmark(
     return elapsed / iterations, error, pss, allocation - active
 
 
+def _pencil_benchmark(
+    mpi: MPIContext,
+    shape: tuple[int, int, int],
+    bands: int,
+    iterations: int,
+    task_groups: int,
+    band_tile: int,
+) -> tuple[float, float, int, int, str, int]:
+    topology = FFTTaskTopology.build(
+        mpi.comm, shape, task_groups=task_groups
+    )
+    owned = topology.band_slice(bands)
+    local_bands = owned.stop - owned.start
+    if local_bands < 1:
+        raise ValueError("each FFT task group must own at least one band")
+    fft = PencilFFT3D(shape, topology, threads=1)
+    nz, nx_local, ny_local = fft.local_z_shape
+    z = np.arange(nz, dtype=np.float64)[:, None, None, None]
+    x = np.arange(fft.x_initial.start, fft.x_initial.stop, dtype=np.float64)[
+        None, :, None, None
+    ]
+    y = np.arange(fft.y_initial.start, fft.y_initial.stop, dtype=np.float64)[
+        None, None, :, None
+    ]
+    band = np.arange(owned.start, owned.stop, dtype=np.float64)[None, None, None, :]
+    coefficients = np.ascontiguousarray(
+        np.sin(0.007 * x + 0.009 * y + 0.011 * z + 0.13 * band)
+        + 1j * np.cos(0.017 * x - 0.005 * y + 0.019 * z - 0.11 * band)
+    )
+    assert coefficients.shape == (nz, nx_local, ny_local, local_bands)
+    potential = np.ones(fft.local_x_shape, dtype=np.float64)
+    topology.fft_comm.Barrier()
+    warmup_started = time.perf_counter()
+    result = fft.apply_local_potential(
+        coefficients, potential, band_tile=band_tile
+    )
+    topology.fft_comm.Barrier()
+    warmup = time.perf_counter() - warmup_started
+    started = time.perf_counter()
+    for _ in range(iterations):
+        result = fft.apply_local_potential(
+            coefficients, potential, band_tile=band_tile
+        )
+    topology.fft_comm.Barrier()
+    elapsed = time.perf_counter() - started
+    local_error = float(np.max(np.abs(result - coefficients)))
+    from mpi4py import MPI
+
+    error = float(topology.world_comm.allreduce(local_error, op=MPI.MAX))
+    pss = int(topology.world_comm.allreduce(current_pss_bytes()))
+    tile = min(band_tile, local_bands)
+    scratch = fft.estimated_scratch_bytes(tile)
+    grid = f"{topology.process_grid[0]}x{topology.process_grid[1]}"
+    return elapsed / iterations, error, pss, int(round(warmup * 1.0e9)), grid, scratch
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--shape", type=int, default=72)
     parser.add_argument("--bands", type=int, default=8)
     parser.add_argument("--iterations", type=int, default=20)
+    parser.add_argument("--task-groups", type=int, default=1)
+    parser.add_argument("--band-tile", type=int, default=1)
+    parser.add_argument("--slab-band-tile", type=int, default=None)
+    parser.add_argument(
+        "--mode",
+        choices=("all", "slab", "fftw-mpi", "pencil"),
+        default="all",
+        help="run one path to obtain uncontaminated process-memory data",
+    )
     args = parser.parse_args()
     mpi = MPIContext.world()
     shape = (args.shape, args.shape, args.shape)
-    stick = _stick_benchmark(mpi, shape, args.bands, args.iterations)
-    fftw_mpi = _fftw_mpi_benchmark(mpi, shape, args.iterations)
+    stick = (
+        _stick_benchmark(
+            mpi,
+            shape,
+            args.bands,
+            args.iterations,
+            args.slab_band_tile,
+        )
+        if args.mode in ("all", "slab")
+        else None
+    )
+    fftw_mpi = (
+        _fftw_mpi_benchmark(mpi, shape, args.iterations)
+        if args.mode in ("all", "fftw-mpi")
+        else None
+    )
+    pencil = (
+        _pencil_benchmark(
+            mpi,
+            shape,
+            args.bands,
+            args.iterations,
+            args.task_groups,
+            args.band_tile,
+        )
+        if args.mode in ("all", "pencil")
+        else None
+    )
     if mpi.is_root:
         mib = 1024.0**2
-        print(
-            "stick_apply_seconds=" f"{stick[0]:.8f} "
-            "max_error=" f"{stick[1]:.3e} "
-            "aggregate_pss_mib=" f"{stick[2] / mib:.2f} "
-            "first_apply_seconds=" f"{stick[3] / 1.0e9:.8f}"
-        )
-        print(
-            "fftw_mpi_roundtrip_seconds=" f"{fftw_mpi[0]:.8f} "
-            "max_error=" f"{fftw_mpi[1]:.3e} "
-            "aggregate_pss_mib=" f"{fftw_mpi[2] / mib:.2f} "
-            "extra_complex_per_rank=" f"{fftw_mpi[3]}"
-        )
+        if stick is not None:
+            print(
+                "stick_apply_seconds=" f"{stick[0]:.8f} "
+                "max_error=" f"{stick[1]:.3e} "
+                "aggregate_pss_mib=" f"{stick[2] / mib:.2f} "
+                "first_apply_seconds=" f"{stick[3] / 1.0e9:.8f}"
+            )
+        if fftw_mpi is not None:
+            print(
+                "fftw_mpi_roundtrip_seconds=" f"{fftw_mpi[0]:.8f} "
+                "max_error=" f"{fftw_mpi[1]:.3e} "
+                "aggregate_pss_mib=" f"{fftw_mpi[2] / mib:.2f} "
+                "extra_complex_per_rank=" f"{fftw_mpi[3]}"
+            )
+        if pencil is not None:
+            print(
+                "pencil_apply_seconds=" f"{pencil[0]:.8f} "
+                "max_error=" f"{pencil[1]:.3e} "
+                "aggregate_pss_mib=" f"{pencil[2] / mib:.2f} "
+                "first_apply_seconds=" f"{pencil[3] / 1.0e9:.8f} "
+                "process_grid=" f"{pencil[4]} "
+                "planned_tile_scratch_mib=" f"{pencil[5] / mib:.2f}"
+            )
 
 
 if __name__ == "__main__":

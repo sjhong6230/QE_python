@@ -86,21 +86,33 @@ number of bands, smearing, eigensolver threshold, and SCF threshold.
 The MPI-specific tests should also be run under the intended launcher:
 
 ```bash
-mpiexec -n 4 python -m pytest -q tests/test_fft_parallel.py
+mpiexec -n 4 python -m pytest -q tests/integration/test_fft_parallel.py \
+  tests/integration/test_fft_pencil.py
 ```
 
 They verify that every reciprocal stick has exactly one persistent owner and
 that a native FFTW-MPI forward/backward pair recovers the distributed input to
 floating-point tolerance.
 
-The dedicated microbenchmark is:
+The scalable engine adds:
+
+- `tests/unit/core/test_fft_engine.py`: process-grid and memory-plan policy,
+  Gamma half-G reconstruction, two-real-band packing, and Gamma metric;
+- `tests/integration/test_fft_pencil.py`: Z/Y/X pencil round trips, a
+  nonconstant local-potential convolution, and independent task groups;
+- a slab test that proves distributed band tiling preserves Hpsi while
+  retaining less scratch than the full-band block.
+
+The dedicated microbenchmark reports the sparse slab local-potential path, a
+dense FFTW-MPI round trip, and a dense pencil local-potential path:
 
 ```bash
 export QEPY_NUM_THREADS=1
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 mpiexec -n 4 python tools/benchmark_distributed_fft.py \
-  --shape 72 --bands 8 --iterations 100
+  --shape 72 --bands 8 --iterations 100 --mode slab \
+  --slab-band-tile 1
 ```
 
 It reports:
@@ -111,6 +123,7 @@ It reports:
 - first-application time, including initial plan creation;
 - dense FFTW-MPI roundtrip time and error;
 - FFTW-MPI allocation padding beyond the active slab.
+- pencil local-potential time, process grid, and planned tile scratch.
 
 The two timings do not represent identical work. The stick benchmark includes
 sparse packing, two distributed transposes, local-potential multiplication,
@@ -307,4 +320,3 @@ This procedure is particularly important for FFT planner flags, persistent MPI
 collectives, padding, and batching. Their microbenchmark behavior can reverse
 once plan creation, SCF block-size variation, allocator high water, and MPI
 contention are included.
-

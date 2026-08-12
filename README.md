@@ -86,6 +86,17 @@ the allocated core count. With a batch scheduler, request one task per MPI
 rank and `QEPY_NUM_THREADS` CPUs per task. Binding options differ between MPI
 implementations and schedulers.
 
+`QEPY_FFT_MEMORY_LIMIT_MIB` sets a hard per-rank budget for distributed
+wavefunction FFT execution scratch. The runtime estimates the local slab,
+sticks, and exact-count transpose buffers, selects an admissible band tile,
+and takes the minimum choice across the communicator so MPI counts agree.
+The limit does not include eigensolver, projector, density, or interpreter
+memory.
+
+```bash
+export QEPY_FFT_MEMORY_LIMIT_MIB=256
+```
+
 ## MPI, OpenMP, and memory
 
 Each MPI rank is a separate Python process. Rank-private interpreter state,

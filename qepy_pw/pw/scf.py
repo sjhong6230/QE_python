@@ -39,6 +39,7 @@ from ..diagonalization import (
     rmm_diis,
 )
 from ..errors import QEInputError, UnsupportedFeatureError, not_implemented
+from ..fft_engine import FFTMemoryPlan
 from ..ewald import ewald_energy, ewald_forces, ewald_stress
 from .buffers import (
     WavefunctionBuffer,
@@ -341,6 +342,7 @@ class _LazyWorkspaceSequence(Sequence[LocalPotentialWorkspace]):
         scratch_pool: FFTScratchPool,
         descriptor: FFTGridDescriptor | None,
         serial_fft_batch_size: int | None = None,
+        distributed_fft_batch_size: int | None = None,
         cache_workspaces: bool = False,
         retain_serial_sticks: bool = True,
     ) -> None:
@@ -357,6 +359,7 @@ class _LazyWorkspaceSequence(Sequence[LocalPotentialWorkspace]):
             scratch_pool=scratch_pool,
             descriptor=descriptor,
             serial_fft_batch_size=serial_fft_batch_size,
+            distributed_fft_batch_size=distributed_fft_batch_size,
             retain_serial_sticks=retain_serial_sticks,
         )
 
@@ -2272,8 +2275,59 @@ def _run_scf(
         wave_fft_descriptor = FFTGridDescriptor.build(
             wave_indices, shape, mpi.size, local_rank=mpi.rank
         )
+        preferred_distributed_fft_batch = max(1, threads_per_process)
+        raw_fft_limit = os.environ.get("QEPY_FFT_MEMORY_LIMIT_MIB", "").strip()
+        if raw_fft_limit:
+            try:
+                fft_limit_bytes = int(float(raw_fft_limit) * 1024.0**2)
+            except ValueError as exc:
+                raise QEInputError(
+                    "QEPY_FFT_MEMORY_LIMIT_MIB must be a positive number"
+                ) from exc
+            if fft_limit_bytes < 1:
+                raise QEInputError(
+                    "QEPY_FFT_MEMORY_LIMIT_MIB must be a positive number"
+                )
+            local_z = mpi.slab(shape[2])
+            local_real_points = (
+                shape[0]
+                * shape[1]
+                * (local_z.stop - local_z.start)
+            )
+            local_sticks = len(
+                wave_fft_descriptor.sticks_by_rank[mpi.rank]
+            )
+            transpose = wave_fft_descriptor.transpose_plans[mpi.rank]
+            assert transpose is not None
+            forward_one = transpose.native_counts(1)
+            reverse_one = transpose.native_counts(1, reverse=True)
+            inverse_receive = int(
+                forward_one[3][-1] + forward_one[2][-1]
+            )
+            reverse_send = int(
+                reverse_one[1][-1] + reverse_one[0][-1]
+            )
+            memory_plan = FFTMemoryPlan.choose(
+                bands=max(1, 2 * nbnd),
+                fixed_bytes=16 * local_real_points,
+                bytes_per_band=16
+                * (
+                    shape[2] * local_sticks
+                    + inverse_receive
+                    + reverse_send
+                ),
+                memory_limit_bytes=fft_limit_bytes,
+                preferred_tile=preferred_distributed_fft_batch,
+            )
+            # Every member of the FFT communicator must enter collectives
+            # with the same band tile even when stick balance and local slab
+            # lengths differ. Select the smallest rank-local admissible tile.
+            preferred_distributed_fft_batch = int(
+                -mpi.max_scalar(-memory_plan.band_tile)
+            )
     else:
         wave_fft_descriptor = None
+        preferred_distributed_fft_batch = None
     local_workspaces = _LazyWorkspaceSequence(
         bases,
         shape,
@@ -2286,6 +2340,13 @@ def _run_scf(
         # occupy the cores. MPI retains its block transform.
         serial_fft_batch_size=(
             threads_per_process if mpi.size == 1 else None
+        ),
+        # The native distributed kernel streams one real-space band but its
+        # reciprocal sticks and MPI payload used to span the entire solver
+        # block.  Bound those allocations by the local worker team.  A later
+        # topology policy may choose a larger tile when memory permits.
+        distributed_fft_batch_size=(
+            preferred_distributed_fft_batch
         ),
         # Every k point is revisited by c_bands and sum_band throughout SCF.
         # Cache only compact slot/owner maps; FFT payloads and plans remain in
@@ -2314,6 +2375,7 @@ def _run_scf(
         timers=timers,
         scratch_pool=fft_scratch_pool,
         descriptor=charge_fft_descriptor,
+        distributed_fft_batch_size=1,
         # Serial charge transforms use compact flat FFT slots.  The retained
         # QE stick catalog is needed only by the distributed transpose.
         retain_serial_sticks=mpi.size > 1,
@@ -2623,6 +2685,9 @@ def _run_scf(
         elif mpi.size > 1:
             assert wave_fft_descriptor is not None
             assert charge_fft_descriptor is not None
+            distributed_fft_batch = min(
+                int(preferred_distributed_fft_batch), maximum_block
+            )
             charge_local_stick_points = shape[2] * len(
                 charge_fft_descriptor.sticks_by_rank[mpi.rank]
             )
@@ -2638,13 +2703,13 @@ def _run_scf(
             # the runtime pool for the denser charge descriptor.
             stick_scratch = max(
                 charge_local_stick_points,
-                local_stick_points * maximum_block,
+                local_stick_points * distributed_fft_batch,
             )
             transpose_buffer = max(
                 charge_local_stick_points,
                 charge_slab_points,
-                local_stick_points * maximum_block,
-                wave_slab_points * maximum_block,
+                local_stick_points * distributed_fft_batch,
+                wave_slab_points * distributed_fft_batch,
             )
             real_batch = 1
             fft_bytes = (
