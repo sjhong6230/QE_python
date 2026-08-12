@@ -10,7 +10,7 @@
  &electrons conv_thr = 1.d-8
  /
 ATOMIC_SPECIES
- H 1.0008   H.pz-vbc.UPF
+ H 1.0008   H.upf
 ATOMIC_POSITIONS {angstrom}
  H  0.00 0.00 -0.35 
  H  0.00 0.00  0.35

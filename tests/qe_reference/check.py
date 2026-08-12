@@ -169,9 +169,22 @@ def verify_pseudos(manifest: dict[str, Any]) -> None:
             )
 
 
+def verify_saved_fixture(manifest: dict[str, Any]) -> None:
+    metadata = manifest["saved_fixture"]
+    directory = UPSTREAM / metadata["directory"]
+    for name, expected in metadata["files_sha256"].items():
+        digest = hashlib.sha256((directory / name).read_bytes()).hexdigest()
+        if digest != expected:
+            raise RuntimeError(
+                f"sha256 checksum mismatch for {directory.name}/{name}: "
+                f"{digest}"
+            )
+
+
 def generate_references(case_ids: set[str] | None = None) -> None:
     manifest = load_manifest()
     verify_pseudos(manifest)
+    verify_saved_fixture(manifest)
     for case in manifest["cases"]:
         if case_ids is not None and case["id"] not in case_ids:
             continue

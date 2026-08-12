@@ -22,6 +22,7 @@ from tests.qe_reference.check import (
     reference_path,
     run_case,
     verify_pseudos,
+    verify_saved_fixture,
 )
 
 
@@ -31,6 +32,7 @@ CASES = {case["id"]: case for case in MANIFEST["cases"]}
 
 def test_qe_fixture_checksums_and_python_references_are_complete():
     verify_pseudos(MANIFEST)
+    verify_saved_fixture(MANIFEST)
     for case in MANIFEST["cases"]:
         assert input_path(case).is_file()
         assert reference_path(case).is_file()

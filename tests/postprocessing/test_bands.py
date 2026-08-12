@@ -582,7 +582,7 @@ def test_bands_lp_writes_p_matrix_from_saved_upf_and_wavefunctions(
         / "qe_reference"
         / "upstream"
         / "pseudo"
-        / "Si.pz-vbc.UPF"
+        / "Si.upf"
     )
     shutil.copy2(pseudo_source, save / pseudo_source.name)
     xml = f"""\

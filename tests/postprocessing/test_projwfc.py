@@ -221,7 +221,7 @@ def test_projwfc_end_to_end_on_saved_scalar_wavefunctions(
         "ngauss,degauss=   0    0.020000\n"
     ) in report
     assert "     IMPORTANT: XC functional enforced from input :\n" in report
-    assert "     Exchange-correlation= PZ\n" in report
+    assert "     Exchange-correlation= PBE\n" in report
 
 
 def test_kresolved_projwfc_writes_each_energy_and_k_point(
