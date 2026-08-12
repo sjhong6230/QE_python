@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Seung-Ju Hong
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Scalar norm-conserving implementation of Quantum ESPRESSO ``pp.x``."""
 
 from __future__ import annotations

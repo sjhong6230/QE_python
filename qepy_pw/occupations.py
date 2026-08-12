@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Seung-Ju Hong
+# SPDX-License-Identifier: GPL-2.0-or-later
 """QE-compatible scalar occupations and Gaussian broadening functions."""
 
 from __future__ import annotations

@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Seung-Ju Hong
+# SPDX-License-Identifier: GPL-2.0-or-later
 """QE-compatible classical Ewald energy for periodic point ions."""
 
 from __future__ import annotations
