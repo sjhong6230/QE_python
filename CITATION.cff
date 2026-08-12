@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+message: >-
+  If you use qepy-pw, cite this software and the applicable Quantum ESPRESSO
+  and pseudopotential publications listed in THIRD_PARTY_NOTICES.md.
+title: qepy-pw
+type: software
+authors:
+  - family-names: Hong
+    given-names: Seung-Ju
+    email: sjhong6230@snu.ac.kr
+version: 1.0.2
+license: GPL-2.0-or-later
+repository-code: https://github.com/sjhong6230/QE_python
+url: https://github.com/sjhong6230/QE_python

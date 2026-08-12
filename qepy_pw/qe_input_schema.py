@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Seung-Ju Hong
+# SPDX-License-Identifier: GPL-2.0-or-later
 """QE 7.5 namelist variable names used to classify input diagnostics.
 
 This is not a second input parser.  It lets the scalar port distinguish a

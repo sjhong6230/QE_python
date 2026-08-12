@@ -139,3 +139,13 @@ Release history is recorded in [CHANGELOG.md](CHANGELOG.md).
 ## Generative AI
 
 Generative AI was used for the production of the code.
+
+## License and attribution
+
+`qepy-pw` is distributed under the GNU General Public License, version 2 or
+(at your option) any later version (`GPL-2.0-or-later`). See [LICENSE](LICENSE)
+for the license text and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for
+Quantum ESPRESSO provenance, required notices, and recommended citations.
+
+This is an independent, unofficial project. It is not affiliated with,
+sponsored by, or endorsed by the Quantum ESPRESSO Foundation.

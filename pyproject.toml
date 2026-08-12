@@ -1,6 +1,6 @@
 [build-system]
 requires = [
-    "setuptools>=68",
+    "setuptools>=77.0.3",
     "Cython>=3.1",
     "numpy>=1.24",
     "mpi4py>=4.0",
@@ -14,6 +14,16 @@ version = "1.0.2"
 description = "A small, readable Python port of the scalar SCF path in Quantum ESPRESSO pw.x"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "GPL-2.0-or-later"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+authors = [
+    {name = "Seung-Ju Hong", email = "sjhong6230@snu.ac.kr"},
+]
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v2 or later (GPLv2+)",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Physics",
+]
 dependencies = [
     "numpy>=1.24",
     "scipy>=1.10",
@@ -25,6 +35,11 @@ dependencies = [
     "pyxtal>=1.0",
     "ase>=3.22",
 ]
+
+[project.urls]
+Homepage = "https://github.com/sjhong6230/QE_python"
+Repository = "https://github.com/sjhong6230/QE_python"
+Issues = "https://github.com/sjhong6230/QE_python/issues"
 
 [project.scripts]
 "pw.py" = "qepy_pw.pw.launcher:main"
