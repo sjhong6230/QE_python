@@ -151,14 +151,40 @@ def compare_values(
 
 def verify_pseudos(manifest: dict[str, Any]) -> None:
     for name, metadata in manifest["pseudopotentials"].items():
-        digest = hashlib.md5((UPSTREAM / "pseudo" / name).read_bytes()).hexdigest()
-        if digest != metadata["fixture_md5"]:
-            raise RuntimeError(f"checksum mismatch for {name}: {digest}")
+        data = (UPSTREAM / "pseudo" / name).read_bytes()
+        if "fixture_sha256" in metadata:
+            algorithm = "sha256"
+            digest = hashlib.sha256(data).hexdigest()
+            expected = metadata["fixture_sha256"]
+        else:
+            # Version-1 manifests recorded MD5. Retain support while old
+            # fixture sets are being migrated, but require SHA-256 for new
+            # provenance records.
+            algorithm = "md5"
+            digest = hashlib.md5(data).hexdigest()
+            expected = metadata["fixture_md5"]
+        if digest != expected:
+            raise RuntimeError(
+                f"{algorithm} checksum mismatch for {name}: {digest}"
+            )
+
+
+def verify_saved_fixture(manifest: dict[str, Any]) -> None:
+    metadata = manifest["saved_fixture"]
+    directory = UPSTREAM / metadata["directory"]
+    for name, expected in metadata["files_sha256"].items():
+        digest = hashlib.sha256((directory / name).read_bytes()).hexdigest()
+        if digest != expected:
+            raise RuntimeError(
+                f"sha256 checksum mismatch for {directory.name}/{name}: "
+                f"{digest}"
+            )
 
 
 def generate_references(case_ids: set[str] | None = None) -> None:
     manifest = load_manifest()
     verify_pseudos(manifest)
+    verify_saved_fixture(manifest)
     for case in manifest["cases"]:
         if case_ids is not None and case["id"] not in case_ids:
             continue

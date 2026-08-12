@@ -18,7 +18,7 @@ PSEUDO_DIR = Path(__file__).resolve().parents[2] / "qe_reference" / "upstream" /
 
 @pytest.mark.parametrize(
     ("filename", "element", "valence"),
-    [("H.pz-vbc.UPF", "H", 1.0), ("Si.pz-vbc.UPF", "Si", 4.0)],
+    [("H.upf", "H", 1.0), ("Si.upf", "Si", 4.0)],
 )
 def test_upf_reader_recovers_normalized_nc_metadata(
     filename: str, element: str, valence: float
@@ -75,7 +75,7 @@ def test_real_spherical_harmonic_gradients_match_finite_difference(
 
 
 def test_local_pseudopotential_radial_derivative_matches_finite_difference() -> None:
-    pseudo = read_upf(PSEUDO_DIR / "Si.pz-vbc.UPF")
+    pseudo = read_upf(PSEUDO_DIR / "Si.upf")
     q = np.asarray([0.31, 0.84, 1.27])
     volume = 125.0
     values, derivative = pseudo.fourier_with_derivative(q, volume)

@@ -40,7 +40,7 @@ def test_one_lsda_save_drives_all_postprocessing_programs(
   conv_thr=2.d-5, electron_maxstep=30
 /
 ATOMIC_SPECIES
-H 1.0008 H.pz-vbc.UPF
+H 1.0008 H.upf
 ATOMIC_POSITIONS angstrom
 H 0.00 0.00 -0.35
 H 0.00 0.00  0.35

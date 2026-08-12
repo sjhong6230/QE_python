@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Seung-Ju Hong
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Charge-density mixing algorithms.
 
 ``PlainBroydenMixer`` follows the algebra in QE ``PW/src/mix_rho.f90`` for

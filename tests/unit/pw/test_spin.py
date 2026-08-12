@@ -353,7 +353,7 @@ def test_lsda_scf_runs_two_spin_blocks_and_preserves_spatial_symmetry(
   conv_thr=1.d-5, electron_maxstep=30
 /
 ATOMIC_SPECIES
-H 1.0008 H.pz-vbc.UPF
+H 1.0008 H.upf
 ATOMIC_POSITIONS angstrom
 H 0.00 0.00 -0.35
 H 0.00 0.00  0.35
@@ -420,7 +420,7 @@ def test_starting_magnetization_splits_initial_spin_hamiltonians(
   conv_thr=1.d-14, electron_maxstep=1, startingwfc='atomic'
 /
 ATOMIC_SPECIES
-H 1.0008 H.pz-vbc.UPF
+H 1.0008 H.upf
 ATOMIC_POSITIONS angstrom
 H 0.00 0.00 -0.35
 H 0.00 0.00  0.35
@@ -467,7 +467,7 @@ def test_spin_gga_scf_force_and_stress_paths() -> None:
   conv_thr=2.d-5, electron_maxstep=30
 /
 ATOMIC_SPECIES
-H 1.0008 H.pz-vbc.UPF
+H 1.0008 H.upf
 ATOMIC_POSITIONS angstrom
 H 0.00 0.00 -0.35
 H 0.00 0.00  0.35

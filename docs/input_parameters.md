@@ -44,7 +44,7 @@ bad-namelist error.
   mixing_beta = 0.7
 /
 ATOMIC_SPECIES
-Si  28.0855  Si.pz-vbc.UPF
+Si  28.0855  Si.upf
 ATOMIC_POSITIONS crystal
 Si  0.00 0.00 0.00
 Si  0.25 0.25 0.25

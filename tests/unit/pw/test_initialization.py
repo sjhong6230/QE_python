@@ -87,13 +87,13 @@ def test_atomic_starting_density_has_requested_charge_and_moment() -> None:
 &ELECTRONS
 /
 ATOMIC_SPECIES
-H 1.0 H.pz-vbc.UPF
+H 1.0 H.upf
 ATOMIC_POSITIONS crystal
 H 0.25 0.25 0.25
 H 0.75 0.75 0.75
 K_POINTS gamma
 """))
-    pseudo = read_upf(PSEUDO_DIR / "H.pz-vbc.UPF")
+    pseudo = read_upf(PSEUDO_DIR / "H.upf")
     shape = (12, 12, 12)
     geometry = ReciprocalGrid.build(shape, pw.reciprocal, cutoff_ry=48.0)
     workspace = LocalPotentialWorkspace(geometry.charge_indices, shape)
