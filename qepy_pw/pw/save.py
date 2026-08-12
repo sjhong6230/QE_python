@@ -199,10 +199,7 @@ def _input_xml(root: ET.Element, pw: PWInput, result: SCFResult) -> None:
         smearing.set("degauss", f"{0.5 * float(pw.system.get('degauss', 0.0)):.16e}")
 
     basis = ET.SubElement(input_element, _qes("basis"))
-    # qepy-pw stores a complete complex G basis even for a Gamma-only input;
-    # QE's gamma_only=.TRUE. representation instead stores only one member
-    # of each +/-G pair and therefore must not be advertised here.
-    _text(basis, "gamma_only", False)
+    _text(basis, "gamma_only", _gamma_wavefunctions_packed(pw, result))
     _text(basis, "ecutwfc", 0.5 * float(pw.system["ecutwfc"]))
     _text(
         basis,
@@ -277,6 +274,16 @@ def _electron_count(pw: PWInput, result: SCFResult) -> float:
     return 0.0
 
 
+def _gamma_wavefunctions_packed(pw: PWInput, result: SCFResult) -> bool:
+    return bool(
+        pw.kpoint_mode == "gamma"
+        and result.wavefunction_miller_indices
+        and result.plane_waves_per_k
+        and len(result.wavefunction_miller_indices[0])
+        < result.plane_waves_per_k[0]
+    )
+
+
 def _charge_data(
     pw: PWInput, result: SCFResult
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
@@ -344,7 +351,7 @@ def _output_xml(root: ET.Element, pw: PWInput, result: SCFResult) -> None:
     _atomic_structure(output, pw)
 
     basis = ET.SubElement(output, _qes("basis_set"))
-    _text(basis, "gamma_only", False)
+    _text(basis, "gamma_only", _gamma_wavefunctions_packed(pw, result))
     _text(basis, "ecutwfc", 0.5 * float(pw.system["ecutwfc"]))
     _text(
         basis,
@@ -359,7 +366,18 @@ def _output_xml(root: ET.Element, pw: PWInput, result: SCFResult) -> None:
     )
     miller, _, _ = _charge_data(pw, result)
     _text(basis, "ngm", len(miller))
-    _text(basis, "npwx", max(result.plane_waves_per_k, default=0))
+    _text(
+        basis,
+        "npwx",
+        (
+            max(
+                (len(rows) for rows in result.wavefunction_miller_indices),
+                default=0,
+            )
+            if _gamma_wavefunctions_packed(pw, result)
+            else max(result.plane_waves_per_k, default=0)
+        ),
+    )
     reciprocal = ET.SubElement(basis, _qes("reciprocal_lattice"))
     for index, vector in enumerate(pw.reciprocal, start=1):
         _text(reciprocal, f"b{index}", _vector(vector))
@@ -790,31 +808,64 @@ def read_saved_wavefunction(
                 raise QEInputError(
                     f"saved wavefunctions at k point {kpoint_index + 1} have a different band count"
                 )
-            if _attribute_bool(h5.attrs.get("gamma_only", False)):
-                raise QEInputError("Gamma-packed saved wavefunctions are not supported")
+            gamma_only = _attribute_bool(
+                h5.attrs.get("gamma_only", False)
+            )
             if h5["evc"].shape != (number_of_bands, len(saved_miller)):
                 raise QEInputError("saved wavefunction coefficient dimensions are inconsistent")
-            if len(saved_miller) != len(current_miller):
+            if not gamma_only and len(saved_miller) != len(current_miller):
                 raise QEInputError(
                     f"saved wavefunction basis size does not match k point {kpoint_index + 1}"
                 )
-            try:
-                order = _miller_row_indices(saved_miller, current_miller)
-            except QEInputError as exc:
-                raise QEInputError(
-                    f"saved wavefunction Miller indices do not match k point "
-                    f"{kpoint_index + 1}"
-                ) from exc
-            del saved_miller
-            selected = order if local_rows is None else order[np.asarray(local_rows)]
-            del order
-            # h5py requires increasing fancy indices; read bands one by one and
-            # restore the requested current-basis ordering afterward.
-            sorting = np.argsort(selected)
-            inverse = np.argsort(sorting)
-            vectors = np.empty((len(selected), number_of_bands), dtype=np.complex128)
-            for band in range(number_of_bands):
-                vectors[:, band] = h5["evc"][band, selected[sorting]][inverse]
+            requested = (
+                current_miller
+                if local_rows is None
+                else current_miller[np.asarray(local_rows)]
+            )
+            if gamma_only:
+                lookup = {
+                    tuple(map(int, row)): index
+                    for index, row in enumerate(saved_miller)
+                }
+                selected = np.empty(len(requested), dtype=np.int64)
+                conjugate = np.zeros(len(requested), dtype=bool)
+                for row, miller in enumerate(requested):
+                    key = tuple(map(int, miller))
+                    index = lookup.get(key)
+                    if index is None:
+                        index = lookup.get(tuple(map(int, -miller)))
+                        conjugate[row] = True
+                    if index is None:
+                        raise QEInputError(
+                            "saved Gamma wavefunction Miller indices do not "
+                            f"match k point {kpoint_index + 1}"
+                        )
+                    selected[row] = index
+                packed = np.asarray(h5["evc"][:], dtype=np.complex128)
+                vectors = np.asfortranarray(packed[:, selected].T)
+                vectors[conjugate] = np.conjugate(vectors[conjugate])
+            else:
+                try:
+                    order = _miller_row_indices(saved_miller, current_miller)
+                except QEInputError as exc:
+                    raise QEInputError(
+                        f"saved wavefunction Miller indices do not match k point "
+                        f"{kpoint_index + 1}"
+                    ) from exc
+                selected = (
+                    order
+                    if local_rows is None
+                    else order[np.asarray(local_rows)]
+                )
+                sorting = np.argsort(selected)
+                inverse = np.argsort(sorting)
+                vectors = np.empty(
+                    (len(selected), number_of_bands), dtype=np.complex128
+                )
+                for band in range(number_of_bands):
+                    vectors[:, band] = h5["evc"][
+                        band, selected[sorting]
+                    ][inverse]
     except QEInputError:
         raise
     except (OSError, KeyError, ValueError) as exc:
@@ -885,7 +936,11 @@ def _write_wavefunction_data(
             point.crystal @ pw.reciprocal, dtype=np.float64
         )
         h5.attrs["ispin"] = int(pw.kpoint_spins[kpoint_index])
-        h5.attrs["gamma_only"] = ".FALSE."
+        h5.attrs["gamma_only"] = (
+            ".TRUE."
+            if _gamma_wavefunctions_packed(pw, result)
+            else ".FALSE."
+        )
         h5.attrs["scale_factor"] = 1.0
         h5.attrs["ngw"] = len(miller)
         h5.attrs["igwx"] = len(miller)
@@ -1008,11 +1063,16 @@ def _write_qe_save_distributed(
     if setup_error is not None:
         raise QEInputError(f"cannot initialize distributed save: {setup_error}")
 
-    for kpoint_index, total_rows in enumerate(result.plane_waves_per_k):
+    for kpoint_index in range(kpoints):
+        row_map = result.wavefunction_row_indices[kpoint_index]
+        local_total_rows = (
+            int(np.max(row_map)) + 1 if len(row_map) else 0
+        )
+        total_rows = int(mpi.max_scalar(local_total_rows))
         gathered = mpi.gather_indexed_rows_root(
             result.wavefunctions[kpoint_index],
-            result.wavefunction_row_indices[kpoint_index],
-            int(total_rows),
+            row_map,
+            total_rows,
         )
         write_error: str | None = None
         if mpi.is_root:

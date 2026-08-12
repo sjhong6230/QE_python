@@ -19,6 +19,7 @@ import numpy as np
 from ..basis import (
     FFTGridDescriptor,
     FFTScratchPool,
+    GammaWavefunctionMap,
     LocalPotentialWorkspace,
     PlaneWaveBasis,
     _load_native_fft,
@@ -30,6 +31,7 @@ from ..diagonalization import (
     FactorizedProjectorTerm,
     PackedProjectorTerm,
     PlaneWaveHamiltonian,
+    GammaPlaneWaveHamiltonian,
     ProjectorTerm,
     _lowest_generalized_eigh,
     _matmul_f,
@@ -351,9 +353,11 @@ class _LazyWorkspaceSequence(Sequence[LocalPotentialWorkspace]):
         distributed_fft_batch_size: int | None = None,
         cache_workspaces: bool = False,
         retain_serial_sticks: bool = True,
+        gamma_only: bool = False,
     ) -> None:
         self.bases = bases
         self.shape = shape
+        self.gamma_only = bool(gamma_only)
         self._cache: list[LocalPotentialWorkspace | None] | None = (
             [None] * len(bases)
             if cache_workspaces
@@ -389,6 +393,10 @@ class _LazyWorkspaceSequence(Sequence[LocalPotentialWorkspace]):
         workspace = LocalPotentialWorkspace(
             self.bases[index], self.shape, **self.options
         )
+        if self.gamma_only:
+            workspace.gamma_map = GammaWavefunctionMap(
+                self.bases[index].indices, workspace
+            )
         if self._cache is not None:
             # Ownership was already distilled into the compact arrays used
             # by the hot FFT path. The full per-G stick and boolean owner maps
@@ -410,15 +418,28 @@ def _collect_wavefunctions_root(
     collected: list[np.ndarray] = []
     miller_indices: list[np.ndarray] = []
     for vectors, basis, workspace in zip(eigenvectors, bases, workspaces):
-        indices = basis.indices
-        if vectors.shape[0] == len(basis):
-            gathered = vectors if mpi.is_root else np.empty((0, 0))
-        else:
-            gathered = mpi.gather_indexed_rows_root(
-                vectors,
-                workspace.local_plane_wave_indices,
-                len(basis),
+        gamma_map = workspace.gamma_map
+        if gamma_map is not None and vectors.shape[0] == gamma_map.local_size:
+            indices = gamma_map.miller_indices
+            gathered = (
+                vectors
+                if mpi.size == 1
+                else mpi.gather_indexed_rows_root(
+                    vectors,
+                    gamma_map.local_half_indices,
+                    gamma_map.global_half_size,
+                )
             )
+        else:
+            indices = basis.indices
+            if vectors.shape[0] == len(basis):
+                gathered = vectors if mpi.is_root else np.empty((0, 0))
+            else:
+                gathered = mpi.gather_indexed_rows_root(
+                    vectors,
+                    workspace.local_plane_wave_indices,
+                    len(basis),
+                )
         if mpi.is_root:
             collected.append(np.asarray(gathered))
             miller_indices.append(np.asarray(indices, dtype=np.int32).copy())
@@ -438,7 +459,15 @@ def _final_wavefunction_payload(
         # matrices avoids a second all-k resident copy for disk_io != 'none'.
         return (
             eigenvectors,
-            [np.asarray(basis.indices, dtype=np.int32) for basis in bases],
+            [
+                np.asarray(
+                    workspaces[index].gamma_map.miller_indices
+                    if workspaces[index].gamma_map is not None
+                    else basis.indices,
+                    dtype=np.int32,
+                )
+                for index, basis in enumerate(bases)
+            ],
             [],
             False,
         )
@@ -448,12 +477,25 @@ def _final_wavefunction_payload(
     # before advancing to the next k point.  Only rank zero needs the global
     # Miller order; all ranks retain their compact row maps.
     miller = (
-        [np.asarray(basis.indices, dtype=np.int32) for basis in bases]
+        [
+            np.asarray(
+                workspaces[index].gamma_map.miller_indices
+                if workspaces[index].gamma_map is not None
+                else basis.indices,
+                dtype=np.int32,
+            )
+            for index, basis in enumerate(bases)
+        ]
         if mpi.is_root
         else []
     )
     rows = [
-        np.asarray(workspaces[index].local_plane_wave_indices, dtype=np.int32)
+        np.asarray(
+            workspaces[index].gamma_map.local_half_indices
+            if workspaces[index].gamma_map is not None
+            else workspaces[index].local_plane_wave_indices,
+            dtype=np.int32,
+        )
         for index in range(len(bases))
     ]
     return eigenvectors, miller, rows, True
@@ -960,6 +1002,36 @@ def _rotate_starting_subspace(
         _matmul_f(atomic_basis, rotation),
         values,
         _matmul_f(applied, rotation),
+    )
+
+
+def _rotate_starting_subspace_gamma(
+    operator: GammaPlaneWaveHamiltonian,
+    trials: np.ndarray,
+    number_of_bands: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """QE ``rotate_wfc_gamma`` with a real half-G overlap metric."""
+    atomic_basis = np.asarray(trials, dtype=np.complex128)
+    applied = np.empty_like(atomic_basis, order="F")
+    operator.apply_into(atomic_basis, applied)
+    metric = operator.representation
+    projected = metric.gram(atomic_basis, applied)
+    overlap = metric.gram(atomic_basis, atomic_basis)
+    projected = 0.5 * (projected + projected.T)
+    overlap = 0.5 * (overlap + overlap.T)
+    cholesky = np.linalg.cholesky(overlap)
+    reduced = np.linalg.solve(
+        cholesky,
+        np.linalg.solve(cholesky, projected).T,
+    ).T
+    reduced = 0.5 * (reduced + reduced.T)
+    values, transformed = np.linalg.eigh(reduced)
+    rotation = np.linalg.solve(cholesky.T, transformed)
+    rotation = rotation[:, :number_of_bands]
+    return (
+        np.asfortranarray(atomic_basis @ rotation),
+        values[:number_of_bands],
+        np.asfortranarray(applied @ rotation),
     )
 
 
@@ -1563,6 +1635,11 @@ def _nonlocal_derivatives(
             continue
         band_count = int(active[-1]) + 1
         occupied_vectors = vectors[:, :band_count]
+        if (
+            workspace.gamma_map is not None
+            and occupied_vectors.shape[0] == workspace.gamma_map.local_size
+        ):
+            occupied_vectors = workspace.gamma_map.expand(occupied_vectors)
         occupation_weights = np.asarray(band_occupations[:band_count])
         for label, indexed_atoms in atoms_by_label.items():
             if stress:
@@ -1722,8 +1799,14 @@ def _hellmann_feynman_stress(
         )
         gk = basis.vectors[local_rows]
         band_count = len(band_occupations)
+        active_vectors = vectors[:, :band_count]
+        if (
+            workspace.gamma_map is not None
+            and active_vectors.shape[0] == workspace.gamma_map.local_size
+        ):
+            active_vectors = workspace.gamma_map.expand(active_vectors)
         plane_wave_weight = np.sum(
-            np.abs(vectors[:, :band_count]) ** 2
+            np.abs(active_vectors) ** 2
             * np.asarray(band_occupations)[None, :],
             axis=1,
         )
@@ -2194,6 +2277,17 @@ def _run_scf(
     diagonalization = _canonical_diagonalization(
         pw.electrons.get("diagonalization", "david")
     )
+    raw_gamma_mode = os.environ.get("QEPY_GAMMA_MODE", "auto").strip().lower()
+    if raw_gamma_mode not in {"auto", "half", "full"}:
+        raise QEInputError("QEPY_GAMMA_MODE must be auto, half, or full")
+    gamma_half_enabled = (
+        pw.kpoint_mode == "gamma" and raw_gamma_mode != "full"
+    )
+    if gamma_half_enabled and diagonalization != "david":
+        raise UnsupportedFeatureError(
+            "Gamma half-G currently requires diagonalization='david'; "
+            "QEPY_GAMMA_MODE=full retains the diagnostic full-complex path"
+        )
     if "diago_david_ndiim" in pw.electrons:
         raise QEInputError(
             "unknown ELECTRONS variable diago_david_ndiim; "
@@ -2400,6 +2494,7 @@ def _run_scf(
         # Serial kernels address one flat FFT grid directly. QE-style stick
         # lists are distributed-FFT metadata and are never read in this path.
         retain_serial_sticks=mpi.size > 1,
+        gamma_only=gamma_half_enabled,
     )
     reciprocal_grid = ReciprocalGrid.build(
         shape, pw.reciprocal, ecutrho
@@ -2500,8 +2595,16 @@ def _run_scf(
         pw.electrons.get("mixing_ndim", 8)
     )
     maximum_block = max(nbnd, atomic_orbitals)
-    local_plane_wave_counts = [
+    full_local_plane_wave_counts = [
         len(local_workspaces[index].local_plane_wave_indices)
+        for index in range(len(local_workspaces))
+    ]
+    local_plane_wave_counts = [
+        (
+            local_workspaces[index].gamma_map.local_size
+            if local_workspaces[index].gamma_map is not None
+            else full_local_plane_wave_counts[index]
+        )
         for index in range(len(local_workspaces))
     ]
     local_plane_waves = max(local_plane_wave_counts)
@@ -2640,7 +2743,7 @@ def _run_scf(
     projector_workspace_bytes = max(
         (
             local_rows * projector_peak_columns * 16
-            for local_rows in local_plane_wave_counts
+            for local_rows in full_local_plane_wave_counts
         ),
         default=0,
     )
@@ -3220,6 +3323,8 @@ def _run_scf(
                     if mpi.size > 1 else None
                 ),
             )
+            if workspace.gamma_map is not None:
+                loaded = workspace.gamma_map.compress(loaded)
             if wavefunction_buffer is not None:
                 # wfcinit reads the portable collected restart one k point at
                 # a time and repopulates QE's processor-local working buffer.
@@ -3250,6 +3355,7 @@ def _run_scf(
             descriptor=None,
             serial_fft_batch_size=threads_per_process,
             retain_serial_sticks=False,
+            gamma_only=gamma_half_enabled,
         )
     qe_random = _QERandom()
     requested_diago_thr = pw.electrons.get("diago_thr_init")
@@ -3550,7 +3656,7 @@ def _run_scf(
                     ),
                 )
                 timers.stop("init_us_2", init_us_started)
-                operator = PlaneWaveHamiltonian(
+                full_operator = PlaneWaveHamiltonian(
                     basis,
                     active_v_eff_g,
                     projector_terms,
@@ -3565,6 +3671,12 @@ def _run_scf(
                     # ionic local potential, not the average total effective
                     # potential used by H|psi>.
                     potential_average=v_ion_average,
+                )
+                gamma_map = local_workspace.gamma_map
+                operator = (
+                    GammaPlaneWaveHamiltonian(full_operator, gamma_map)
+                    if gamma_map is not None
+                    else full_operator
                 )
                 trial_vectors = (
                     wavefunction_buffer[kpoint_index]
@@ -3588,7 +3700,7 @@ def _run_scf(
                         # of the serial one, without allocating its global
                         # wavefunction matrix on every rank.
                         local_rows=(
-                            operator.local_rows
+                            full_operator.local_rows
                             if mpi.size > 1
                             and pw.full_kpoint_count > len(pw.kpoints)
                             else None
@@ -3603,31 +3715,59 @@ def _run_scf(
                     )
                     if mpi.size > 1 and starting.shape[0] == len(basis):
                         starting = starting[
-                            operator.local_rows
+                            full_operator.local_rows
                         ]
+                    if gamma_map is not None:
+                        starting = gamma_map.compress(starting)
                     rotation_operator = operator
                     if starting_local_workspaces is not None:
-                        rotation_operator = PlaneWaveHamiltonian(
+                        rotation_workspace = starting_local_workspaces[
+                            kpoint_index
+                        ]
+                        rotation_full_operator = PlaneWaveHamiltonian(
                             basis,
                             active_v_eff_g,
                             projector_terms,
-                            local_workspace=(
-                                starting_local_workspaces[kpoint_index]
-                            ),
+                            local_workspace=rotation_workspace,
                             timers=timers,
                             real_potential=active_v_eff_local,
                             native_potential_layout=True,
                             potential_average=v_ion_average,
                         )
-                    (
-                        trial_vectors,
-                        trial_eigenvalues,
-                        trial_applied,
-                    ) = _rotate_starting_subspace(
-                        rotation_operator, starting, nbnd, mpi
-                    )
+                        rotation_gamma_map = rotation_workspace.gamma_map
+                        rotation_operator = (
+                            GammaPlaneWaveHamiltonian(
+                                rotation_full_operator,
+                                rotation_gamma_map,
+                            )
+                            if rotation_gamma_map is not None
+                            else rotation_full_operator
+                        )
+                    if isinstance(
+                        rotation_operator, GammaPlaneWaveHamiltonian
+                    ):
+                        (
+                            trial_vectors,
+                            trial_eigenvalues,
+                            trial_applied,
+                        ) = _rotate_starting_subspace_gamma(
+                            rotation_operator, starting, nbnd
+                        )
+                    else:
+                        (
+                            trial_vectors,
+                            trial_eigenvalues,
+                            trial_applied,
+                        ) = _rotate_starting_subspace(
+                            rotation_operator, starting, nbnd, mpi
+                        )
                     timers.stop("wfcinit", wfcinit_started)
                     del starting, rotation_operator
+                elif (
+                    gamma_map is not None
+                    and trial_vectors.shape[0] != gamma_map.local_size
+                ):
+                    trial_vectors = gamma_map.compress(trial_vectors)
                 active_diagonalization = diagonalization
                 if diagonalization == "rmm-davidson":
                     active_diagonalization = (
@@ -3688,10 +3828,15 @@ def _run_scf(
                             initial_eigenvalues=retry_eigenvalues,
                             initial_applied=retry_applied,
                             mpi=mpi,
-                            global_dimension=len(basis),
+                            global_dimension=(
+                                gamma_map.global_real_dimension
+                                if gamma_map is not None
+                                else len(basis)
+                            ),
                             global_row_indices=operator.local_rows,
                             timers=timers,
                             operator_into=operator.apply_into,
+                            metric=gamma_map,
                         )
                         davidson_attempt += 1
                         davidson_iterations += solution.iterations
@@ -3809,6 +3954,7 @@ def _run_scf(
             if diagonalization != "dense":
                 del (
                     operator,
+                    full_operator,
                     projector_terms,
                     solution,
                     trial_vectors,

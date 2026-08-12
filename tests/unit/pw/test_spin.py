@@ -427,14 +427,16 @@ H 0.00 0.00  0.35
 K_POINTS gamma
 """))
     projected_eigenvalues: list[np.ndarray] = []
-    original_rotate = scf_module._rotate_starting_subspace
+    original_rotate = scf_module._rotate_starting_subspace_gamma
 
     def tracked_rotate(*args, **kwargs):
         vectors, values, applied = original_rotate(*args, **kwargs)
         projected_eigenvalues.append(values.copy())
         return vectors, values, applied
 
-    monkeypatch.setattr(scf_module, "_rotate_starting_subspace", tracked_rotate)
+    monkeypatch.setattr(
+        scf_module, "_rotate_starting_subspace_gamma", tracked_rotate
+    )
     run_scf(pw)
 
     # QE uses the same scalar atomic orbitals for both collinear channels,

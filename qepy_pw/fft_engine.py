@@ -785,17 +785,39 @@ class GammaHalfSpectrum:
         selected: list[int] = []
         partners: list[int] = []
         weights: list[float] = []
+        visited: set[int] = set()
         for row, slot in enumerate(slots):
+            if row in visited:
+                continue
             partner_slot = tuple(
                 map(int, (-slot) % np.asarray(shape, dtype=np.int32))
             )
             if partner_slot not in lookup:
                 raise ValueError("Gamma basis is not closed under G -> -G")
             partner = lookup[partner_slot]
-            if row <= partner:
-                selected.append(row)
-                partners.append(partner)
-                weights.append(1.0 if row == partner else 2.0)
+            visited.update((row, partner))
+            if row == partner:
+                canonical = row
+            else:
+                predicates = []
+                for candidate in (row, partner):
+                    gx, gy, gz = map(int, miller[candidate])
+                    predicates.append(
+                        gz > 0
+                        or (gz == 0 and gy > 0)
+                        or (gz == 0 and gy == 0 and gx >= 0)
+                    )
+                canonical = (
+                    (row, partner)[predicates.index(True)]
+                    if sum(predicates) == 1
+                    else min(row, partner)
+                )
+            canonical_partner = lookup[
+                tuple(map(int, (-slots[canonical]) % np.asarray(shape)))
+            ]
+            selected.append(canonical)
+            partners.append(canonical_partner)
+            weights.append(1.0 if canonical == canonical_partner else 2.0)
         return cls(
             tuple(map(int, shape)),
             miller,

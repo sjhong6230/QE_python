@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 
 from .errors import QEInputError
-from .fft_engine import PencilFFT3D, _partition_owner
+from .fft_engine import GammaHalfSpectrum, PencilFFT3D, _partition_owner
 from .mpi import MPIContext
 from .threads import hybrid_thread_count
 from .timing import TimingRegistry
@@ -546,6 +546,7 @@ class LocalPotentialWorkspace:
         # them into real-space Z-plane slabs for the two-dimensional XY FFT.
         self.local_slab = self.mpi.slab(self.shape[2])
         self.pencil_fft = pencil_fft
+        self.gamma_map: GammaWavefunctionMap | None = None
         if self.mpi.size == 1:
             if miller is None:
                 assert compact_basis is not None
@@ -1402,6 +1403,12 @@ class LocalPotentialWorkspace:
         if density.shape != expected_density_shape:
             raise ValueError("density accumulator has the wrong local shape")
         number_of_vectors = vectors.shape[1]
+        if (
+            self.gamma_map is not None
+            and vectors.shape[0] == self.gamma_map.local_size
+        ):
+            self.gamma_map.accumulate_density(density, vectors, weights)
+            return
         timer = (
             self.timers.measure("fftw")
             if self.timers is not None
@@ -1671,6 +1678,328 @@ class LocalPotentialWorkspace:
                     diagonal,
                 )
         return result[:, 0] if was_vector else result
+
+
+class GammaWavefunctionMap:
+    """Distributed QE Γ half-G representation around a full FFT workspace.
+
+    Solver vectors contain one canonical member of every ``G,-G`` pair.
+    Expansion exchanges only the missing conjugate rows; unpacking performs
+    the reverse exchange so two real orbitals can share one complex Hψ call.
+    No rank ever gathers a complete wavefunction.
+    """
+
+    def __init__(
+        self,
+        indices: np.ndarray,
+        workspace: LocalPotentialWorkspace,
+    ) -> None:
+        self.indices = np.asarray(indices, dtype=np.int32)
+        self.workspace = workspace
+        self.mpi = workspace.mpi
+        self.spectrum = GammaHalfSpectrum.build(self.indices, workspace.shape)
+        self.half_rows = self.spectrum.half_rows
+        self.partner_rows = self.spectrum.partner_rows
+        self.global_half_size = len(self.half_rows)
+        self.global_real_dimension = int(np.sum(self.spectrum.weights))
+        if self.mpi.size == 1:
+            owners = np.zeros(len(self.indices), dtype=np.int32)
+            full_local_rows = np.arange(len(self.indices), dtype=np.int32)
+        else:
+            owners = np.asarray(
+                workspace.stick_owners[workspace.stick_indices],
+                dtype=np.int32,
+            )
+            full_local_rows = workspace.local_plane_wave_indices
+        self.full_owners = owners
+        self.full_local_rows = np.asarray(full_local_rows, dtype=np.int32)
+        full_positions = np.full(len(self.indices), -1, dtype=np.int64)
+        full_positions[self.full_local_rows] = np.arange(len(full_local_rows))
+        self._full_positions = full_positions
+        half_owners = owners[self.half_rows]
+        partner_owners = owners[self.partner_rows]
+        self._half_owners = half_owners
+        self._partner_owners = partner_owners
+        self.local_half_indices = np.asarray(
+            np.flatnonzero(half_owners == self.mpi.rank), dtype=np.int32
+        )
+        self.local_full_rows = self.half_rows[self.local_half_indices]
+        self.local_partner_rows = self.partner_rows[self.local_half_indices]
+        self.local_weights = np.asarray(
+            self.spectrum.weights[self.local_half_indices], dtype=np.float64
+        )
+        self.self_conjugate = self.local_full_rows == self.local_partner_rows
+        self._canonical_positions = self._full_positions[self.local_full_rows]
+        if np.any(self._canonical_positions < 0):
+            raise ValueError("Gamma canonical rows are not locally owned")
+
+        ranks = range(self.mpi.size)
+        half_ids = np.arange(self.global_half_size, dtype=np.int32)
+        nonself = self.half_rows != self.partner_rows
+        self._expand_send_half = tuple(
+            np.asarray(
+                np.flatnonzero(
+                    (half_owners == self.mpi.rank)
+                    & (partner_owners == rank)
+                    & nonself
+                ),
+                dtype=np.int32,
+            )
+            for rank in ranks
+        )
+        local_lookup = np.full(self.global_half_size, -1, dtype=np.int64)
+        local_lookup[self.local_half_indices] = np.arange(
+            len(self.local_half_indices)
+        )
+        self._expand_send_local = tuple(
+            local_lookup[ids] for ids in self._expand_send_half
+        )
+        self._expand_receive_full = tuple(
+            self._full_positions[
+                self.partner_rows[
+                    half_ids[
+                        (half_owners == rank)
+                        & (partner_owners == self.mpi.rank)
+                        & nonself
+                    ]
+                ]
+            ]
+            for rank in ranks
+        )
+        self._unpack_send_full = tuple(
+            self._full_positions[
+                self.partner_rows[
+                    half_ids[
+                        (half_owners == rank)
+                        & (partner_owners == self.mpi.rank)
+                        & nonself
+                    ]
+                ]
+            ]
+            for rank in ranks
+        )
+        self._unpack_receive_local = tuple(
+            local_lookup[
+                half_ids[
+                    (half_owners == self.mpi.rank)
+                    & (partner_owners == rank)
+                    & nonself
+                ]
+            ]
+            for rank in ranks
+        )
+        for groups in (
+            self._expand_send_local,
+            self._expand_receive_full,
+            self._unpack_send_full,
+            self._unpack_receive_local,
+        ):
+            if any(np.any(np.asarray(group) < 0) for group in groups):
+                raise ValueError("Gamma pair exchange contains a nonlocal row")
+
+    @property
+    def local_size(self) -> int:
+        return len(self.local_half_indices)
+
+    @property
+    def miller_indices(self) -> np.ndarray:
+        return self.indices[self.half_rows]
+
+    def _exchange_rows(
+        self,
+        values: np.ndarray,
+        send_rows: tuple[np.ndarray, ...],
+        receive_rows: tuple[np.ndarray, ...],
+        destination: np.ndarray,
+        *,
+        conjugate: bool,
+    ) -> None:
+        bands = values.shape[1]
+        send_counts = np.asarray(
+            [len(rows) * bands for rows in send_rows], dtype=np.int64
+        )
+        receive_counts = np.asarray(
+            [len(rows) * bands for rows in receive_rows], dtype=np.int64
+        )
+        send_displacements = np.concatenate(
+            (np.array([0], dtype=np.int64), np.cumsum(send_counts[:-1]))
+        )
+        receive_displacements = np.concatenate(
+            (np.array([0], dtype=np.int64), np.cumsum(receive_counts[:-1]))
+        )
+        send = np.empty(int(np.sum(send_counts)), dtype=np.complex128)
+        receive = np.empty(int(np.sum(receive_counts)), dtype=np.complex128)
+        for rows, start, count in zip(
+            send_rows, send_displacements, send_counts
+        ):
+            block = values[np.asarray(rows, dtype=np.int64)]
+            if conjugate:
+                block = np.conjugate(block)
+            send[int(start) : int(start + count)] = block.reshape(-1)
+        if self.mpi.size == 1:
+            receive[:] = send
+        else:
+            from mpi4py import MPI
+
+            self.mpi.comm.Alltoallv(
+                [send, send_counts, send_displacements, MPI.C_DOUBLE_COMPLEX],
+                [
+                    receive,
+                    receive_counts,
+                    receive_displacements,
+                    MPI.C_DOUBLE_COMPLEX,
+                ],
+            )
+        for rows, start, count in zip(
+            receive_rows, receive_displacements, receive_counts
+        ):
+            if not count:
+                continue
+            destination[np.asarray(rows, dtype=np.int64)] = receive[
+                int(start) : int(start + count)
+            ].reshape(len(rows), bands)
+
+    def expand(self, half: np.ndarray) -> np.ndarray:
+        """Expand rank-local half-G columns into full distributed rows."""
+        values = np.asarray(half, dtype=np.complex128)
+        was_vector = values.ndim == 1
+        if was_vector:
+            values = values[:, None]
+        if values.ndim != 2 or values.shape[0] != self.local_size:
+            raise ValueError("Gamma half-G coefficients have the wrong shape")
+        canonical = values.copy()
+        canonical[self.self_conjugate] = canonical[self.self_conjugate].real
+        result = np.zeros(
+            (len(self.full_local_rows), values.shape[1]),
+            dtype=np.complex128,
+            order="F",
+        )
+        result[self._canonical_positions] = canonical
+        local_partner = (
+            (self._partner_owners[self.local_half_indices] == self.mpi.rank)
+            & ~self.self_conjugate
+        )
+        result[self._full_positions[self.local_partner_rows[local_partner]]] = (
+            np.conjugate(canonical[local_partner])
+        )
+        self._exchange_rows(
+            canonical,
+            self._expand_send_local,
+            self._expand_receive_full,
+            result,
+            conjugate=True,
+        )
+        return result[:, 0] if was_vector else result
+
+    def compress(self, full: np.ndarray, *, symmetrize: bool = True) -> np.ndarray:
+        """Return locally owned canonical rows from a full distributed block."""
+        values = np.asarray(full, dtype=np.complex128)
+        was_vector = values.ndim == 1
+        if was_vector:
+            values = values[:, None]
+        if values.ndim != 2 or values.shape[0] != len(self.full_local_rows):
+            raise ValueError("full Gamma coefficients have the wrong shape")
+        canonical = np.array(values[self._canonical_positions], copy=True)
+        if symmetrize:
+            partner_conjugate = np.empty_like(canonical)
+            local_partner = self._partner_owners[
+                self.local_half_indices
+            ] == self.mpi.rank
+            partner_conjugate[local_partner] = np.conjugate(
+                values[
+                    self._full_positions[
+                        self.local_partner_rows[local_partner]
+                    ]
+                ]
+            )
+            self._exchange_rows(
+                values,
+                self._unpack_send_full,
+                self._unpack_receive_local,
+                partner_conjugate,
+                conjugate=True,
+            )
+            canonical = 0.5 * (canonical + partner_conjugate)
+        canonical[self.self_conjugate] = canonical[self.self_conjugate].real
+        return canonical[:, 0] if was_vector else canonical
+
+    def pack_two(self, first: np.ndarray, second: np.ndarray) -> np.ndarray:
+        return self.expand(first) + 1j * self.expand(second)
+
+    def unpack_two(self, packed: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        values = np.asarray(packed, dtype=np.complex128)
+        if values.ndim == 1:
+            values = values[:, None]
+        plus = np.array(values[self._canonical_positions], copy=True)
+        minus_conjugate = np.empty_like(plus)
+        local_partner = self._partner_owners[
+            self.local_half_indices
+        ] == self.mpi.rank
+        minus_conjugate[local_partner] = np.conjugate(
+            values[
+                self._full_positions[self.local_partner_rows[local_partner]]
+            ]
+        )
+        self._exchange_rows(
+            values,
+            self._unpack_send_full,
+            self._unpack_receive_local,
+            minus_conjugate,
+            conjugate=True,
+        )
+        first = 0.5 * (plus + minus_conjugate)
+        second = (plus - minus_conjugate) / (2.0j)
+        first[self.self_conjugate] = first[self.self_conjugate].real
+        second[self.self_conjugate] = second[self.self_conjugate].real
+        return first, second
+
+    def local_gram(self, left: np.ndarray, right: np.ndarray) -> np.ndarray:
+        lhs = np.asarray(left, dtype=np.complex128)
+        rhs = np.asarray(right, dtype=np.complex128)
+        if lhs.ndim == 1:
+            lhs = lhs[:, None]
+        if rhs.ndim == 1:
+            rhs = rhs[:, None]
+        if lhs.shape[0] != self.local_size or rhs.shape[0] != self.local_size:
+            raise ValueError("Gamma metric row count is inconsistent")
+        return np.real(
+            (np.conjugate(lhs) * self.local_weights[:, None]).T @ rhs
+        )
+
+    def gram(self, left: np.ndarray, right: np.ndarray) -> np.ndarray:
+        return np.asarray(self.mpi.sum_array(self.local_gram(left, right)))
+
+    def column_norms(self, values: np.ndarray) -> np.ndarray:
+        gram = self.gram(values, values)
+        return np.sqrt(np.maximum(np.diag(gram), 0.0))
+
+    def accumulate_density(
+        self,
+        density: np.ndarray,
+        coefficients: np.ndarray,
+        weights: np.ndarray,
+    ) -> None:
+        """Accumulate two real Γ orbitals per complex inverse FFT."""
+        vectors = np.asarray(coefficients, dtype=np.complex128)
+        band_weights = np.asarray(weights, dtype=np.float64)
+        for start in range(0, vectors.shape[1], 2):
+            if start + 1 < vectors.shape[1]:
+                packed = self.pack_two(
+                    vectors[:, start], vectors[:, start + 1]
+                )
+                real_space = self.workspace.coefficients_to_grid(
+                    packed, use_scratch=True
+                )
+                density += (
+                    band_weights[start] * np.real(real_space) ** 2
+                    + band_weights[start + 1] * np.imag(real_space) ** 2
+                )
+            else:
+                expanded = self.expand(vectors[:, start])
+                real_space = self.workspace.coefficients_to_grid(
+                    expanded, use_scratch=True
+                )
+                density += band_weights[start] * np.real(real_space) ** 2
 
 
 def _basis_bound(

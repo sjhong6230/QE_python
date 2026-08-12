@@ -8,7 +8,12 @@ from typing import Callable
 
 import numpy as np
 
-from .basis import LocalPotentialWorkspace, PlaneWaveBasis, _load_native_fft
+from .basis import (
+    GammaWavefunctionMap,
+    LocalPotentialWorkspace,
+    PlaneWaveBasis,
+    _load_native_fft,
+)
 from .mpi import MPIContext
 from .timing import TimingRegistry
 
@@ -107,6 +112,23 @@ def _lowest_generalized_eigh(
     reduced = 0.5 * (reduced + reduced.conj().T)
     values, transformed = np.linalg.eigh(reduced)
     vectors = np.linalg.solve(cholesky.conj().T, transformed)
+    return values[:roots], vectors[:, :roots]
+
+
+def _lowest_generalized_eigh_real(
+    hamiltonian: np.ndarray,
+    overlap: np.ndarray,
+    roots: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Real-symmetric counterpart used by QE's Γ-only Hilbert space."""
+    hamiltonian = np.asarray(hamiltonian, dtype=np.float64)
+    overlap = np.asarray(overlap, dtype=np.float64)
+    cholesky = np.linalg.cholesky(overlap)
+    left_reduced = np.linalg.solve(cholesky, hamiltonian)
+    reduced = np.linalg.solve(cholesky, left_reduced.T).T
+    reduced = 0.5 * (reduced + reduced.T)
+    values, transformed = np.linalg.eigh(reduced)
+    vectors = np.linalg.solve(cholesky.T, transformed)
     return values[:roots], vectors[:, :roots]
 
 
@@ -369,11 +391,116 @@ class PlaneWaveHamiltonian:
         return result[:, 0] if was_vector else result
 
 
+class GammaPlaneWaveHamiltonian:
+    """Real-linear Γ Hamiltonian stored in a distributed half-G basis."""
+
+    def __init__(
+        self,
+        full_operator: PlaneWaveHamiltonian,
+        representation: GammaWavefunctionMap,
+    ) -> None:
+        self.full_operator = full_operator
+        self.representation = representation
+        self.mpi = full_operator.mpi
+        self.local_rows = representation.local_half_indices
+        self.local_kinetic = full_operator.local_kinetic[
+            representation._canonical_positions
+        ]
+        self._diagonal = full_operator.diagonal[
+            representation._canonical_positions
+        ].copy()
+        canonical = representation._canonical_positions
+        half_terms: list[MaterializedProjectorTerm] = []
+        for term in full_operator.projector_terms:
+            if isinstance(term, FactorizedProjectorTerm):
+                for atom in range(term.phases.shape[1]):
+                    beta = term.beta * term.phases[:, atom, None]
+                    half_terms.append(
+                        (
+                            np.asfortranarray(beta[canonical]),
+                            np.asarray(term.coupling),
+                        )
+                    )
+            elif isinstance(term, PackedProjectorTerm):
+                half_terms.append(
+                    (
+                        np.asfortranarray(term.beta[canonical]),
+                        np.asarray(term.coupling),
+                    )
+                )
+            else:
+                beta, coupling = term
+                half_terms.append(
+                    (
+                        np.asfortranarray(beta[canonical]),
+                        np.asarray(coupling),
+                    )
+                )
+        self.projector_terms = tuple(half_terms)
+        # The Γ wrapper evaluates projectors directly in the weighted half-G
+        # metric. Retain only T+Vloc in the full-row packed FFT operator.
+        full_operator.projector_terms = ()
+
+    @property
+    def diagonal(self) -> np.ndarray:
+        return self._diagonal
+
+    def _add_projectors(
+        self, vectors: np.ndarray, result: np.ndarray
+    ) -> None:
+        for beta, coupling in self.projector_terms:
+            overlap = self.representation.gram(beta, vectors)
+            coupled = np.asarray(coupling) @ overlap
+            result += beta @ coupled
+
+    def apply(self, coefficients: np.ndarray) -> np.ndarray:
+        values = np.asarray(coefficients, dtype=np.complex128)
+        was_vector = values.ndim == 1
+        if was_vector:
+            values = values[:, None]
+        result = np.empty_like(values, order="F")
+        self.apply_into(values, result)
+        return result[:, 0] if was_vector else result
+
+    def apply_into(
+        self, coefficients: np.ndarray, out: np.ndarray
+    ) -> np.ndarray:
+        values = np.asarray(coefficients, dtype=np.complex128)
+        destination = np.asarray(out)
+        was_vector = values.ndim == 1
+        if was_vector:
+            values = values[:, None]
+            destination = destination[:, None]
+        if (
+            values.ndim != 2
+            or values.shape[0] != self.representation.local_size
+            or destination.shape != values.shape
+        ):
+            raise ValueError("Gamma Hamiltonian block has the wrong shape")
+        for start in range(0, values.shape[1], 2):
+            if start + 1 < values.shape[1]:
+                packed = self.representation.pack_two(
+                    values[:, start], values[:, start + 1]
+                )
+                applied = self.full_operator.apply(packed)
+                first, second = self.representation.unpack_two(applied)
+                destination[:, start] = first[:, 0]
+                destination[:, start + 1] = second[:, 0]
+            else:
+                expanded = self.representation.expand(values[:, start])
+                applied = self.full_operator.apply(expanded)
+                destination[:, start] = self.representation.compress(applied)
+        if self.projector_terms:
+            self._add_projectors(values, destination)
+        return out
+
+
 def _orthonormalize(
     vectors: np.ndarray,
     against: np.ndarray | None = None,
     threshold: float = 1.0e-12,
     mpi: MPIContext | None = None,
+    metric: GammaWavefunctionMap | None = None,
 ) -> np.ndarray:
     """Return a rank-revealing basis with one common-case MPI reduction.
 
@@ -388,6 +515,33 @@ def _orthonormalize(
     mpi = mpi if mpi is not None else MPIContext()
     if block.shape[1] == 0:
         return np.empty((block.shape[0], 0), dtype=complex)
+    if metric is not None:
+        if against is not None and against.ndim == 2 and against.shape[1]:
+            for _ in range(2):
+                projection = mpi.sum_array(
+                    metric.local_gram(against, block)
+                )
+                block -= against @ projection
+        gram = np.asarray(
+            mpi.sum_array(metric.local_gram(block, block)), dtype=float
+        )
+        gram = 0.5 * (gram + gram.T)
+        if gram.shape == (1, 1):
+            squared_norm = float(gram[0, 0])
+            if squared_norm <= 0.0:
+                return np.empty((block.shape[0], 0), dtype=complex)
+            return block / np.sqrt(squared_norm)
+        squared, rotation = np.linalg.eigh(gram)
+        order = np.argsort(squared)[::-1]
+        squared = np.maximum(squared[order], 0.0)
+        if not len(squared) or squared[0] == 0.0:
+            return np.empty((block.shape[0], 0), dtype=complex)
+        rank = int(
+            np.count_nonzero(squared > threshold**2 * squared[0])
+        )
+        transform = rotation[:, order[:rank]]
+        transform /= np.sqrt(squared[:rank])[None, :]
+        return block @ transform
     if mpi.size > 1:
         if against is not None and against.ndim == 2 and against.shape[1]:
             projection_local = against.conj().T @ block
@@ -501,15 +655,21 @@ def _normalize_columns(
     vectors: np.ndarray,
     mpi: MPIContext,
     threshold: float = 1.0e-14,
+    metric: GammaWavefunctionMap | None = None,
 ) -> np.ndarray:
     """Normalize a correction block as QE ``cegterg`` does."""
     block = np.asarray(vectors, dtype=complex)
     if block.ndim == 1:
         block = block[:, None]
     native = _load_native_fft()
-    squared_norms = np.real(
-        mpi.sum_array(native.column_squared_norms(block))
-    )
+    if metric is None:
+        squared_norms = np.real(
+            mpi.sum_array(native.column_squared_norms(block))
+        )
+    else:
+        squared_norms = np.diag(
+            mpi.sum_array(metric.local_gram(block, block))
+        )
     if not len(squared_norms):
         return np.empty((block.shape[0], 0), dtype=complex)
     scale = max(float(np.max(squared_norms)), 1.0e-300)
@@ -517,6 +677,8 @@ def _normalize_columns(
     if not np.any(keep):
         return np.empty((block.shape[0], 0), dtype=complex)
     selected = np.ascontiguousarray(np.flatnonzero(keep), dtype=np.int64)
+    if metric is not None:
+        return block[:, selected] / np.sqrt(squared_norms[selected])[None, :]
     return native.normalize_selected_columns(
         block,
         np.ascontiguousarray(squared_norms, dtype=np.float64),
@@ -545,6 +707,7 @@ def davidson(
     global_row_indices: np.ndarray | None = None,
     timers: TimingRegistry | None = None,
     operator_into: BlockOperatorInto | None = None,
+    metric: GammaWavefunctionMap | None = None,
 ) -> DavidsonResult:
     """Compute the lowest eigenpairs with restarted block Davidson iteration."""
     diagonal = np.asarray(diagonal, dtype=float)
@@ -617,7 +780,7 @@ def davidson(
             if timers is not None
             else nullcontext()
         ):
-            basis = _orthonormalize(trial, mpi=mpi)
+            basis = _orthonormalize(trial, mpi=mpi, metric=metric)
     if basis.shape[1] < number_of_roots:
         raise ValueError("initial Davidson vectors are linearly dependent")
     maximum_subspace = min(
@@ -651,7 +814,8 @@ def davidson(
         hamiltonian_applications = 0
     applied_basis = applied_storage[:, :active_columns]
     projected_storage = np.zeros(
-        (maximum_subspace, maximum_subspace), dtype=complex
+        (maximum_subspace, maximum_subspace),
+        dtype=float if metric is not None else complex,
     )
     overlap_storage = np.zeros_like(projected_storage)
 
@@ -663,8 +827,12 @@ def davidson(
             else nullcontext()
         ):
             new_basis = basis[:, first_new:active_columns]
-            h_local = new_basis.conj().T @ applied_basis
-            s_local = new_basis.conj().T @ basis
+            if metric is None:
+                h_local = new_basis.conj().T @ applied_basis
+                s_local = new_basis.conj().T @ basis
+            else:
+                h_local = metric.local_gram(new_basis, applied_basis)
+                s_local = metric.local_gram(new_basis, basis)
             split = h_local.size
             reduced = mpi.sum_array(
                 np.concatenate((h_local.ravel(), s_local.ravel()))
@@ -680,18 +848,34 @@ def davidson(
             if first_new:
                 projected_storage[
                     :first_new, first_new:active_columns
-                ] = h_rows[:, :first_new].conj().T
+                ] = (
+                    h_rows[:, :first_new].conj().T
+                    if metric is None
+                    else h_rows[:, :first_new].T
+                )
                 overlap_storage[
                     :first_new, first_new:active_columns
-                ] = s_rows[:, :first_new].conj().T
+                ] = (
+                    s_rows[:, :first_new].conj().T
+                    if metric is None
+                    else s_rows[:, :first_new].T
+                )
             new_slice = slice(first_new, active_columns)
             projected_storage[new_slice, new_slice] = 0.5 * (
                 projected_storage[new_slice, new_slice]
-                + projected_storage[new_slice, new_slice].conj().T
+                + (
+                    projected_storage[new_slice, new_slice].conj().T
+                    if metric is None
+                    else projected_storage[new_slice, new_slice].T
+                )
             )
             overlap_storage[new_slice, new_slice] = 0.5 * (
                 overlap_storage[new_slice, new_slice]
-                + overlap_storage[new_slice, new_slice].conj().T
+                + (
+                    overlap_storage[new_slice, new_slice].conj().T
+                    if metric is None
+                    else overlap_storage[new_slice, new_slice].T
+                )
             )
 
     update_projected(0)
@@ -702,11 +886,18 @@ def davidson(
             if timers is not None
             else nullcontext()
         ):
-            roots, coefficients = _lowest_generalized_eigh(
-                projected_storage[:active_columns, :active_columns],
-                overlap_storage[:active_columns, :active_columns],
-                number_of_roots,
-            )
+            if metric is None:
+                roots, coefficients = _lowest_generalized_eigh(
+                    projected_storage[:active_columns, :active_columns],
+                    overlap_storage[:active_columns, :active_columns],
+                    number_of_roots,
+                )
+            else:
+                roots, coefficients = _lowest_generalized_eigh_real(
+                    projected_storage[:active_columns, :active_columns],
+                    overlap_storage[:active_columns, :active_columns],
+                    number_of_roots,
+                )
         with (
             timers.measure("cegterg:upda")
             if timers is not None
@@ -730,8 +921,10 @@ def davidson(
         # second initial reduced diagonalization, but starts from the rotated
         # vectors and diagonal projected energies with vc=I.
         if initial_eigenvalues is None:
-            projected_diagonal = _column_expectations(
-                basis, applied_basis, mpi
+            projected_diagonal = (
+                _column_expectations(basis, applied_basis, mpi)
+                if metric is None
+                else np.diag(metric.gram(basis, applied_basis))
             )
             values = np.real(projected_diagonal[:number_of_roots])
         else:
@@ -749,12 +942,12 @@ def davidson(
     )
 
     def reduced_residual_norms(block: np.ndarray) -> np.ndarray:
+        if metric is not None:
+            return metric.column_norms(block)
         local_squared = _load_native_fft().column_squared_norms(
             np.asarray(block, dtype=np.complex128)
         )
-        return np.sqrt(
-            np.real(mpi.sum_array(local_squared))
-        )
+        return np.sqrt(np.real(mpi.sum_array(local_squared)))
 
     residual_norms = (
         reduced_residual_norms(residuals)
@@ -783,7 +976,7 @@ def davidson(
         # eigenproblem already contains its overlap matrix; projecting the
         # corrections against the full Davidson basis adds large BLAS work
         # and another collective without changing their useful span.
-        corrections = _normalize_columns(corrections, mpi)
+        corrections = _normalize_columns(corrections, mpi, metric=metric)
         if corrections.shape[1] == 0:
             break
         old_columns = active_columns
@@ -864,7 +1057,8 @@ def davidson(
                     np.arange(active_columns), np.arange(active_columns)
                 ] = values
                 overlap_storage[:active_columns, :active_columns] = np.eye(
-                    active_columns, dtype=complex
+                    active_columns,
+                    dtype=float if metric is not None else complex,
                 )
 
     if not track_residual_norms:

@@ -92,6 +92,16 @@ def _read_wavefunctions(
                     ).astype(np.complex128, copy=False).T
                 else:
                     coefficients = np.asarray(raw, dtype=np.complex128).T
+                gamma_only = str(
+                    h5.attrs.get("gamma_only", ".FALSE.")
+                ).strip().upper() in {"TRUE", ".TRUE.", "1", "B'TRUE'", "B'.TRUE.'"}
+                if gamma_only:
+                    self_conjugate = np.all(miller == 0, axis=1)
+                    paired = ~self_conjugate
+                    miller = np.vstack((miller, -miller[paired]))
+                    coefficients = np.vstack(
+                        (coefficients, np.conjugate(coefficients[paired]))
+                    )
         except (OSError, KeyError, ValueError) as exc:
             raise QEInputError(f"cannot read wavefunctions {path}: {exc}") from exc
         result.append((miller, coefficients))

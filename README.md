@@ -113,6 +113,21 @@ communicators and band slices. Production SCF currently uses one task group;
 multi-group execution is benchmarked separately because duplicating each
 group's spatial grid changes both solver ownership and the memory model.
 
+For scalar or collinear Gamma-point Davidson calculations, `QEPY_GAMMA_MODE` accepts
+`auto` (default), `half`, or `full`. The half-G path stores one canonical
+member of every `G,-G` pair, uses QE's weighted real inner product in the
+Davidson subspace and nonlocal projectors, packs two real orbitals into one
+complex FFT, and writes/reads QE-compatible `gamma_only=.TRUE.` HDF5 files.
+`auto` and `half` select half-G for every Gamma-only scalar or collinear
+Davidson calculation, matching QE independently of problem size. `full` is
+an explicit diagnostic escape hatch. Non-Gamma k points retain the general
+full-complex path; Gamma with an alternative diagonalizer is rejected unless
+that diagnostic override is explicitly requested.
+
+```bash
+export QEPY_GAMMA_MODE=half
+```
+
 ## MPI, OpenMP, and memory
 
 Each MPI rank is a separate Python process. Rank-private interpreter state,

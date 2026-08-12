@@ -82,3 +82,51 @@ lose to the fused sparse slab kernel at this modest process count. The result
 establishes end-to-end SCF equivalence and removes the slab's `ranks <= Nz`
 topological limit. The next performance work is native packed pencil
 transposes and avoiding dense inactive-grid traffic.
+
+## Completed production Gamma and non-Gamma comparison
+
+These measurements supersede the earlier one-shot Python timing above. Each
+entry is the median of three sequential runs on the same WSL host, with four
+MPI ranks and one FFT/OpenMP/BLAS thread per rank. QE is the locally installed
+7.5 build. The Python Gamma runs force `QEPY_GAMMA_MODE=half`; both Python
+cases use the sparse slab backend because four ranks are well below `Nz`.
+
+### Gamma point (`Si.gamma.in`)
+
+| Measurement | QE 7.5 | qepy-pw half-G | Port / QE |
+|---|---:|---:|---:|
+| External elapsed | 1.13 s | 2.40 s | 2.12x |
+| Internal PWSCF wall | 0.83 s | 1.64 s | 1.98x |
+| Local potential wall | 0.35 s | 0.29 s | 0.83x |
+| FFT wall timer | 0.34 s | 0.33 s | 0.97x |
+| SCF iterations | 8 | 7 | -- |
+| Final energy | -14.57882210 Ry | -14.57882210 Ry | equal at print precision |
+| Stored solver rows | 4593 | 4593 | equal |
+
+The hot Gamma FFT/local-potential region is now at parity with QE and is
+slightly faster in this run. The remaining end-to-end gap is dominated by
+Python process/import/setup work and by orchestration outside the FFT timer,
+not by doubled `+/-G` storage. The port reports a median sampled aggregate PSS
+of 220.62 MiB across four Python ranks; QE does not print a directly
+comparable aggregate PSS counter.
+
+### Non-Gamma point (`Si.kpoint.in`)
+
+| Measurement | QE 7.5 | qepy-pw full complex | Port / QE |
+|---|---:|---:|---:|
+| External elapsed | 1.71 s | 2.42 s | 1.42x |
+| Internal PWSCF wall | 1.46 s | 1.74 s | 1.19x |
+| Local potential wall | 0.63 s | 0.62 s | 0.98x |
+| FFT wall timer | 0.67 s | 0.65 s | 0.97x |
+| SCF iterations | 8 | 8 | equal |
+| Final energy | -14.89405563 Ry | -14.89405563 Ry | equal at print precision |
+
+The non-Gamma result independently checks that the general complex path did
+not regress: both FFT and local-potential medians are within three percent of
+QE, and total internal PWSCF time is within 19 percent. The Python aggregate
+sampled PSS median is 214.99 MiB.
+
+QE's `fftw` row counts individual one-dimensional transforms, whereas the
+Python timer encloses fused sparse packing, transforms, collectives,
+potential multiplication, and gathering. The near-equal wall totals are
+therefore more meaningful than comparing their call counts.
