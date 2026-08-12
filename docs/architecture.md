@@ -27,6 +27,7 @@ latency-sensitive inner work.
 | `qe_input_schema.py` | QE 7.5 variable-name catalog used to distinguish unknown names from valid but unimplemented options. |
 | `upf.py` | Scalar/fully-relativistic UPF parsing, radial transforms, j-resolved or averaged projectors, atomic orbitals/densities, and NLCC. |
 | `basis.py` | Global plane-wave catalogs, per-k bases, FFT grids, stick ownership, transpose descriptors, scratch pools, and local-potential/density FFT workspaces. |
+| `fft_engine.py` | Memory-bounded band plans, MPI task-group topology, two-dimensional Z/Y/X pencil FFTs, and Gamma half-spectrum algebra. |
 | `_native_fft.pyx` | Mandatory native kernels: FFTW plans, MPI transposes, sparse pack/unpack, Hψ, density accumulation, XC helpers, projector/BLAS bridges, and FFTW-MPI support. |
 | `mpi.py` | Communicators, reductions, slab helpers, reusable exchange buffers, shared-memory windows, and root gathers. |
 | `diagonalization.py` | Matrix-free Hamiltonian, Davidson, CG, ParO, RMM-DIIS, orthogonalization, and preconditioners. |
@@ -73,6 +74,27 @@ flowchart TD
 Only rank zero parses user text and emits ordinary output. Large numerical work
 is collective. K points are processed sequentially by the same plane-wave MPI
 communicator; there is no pool split.
+
+### Scalable pencil and task-group engine
+
+`fft_engine.py` supplies the large-grid decomposition independently of the
+legacy SCF slab field layout. `FFTTaskTopology` splits the world communicator
+into band task groups and a two-dimensional FFT process grid. `PencilFFT3D`
+performs the actual sequence
+
+```text
+Z pencil --FFT(z)--> transpose --FFT(y)--> transpose --FFT(x)--> X pencil
+```
+
+and reverses it for the forward transform. Exact `Alltoallv` counts handle
+uneven dimensions, while `FFTMemoryPlan` bounds all band-dependent arrays by a
+tile. `GammaHalfSpectrum` provides canonical half-G storage, conjugate
+reconstruction, the real Gamma metric, and two-real-orbital complex packing.
+
+The production SCF fields still use Z slabs. Integrating X-pencil ownership
+through XC, symmetry, and charge mixing is a separate migration; changing
+only Hpsi would introduce an extra full-grid redistribution that defeats much
+of pencil decomposition's scaling benefit.
 
 ## 4. Data ownership
 

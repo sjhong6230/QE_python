@@ -467,6 +467,7 @@ class LocalPotentialWorkspace:
         scratch_pool: FFTScratchPool | None = None,
         descriptor: FFTGridDescriptor | None = None,
         serial_fft_batch_size: int | None = None,
+        distributed_fft_batch_size: int | None = None,
         retain_serial_sticks: bool = True,
     ) -> None:
         compact_basis = (
@@ -505,6 +506,18 @@ class LocalPotentialWorkspace:
             and self.serial_fft_batch_size < 1
         ):
             raise QEInputError("serial_fft_batch_size must be at least 1")
+        self.distributed_fft_batch_size = (
+            None
+            if distributed_fft_batch_size is None
+            else int(distributed_fft_batch_size)
+        )
+        if (
+            self.distributed_fft_batch_size is not None
+            and self.distributed_fft_batch_size < 1
+        ):
+            raise QEInputError(
+                "distributed_fft_batch_size must be at least 1"
+            )
         # QE stores complete Z-sticks indexed by (Gx,Gy), then transposes
         # them into real-space Z-plane slabs for the two-dimensional XY FFT.
         self.local_slab = self.mpi.slab(self.shape[2])
@@ -1280,75 +1293,77 @@ class LocalPotentialWorkspace:
                             grid_stride,
                         )
             return
-        local_sticks = self.sticks_by_rank[self.mpi.rank]
-        sticks = self._scratch(
-            "wave_sticks",
-            (self.shape[2], len(local_sticks), number_of_vectors),
-            zero=True,
-        )
         if self.mpi.size > 1:
             assert self.transpose_plan is not None
+            local_sticks = self.sticks_by_rank[self.mpi.rank]
             local_z = self.local_slab.stop - self.local_slab.start
-            slab = self._scratch(
-                "real_slabs",
-                (
-                    local_z,
-                    self.shape[0],
-                    self.shape[1],
-                    1,
-                ),
+            batch_size = min(
+                number_of_vectors,
+                self.distributed_fft_batch_size or number_of_vectors,
             )
-            counts = self.transpose_plan.native_counts(number_of_vectors)
-            receive_size = int(counts[3][-1] + counts[2][-1])
-            _send, receive = self.mpi.complex_exchange_buffers(
-                0, receive_size
-            )
-            threaded_sticks = self.thread_count > 1
-            z_plan = self._native_plan(
-                sticks,
-                (self.shape[2],),
-                1 if threaded_sticks else len(local_sticks) * number_of_vectors,
-                len(local_sticks) * number_of_vectors,
-                1,
-                parallel_bands=threaded_sticks,
-                preserve_values=False,
-            )
-            xy_plan = self._native_plan(
-                slab,
-                (self.shape[0], self.shape[1]),
-                local_z,
-                1,
-                self.shape[0] * self.shape[1],
-                planner_flag=(
-                    "FFTW_MEASURE"
-                    if self.thread_count > 1
-                    and self.shape[0] * self.shape[1] * local_z
-                    >= _BATCHED_FFT_THREAD_WORK_THRESHOLD
-                    else None
-                ),
-                preserve_values=False,
-            )
-            timer = (
-                self.timers.measure("fftw")
-                if self.timers is not None
-                else nullcontext()
-            )
-            with timer:
-                self._native_fft.accumulate_density_distributed(
-                    density,
-                    sticks,
-                    slab,
-                    receive,
-                    vectors,
-                    weights,
-                    self.local_slots[2],
-                    self.local_stick_positions,
-                    self.transpose_plan.native_slab_point_indices,
-                    *counts,
-                    self.mpi.comm,
-                    z_plan,
-                    xy_plan,
+            for start in range(0, number_of_vectors, batch_size):
+                stop = min(start + batch_size, number_of_vectors)
+                active = stop - start
+                sticks = self._scratch(
+                    "wave_sticks",
+                    (self.shape[2], len(local_sticks), active),
+                    zero=True,
                 )
+                slab = self._scratch(
+                    "real_slabs",
+                    (
+                        local_z,
+                        self.shape[0],
+                        self.shape[1],
+                        1,
+                    ),
+                )
+                counts = self.transpose_plan.native_counts(active)
+                receive_size = int(counts[3][-1] + counts[2][-1])
+                _send, receive = self.mpi.complex_exchange_buffers(
+                    0, receive_size
+                )
+                threaded_sticks = self.thread_count > 1
+                z_plan = self._native_plan(
+                    sticks,
+                    (self.shape[2],),
+                    1 if threaded_sticks else len(local_sticks) * active,
+                    len(local_sticks) * active,
+                    1,
+                    parallel_bands=threaded_sticks,
+                    preserve_values=False,
+                )
+                xy_plan = self._native_plan(
+                    slab,
+                    (self.shape[0], self.shape[1]),
+                    local_z,
+                    1,
+                    self.shape[0] * self.shape[1],
+                    planner_flag=(
+                        "FFTW_MEASURE"
+                        if self.thread_count > 1
+                        and self.shape[0] * self.shape[1] * local_z
+                        >= _BATCHED_FFT_THREAD_WORK_THRESHOLD
+                        else None
+                    ),
+                    preserve_values=False,
+                )
+                with timer:
+                    self._native_fft.accumulate_density_distributed(
+                        density,
+                        sticks,
+                        slab,
+                        receive,
+                        vectors[:, start:stop],
+                        weights[start:stop],
+                        self.local_slots[2],
+                        self.local_stick_positions,
+                        self.transpose_plan.native_slab_point_indices,
+                        *counts,
+                        self.mpi.comm,
+                        z_plan,
+                        xy_plan,
+                    )
             return
 
     def apply(
@@ -1377,13 +1392,32 @@ class LocalPotentialWorkspace:
             )
         number_of_vectors = vectors.shape[1]
         if self.mpi.size > 1:
-            result = self._distributed_apply(
-                real_potential,
-                vectors,
-                native_potential_layout=native_potential_layout,
-                out=out,
-                diagonal=diagonal,
+            batch_size = min(
+                number_of_vectors,
+                self.distributed_fft_batch_size or number_of_vectors,
             )
+            result = (
+                np.empty(vectors.shape, dtype=np.complex128)
+                if out is None
+                else np.asarray(out)
+            )
+            if result.shape != vectors.shape or result.dtype != np.complex128:
+                raise ValueError(
+                    "local-potential output has the wrong shape or dtype"
+                )
+            # Bound all band-dependent stick and collective buffers by the
+            # tile size.  This is the distributed analogue of QE's small
+            # many_fft blocks and keeps peak FFT storage O(tile), not
+            # O(total bands).
+            for start in range(0, number_of_vectors, batch_size):
+                stop = min(start + batch_size, number_of_vectors)
+                self._distributed_apply(
+                    real_potential,
+                    vectors[:, start:stop],
+                    native_potential_layout=native_potential_layout,
+                    out=result[:, start:stop],
+                    diagonal=diagonal,
+                )
             return result[:, 0] if was_vector else result
         # QE's serial vloc_psi transforms a small number of states at a time.
         # Keep one native result owner and one timing scope around the bounded

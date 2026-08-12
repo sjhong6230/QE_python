@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from qepy_pw import _native_fft
-from qepy_pw.basis import FFTGridDescriptor
+from qepy_pw.basis import FFTGridDescriptor, FFTScratchPool, LocalPotentialWorkspace
 from qepy_pw.mpi import MPIContext
 
 
@@ -64,3 +64,52 @@ def test_fftw_mpi_collective_plan_roundtrip() -> None:
     values[:active] /= np.prod(dimensions)
     local_error = float(np.max(np.abs(values[:active] - reference)))
     assert mpi.max_scalar(local_error) < 5.0e-13
+
+
+def test_distributed_band_tiles_bound_stick_scratch() -> None:
+    mpi = MPIContext.world()
+    if mpi.size == 1:
+        pytest.skip("distributed band tiling requires more than one rank")
+    shape = (12, 10, 8)
+    if mpi.size > shape[2]:
+        pytest.skip("legacy slab comparison requires ranks <= Nz")
+    indices = _sphere_indices(shape, 3.5)
+    descriptor = FFTGridDescriptor.build(
+        indices, shape, mpi.size, local_rank=mpi.rank
+    )
+    tiled_pool = FFTScratchPool()
+    full_pool = FFTScratchPool()
+    tiled = LocalPotentialWorkspace(
+        indices,
+        shape,
+        mpi=mpi,
+        descriptor=descriptor,
+        scratch_pool=tiled_pool,
+        distributed_fft_batch_size=1,
+    )
+    full = LocalPotentialWorkspace(
+        indices,
+        shape,
+        mpi=mpi,
+        descriptor=descriptor,
+        scratch_pool=full_pool,
+    )
+    bands = 5
+    rows = tiled.local_plane_wave_indices.astype(np.float64)
+    band = np.arange(bands, dtype=np.float64)
+    coefficients = np.asfortranarray(
+        np.sin(0.11 * rows[:, None] + band[None, :])
+        + 1j * np.cos(0.07 * rows[:, None] - band[None, :])
+    )
+    slab = mpi.slab(shape[2])
+    potential = np.ones(
+        (slab.stop - slab.start, shape[0], shape[1]), dtype=np.float64
+    )
+    tiled_result = tiled.apply(
+        potential, coefficients, native_potential_layout=True
+    )
+    full_result = full.apply(
+        potential, coefficients, native_potential_layout=True
+    )
+    np.testing.assert_allclose(tiled_result, full_result, atol=8.0e-13)
+    assert tiled_pool.nbytes < full_pool.nbytes
