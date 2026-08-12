@@ -12,3 +12,39 @@ version: 1.0.2
 license: GPL-2.0-or-later
 repository-code: https://github.com/sjhong6230/QE_python
 url: https://github.com/sjhong6230/QE_python
+references:
+  - type: article
+    title: >-
+      The PseudoDojo: Training and grading a 85 element optimized
+      norm-conserving pseudopotential table
+    authors:
+      - family-names: van Setten
+        given-names: M. J.
+      - family-names: Giantomassi
+        given-names: M.
+      - family-names: Bousquet
+        given-names: E.
+      - family-names: Verstraete
+        given-names: M. J.
+      - family-names: Hamann
+        given-names: D. R.
+      - family-names: Gonze
+        given-names: X.
+      - family-names: Rignanese
+        given-names: G.-M.
+    journal: Computer Physics Communications
+    volume: 226
+    start: 39
+    end: 54
+    year: 2018
+    doi: 10.1016/j.cpc.2018.01.012
+  - type: article
+    title: Optimized norm-conserving Vanderbilt pseudopotentials
+    authors:
+      - family-names: Hamann
+        given-names: D. R.
+    journal: Physical Review B
+    volume: 88
+    issue: 8
+    year: 2013
+    doi: 10.1103/PhysRevB.88.085117

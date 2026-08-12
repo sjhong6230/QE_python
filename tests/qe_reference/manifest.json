@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "upstream": {
     "repository": "https://gitlab.com/QEF/q-e.git",
     "commit": "4a218b993489604a844db92fe85c747bd09b2442"
@@ -17,6 +17,24 @@
     "num_kpoints": {"absolute": 0.0}
   },
   "pseudopotentials": {
+    "H.upf": {
+      "fixture_sha256": "38add5ec2a81b907d7ae0891de1d8353c5d60f4b53b27ed854f05c2a955d7ddf",
+      "source": "https://www.pseudo-dojo.org/pseudos/nc-sr-05_pbe_standard_upf/H.upf.gz",
+      "collection": "PseudoDojo NC SR ONCVPSP v0.5 PBE standard UPF",
+      "downloaded": "2026-08-12"
+    },
+    "Si.upf": {
+      "fixture_sha256": "39822757f53f36e3bf3bfb779356152a8d3f21199c7db9dd5a931e5d18c45282",
+      "source": "https://www.pseudo-dojo.org/pseudos/nc-sr-05_pbe_standard_upf/Si.upf.gz",
+      "collection": "PseudoDojo NC SR ONCVPSP v0.5 PBE standard UPF",
+      "downloaded": "2026-08-12"
+    },
+    "Al.upf": {
+      "fixture_sha256": "b02eaa07c5d98f5eeae1bec4155854a7a94ea3635ca6b42e914f3f7ebd6912fb",
+      "source": "https://www.pseudo-dojo.org/pseudos/nc-sr-05_pbe_standard_upf/Al.upf.gz",
+      "collection": "PseudoDojo NC SR ONCVPSP v0.5 PBE standard UPF",
+      "downloaded": "2026-08-12"
+    },
     "H.pz-vbc.UPF": {
       "fixture_md5": "b4742c37e165d3c4b97552e3cd66ffd5",
       "source": "https://pseudopotentials.quantum-espresso.org/upf_files/H.pz-vbc.UPF"

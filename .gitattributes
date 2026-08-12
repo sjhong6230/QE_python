@@ -1,0 +1,4 @@
+# Pseudopotential fixtures are immutable scientific data. Do not let Git
+# rewrite their bytes, because manifest checksums identify the exact inputs.
+*.UPF binary
+*.upf binary

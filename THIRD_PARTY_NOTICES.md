@@ -37,3 +37,30 @@ ESPRESSO papers, including:
 Files that identify a particular upstream routine record that provenance in
 their module documentation. Existing upstream copyright and license notices
 must be preserved when additional Quantum ESPRESSO material is incorporated.
+
+## PseudoDojo pseudopotentials
+
+The H, Si, and Al UPF regression fixtures in
+`tests/qe_reference/upstream/pseudo` are unmodified files from the official
+PseudoDojo `NC SR (ONCVPSP v0.5) / PBE / standard / UPF` table, downloaded on
+2026-08-12 from:
+
+<https://www.pseudo-dojo.org/pseudos/nc-sr-05_pbe_standard_upf.tgz>
+
+The archive SHA-256 is
+`455e00dac71aa13ade7508fbc863cb52f2333e28d556fe22d374a1889aad6930`.
+Individual file digests and element URLs are recorded in
+`tests/qe_reference/manifest.json`. Each UPF preserves its original
+`PP_INFO`, including the GNU GPL notice and the complete ONCVPSP generation
+input. No license or provenance text in these files has been altered.
+
+Scientific work using these fixtures should cite:
+
+1. M. J. van Setten, M. Giantomassi, E. Bousquet, M. J. Verstraete,
+   D. R. Hamann, X. Gonze, and G.-M. Rignanese, “The PseudoDojo: Training and
+   grading a 85 element optimized norm-conserving pseudopotential table,”
+   *Computer Physics Communications* **226**, 39–54 (2018).
+   <https://doi.org/10.1016/j.cpc.2018.01.012>
+2. D. R. Hamann, “Optimized norm-conserving Vanderbilt pseudopotentials,”
+   *Physical Review B* **88**, 085117 (2013).
+   <https://doi.org/10.1103/PhysRevB.88.085117>
