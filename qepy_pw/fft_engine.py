@@ -312,6 +312,169 @@ class PencilFFT3D:
             exchange_points *= 2
         return int((z_points + y_points + x_points + exchange_points) * bands * 16)
 
+    @staticmethod
+    def _mpi_datatype(dtype: np.dtype) -> object:
+        from mpi4py import MPI
+
+        if dtype == np.dtype(np.float64):
+            return MPI.DOUBLE
+        if dtype == np.dtype(np.complex128):
+            return MPI.C_DOUBLE_COMPLEX
+        raise ValueError("pencil field redistribution requires float64 or complex128")
+
+    @staticmethod
+    def _intersection(first: slice, second: slice) -> slice:
+        start = max(int(first.start), int(second.start))
+        stop = min(int(first.stop), int(second.stop))
+        return slice(start, max(start, stop))
+
+    def slab_to_x_pencil(self, slab: np.ndarray) -> np.ndarray:
+        """Redistribute a conventional Z slab into unique X pencils."""
+        values = np.asarray(slab)
+        scalar = values.ndim == 3
+        if scalar:
+            values = values[..., None]
+        nx, ny, nz = self.shape
+        source_z = _partition(nz, self.topology.fft_size, self.topology.fft_rank)
+        expected = (nx, ny, source_z.stop - source_z.start)
+        if values.shape[:3] != expected:
+            raise ValueError("field does not match the rank-local Z slab")
+        channels = values.shape[-1]
+        blocks: list[np.ndarray] = []
+        send_counts: list[int] = []
+        px, py = self.topology.process_grid
+        for destination in range(self.topology.fft_size):
+            row, column = divmod(destination, py)
+            target_y = _partition(ny, px, row)
+            target_z = _partition(nz, py, column)
+            overlap = self._intersection(source_z, target_z)
+            block = np.ascontiguousarray(
+                values[
+                    :,
+                    target_y,
+                    overlap.start - source_z.start : overlap.stop - source_z.start,
+                    :,
+                ]
+            ).reshape(-1)
+            blocks.append(block)
+            send_counts.append(block.size)
+        receive_counts = np.asarray(
+            self.topology.fft_comm.alltoall(send_counts), dtype=np.int64
+        )
+        receive, displacements = self._exchange_typed(
+            self.topology.fft_comm, blocks, receive_counts, values.dtype
+        )
+        result = np.empty(self.local_x_shape + (channels,), dtype=values.dtype)
+        for source in range(self.topology.fft_size):
+            source_z = _partition(nz, self.topology.fft_size, source)
+            overlap = self._intersection(source_z, self.z_final)
+            count = int(receive_counts[source])
+            block = receive[
+                int(displacements[source]) : int(displacements[source]) + count
+            ].reshape(
+                nx,
+                self.y_final.stop - self.y_final.start,
+                overlap.stop - overlap.start,
+                channels,
+            )
+            result[
+                :,
+                :,
+                overlap.start - self.z_final.start : overlap.stop - self.z_final.start,
+                :,
+            ] = block
+        return result[..., 0] if scalar else result
+
+    def x_pencil_to_slab(self, pencil: np.ndarray) -> np.ndarray:
+        """Redistribute unique X pencils into the conventional Z slabs."""
+        values = np.asarray(pencil)
+        scalar = values.ndim == 3
+        if scalar:
+            values = values[..., None]
+        if values.shape[:3] != self.local_x_shape:
+            raise ValueError("field does not match the rank-local X pencil")
+        nx, ny, nz = self.shape
+        channels = values.shape[-1]
+        blocks: list[np.ndarray] = []
+        send_counts: list[int] = []
+        for destination in range(self.topology.fft_size):
+            target_z = _partition(nz, self.topology.fft_size, destination)
+            overlap = self._intersection(self.z_final, target_z)
+            block = np.ascontiguousarray(
+                values[
+                    :,
+                    :,
+                    overlap.start - self.z_final.start : overlap.stop - self.z_final.start,
+                    :,
+                ]
+            ).reshape(-1)
+            blocks.append(block)
+            send_counts.append(block.size)
+        receive_counts = np.asarray(
+            self.topology.fft_comm.alltoall(send_counts), dtype=np.int64
+        )
+        receive, displacements = self._exchange_typed(
+            self.topology.fft_comm, blocks, receive_counts, values.dtype
+        )
+        target_z = _partition(nz, self.topology.fft_size, self.topology.fft_rank)
+        result = np.empty(
+            (nx, ny, target_z.stop - target_z.start, channels),
+            dtype=values.dtype,
+        )
+        _px, py = self.topology.process_grid
+        for source in range(self.topology.fft_size):
+            row, column = divmod(source, py)
+            source_y = _partition(ny, self.topology.process_grid[0], row)
+            source_z = _partition(nz, self.topology.process_grid[1], column)
+            overlap = self._intersection(source_z, target_z)
+            count = int(receive_counts[source])
+            block = receive[
+                int(displacements[source]) : int(displacements[source]) + count
+            ].reshape(
+                nx,
+                source_y.stop - source_y.start,
+                overlap.stop - overlap.start,
+                channels,
+            )
+            result[
+                :,
+                source_y,
+                overlap.start - target_z.start : overlap.stop - target_z.start,
+                :,
+            ] = block
+        return result[..., 0] if scalar else result
+
+    def _exchange_typed(
+        self,
+        communicator: object,
+        blocks: Iterable[np.ndarray],
+        receive_counts: np.ndarray,
+        dtype: np.dtype,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        dtype = np.dtype(dtype)
+        flat_blocks = [np.asarray(block, dtype=dtype).reshape(-1) for block in blocks]
+        send_counts = np.asarray([block.size for block in flat_blocks], dtype=np.int64)
+        send_displacements = np.concatenate(
+            (np.array([0], dtype=np.int64), np.cumsum(send_counts[:-1]))
+        )
+        receive_counts = np.asarray(receive_counts, dtype=np.int64)
+        receive_displacements = np.concatenate(
+            (np.array([0], dtype=np.int64), np.cumsum(receive_counts[:-1]))
+        )
+        send = np.empty(int(np.sum(send_counts)), dtype=dtype)
+        receive = np.empty(int(np.sum(receive_counts)), dtype=dtype)
+        for block, start, count in zip(flat_blocks, send_displacements, send_counts):
+            send[int(start) : int(start + count)] = block
+        if int(communicator.Get_size()) == 1:
+            receive[:] = send
+        else:
+            mpi_type = self._mpi_datatype(dtype)
+            communicator.Alltoallv(
+                [send, send_counts, send_displacements, mpi_type],
+                [receive, receive_counts, receive_displacements, mpi_type],
+            )
+        return receive, receive_displacements
+
     def _storage(self, bands: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         cached = self._arrays.get(bands)
         if cached is not None:

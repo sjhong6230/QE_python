@@ -87,15 +87,31 @@ rank and `QEPY_NUM_THREADS` CPUs per task. Binding options differ between MPI
 implementations and schedulers.
 
 `QEPY_FFT_MEMORY_LIMIT_MIB` sets a hard per-rank budget for distributed
-wavefunction FFT execution scratch. The runtime estimates the local slab,
-sticks, and exact-count transpose buffers, selects an admissible band tile,
-and takes the minimum choice across the communicator so MPI counts agree.
-The limit does not include eigensolver, projector, density, or interpreter
-memory.
+wavefunction FFT execution scratch. The runtime estimates the selected slab
+or pencil layouts and transpose buffers, selects an admissible band tile, and
+takes the minimum choice across the communicator so MPI counts agree. The
+limit does not include eigensolver, projector, density, or interpreter memory.
 
 ```bash
 export QEPY_FFT_MEMORY_LIMIT_MIB=256
 ```
+
+`QEPY_FFT_DECOMPOSITION` accepts `auto` (the default), `slab`, or `pencil`.
+`auto` retains the lower-communication sparse Z-stick slab while the rank
+count fits the FFT Z dimension, and selects a two-dimensional pencil grid
+when a slab can no longer assign a nonempty Z plane to every rank. `pencil`
+can be forced for scaling studies. It keeps the SCF density, XC, symmetry,
+and mixing interfaces in their conventional Z-slab layout, but holds the
+effective potential in X pencils throughout each k-point loop.
+
+```bash
+export QEPY_FFT_DECOMPOSITION=pencil
+```
+
+The pencil execution engine also supports independent FFT task-group
+communicators and band slices. Production SCF currently uses one task group;
+multi-group execution is benchmarked separately because duplicating each
+group's spatial grid changes both solver ownership and the memory model.
 
 ## MPI, OpenMP, and memory
 

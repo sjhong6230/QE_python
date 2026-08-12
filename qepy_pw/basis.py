@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 
 from .errors import QEInputError
+from .fft_engine import PencilFFT3D, _partition_owner
 from .mpi import MPIContext
 from .threads import hybrid_thread_count
 from .timing import TimingRegistry
@@ -267,6 +268,8 @@ class FFTGridDescriptor:
     row_stick_indices: np.ndarray
     row_z_slots: np.ndarray
     transpose_plans: tuple[FFTTransposePlan | None, ...]
+    decomposition: str
+    process_grid: tuple[int, int] | None
 
     @classmethod
     def build(
@@ -276,6 +279,8 @@ class FFTGridDescriptor:
         processes: int,
         *,
         local_rank: int | None = None,
+        decomposition: str = "slab",
+        process_grid: tuple[int, int] | None = None,
     ) -> "FFTGridDescriptor":
         miller = np.asarray(indices, dtype=np.int32)
         shape = tuple(int(value) for value in shape)
@@ -285,6 +290,8 @@ class FFTGridDescriptor:
             raise ValueError("FFT descriptor needs at least one process")
         if local_rank is not None and not 0 <= local_rank < processes:
             raise ValueError("local FFT-descriptor rank is out of range")
+        if decomposition not in {"slab", "pencil"}:
+            raise ValueError("FFT decomposition must be slab or pencil")
         pairs = np.column_stack(
             (miller[:, 0] % shape[0], miller[:, 1] % shape[1])
         )
@@ -292,17 +299,28 @@ class FFTGridDescriptor:
         sticks = np.asarray(sticks, dtype=np.int32)
         counts = np.bincount(inverse, minlength=len(sticks))
         owners = np.zeros(len(sticks), dtype=np.int32)
-        g_loads = np.zeros(processes, dtype=np.int64)
-        stick_loads = np.zeros(processes, dtype=np.int64)
-        # Match QE's primary G-count balance and stick-count tie breaker.
-        for stick in np.argsort(-counts, kind="stable"):
-            owner = min(
-                range(processes),
-                key=lambda rank: (g_loads[rank], stick_loads[rank]),
-            )
-            owners[stick] = owner
-            g_loads[owner] += counts[stick]
-            stick_loads[owner] += 1
+        if decomposition == "pencil":
+            if process_grid is None or prod(process_grid) != processes:
+                raise ValueError(
+                    "pencil descriptor requires a matching process grid"
+                )
+            _px, py = process_grid
+            for stick, (x_slot, y_slot) in enumerate(sticks):
+                x_owner = _partition_owner(shape[0], process_grid[0], int(x_slot))
+                y_owner = _partition_owner(shape[1], process_grid[1], int(y_slot))
+                owners[stick] = x_owner * py + y_owner
+        else:
+            g_loads = np.zeros(processes, dtype=np.int64)
+            stick_loads = np.zeros(processes, dtype=np.int64)
+            # Match QE's primary G-count balance and stick-count tie breaker.
+            for stick in np.argsort(-counts, kind="stable"):
+                owner = min(
+                    range(processes),
+                    key=lambda rank: (g_loads[rank], stick_loads[rank]),
+                )
+                owners[stick] = owner
+                g_loads[owner] += counts[stick]
+                stick_loads[owner] += 1
         by_rank = tuple(
             np.asarray(np.flatnonzero(owners == rank), dtype=np.int32)
             for rank in range(processes)
@@ -325,6 +343,9 @@ class FFTGridDescriptor:
         xy = sticks[:, 0].astype(np.int64) * shape[1] + sticks[:, 1]
         plans: list[FFTTransposePlan | None] = []
         for rank in range(processes):
+            if decomposition == "pencil":
+                plans.append(None)
+                continue
             if local_rank is not None and rank != local_rank:
                 plans.append(None)
                 continue
@@ -382,6 +403,8 @@ class FFTGridDescriptor:
             _compact_unsigned(inverse, len(sticks)),
             _compact_unsigned(miller[:, 2] % shape[2], shape[2]),
             tuple(plans),
+            decomposition,
+            process_grid,
         )
 
     @property
@@ -466,6 +489,7 @@ class LocalPotentialWorkspace:
         timers: TimingRegistry | None = None,
         scratch_pool: FFTScratchPool | None = None,
         descriptor: FFTGridDescriptor | None = None,
+        pencil_fft: PencilFFT3D | None = None,
         serial_fft_batch_size: int | None = None,
         distributed_fft_batch_size: int | None = None,
         retain_serial_sticks: bool = True,
@@ -521,6 +545,7 @@ class LocalPotentialWorkspace:
         # QE stores complete Z-sticks indexed by (Gx,Gy), then transposes
         # them into real-space Z-plane slabs for the two-dimensional XY FFT.
         self.local_slab = self.mpi.slab(self.shape[2])
+        self.pencil_fft = pencil_fft
         if self.mpi.size == 1:
             if miller is None:
                 assert compact_basis is not None
@@ -566,6 +591,9 @@ class LocalPotentialWorkspace:
                 np.empty(0, dtype=np.int32) for _ in range(3)
             )
             self.local_stick_positions = np.empty(0, dtype=np.int32)
+            self.local_pencil_slots = tuple(
+                np.empty(0, dtype=np.int32) for _ in range(3)
+            )
         else:
             if descriptor is None:
                 if miller is None:
@@ -583,10 +611,19 @@ class LocalPotentialWorkspace:
                 )
             self.descriptor = descriptor
             self.transpose_plan = descriptor.transpose_plans[self.mpi.rank]
-            if self.transpose_plan is None:
+            if descriptor.decomposition == "pencil" and pencil_fft is None:
+                raise ValueError("pencil descriptor requires a pencil FFT executor")
+            if descriptor.decomposition == "slab" and self.transpose_plan is None:
                 raise ValueError(
                     "FFT descriptor does not contain this rank's transpose plan"
                 )
+            if pencil_fft is not None and (
+                descriptor.decomposition != "pencil"
+                or pencil_fft.shape != self.shape
+                or pencil_fft.topology.fft_size != self.mpi.size
+                or pencil_fft.topology.fft_rank != self.mpi.rank
+            ):
+                raise ValueError("pencil FFT executor does not match the descriptor")
             self.sticks = descriptor.sticks
             self.stick_owners = descriptor.stick_owners
             self.sticks_by_rank = descriptor.sticks_by_rank
@@ -649,6 +686,24 @@ class LocalPotentialWorkspace:
                 ],
                 len(self.sticks_by_rank[self.mpi.rank]),
             )
+            if pencil_fft is None:
+                self.local_pencil_slots = tuple(
+                    np.empty(0, dtype=np.int32) for _ in range(3)
+                )
+            else:
+                owned_sticks = self.stick_indices[self.owned_plane_waves]
+                owned_pairs = self.sticks[owned_sticks]
+                self.local_pencil_slots = (
+                    _compact_unsigned(
+                        owned_pairs[:, 0] - pencil_fft.x_initial.start,
+                        pencil_fft.local_z_shape[1],
+                    ),
+                    _compact_unsigned(
+                        owned_pairs[:, 1] - pencil_fft.y_initial.start,
+                        pencil_fft.local_z_shape[2],
+                    ),
+                    self.local_slots[2],
+                )
         self._native_fft = _load_native_fft()
         self._fft_alignment = _FFTW_ALIGNMENT
         self.thread_count = hybrid_thread_count()
@@ -830,6 +885,33 @@ class LocalPotentialWorkspace:
         plan.execute("forward")
         return values
 
+    def _coefficients_to_z_pencil(self, vectors: np.ndarray) -> np.ndarray:
+        if self.pencil_fft is None:
+            raise RuntimeError("pencil FFT executor is unavailable")
+        result = np.zeros(
+            self.pencil_fft.local_z_shape + (vectors.shape[1],),
+            dtype=np.complex128,
+        )
+        x_slots, y_slots, z_slots = self.local_pencil_slots
+        result[z_slots, x_slots, y_slots, :] = vectors
+        return result
+
+    def _z_pencil_to_coefficients(self, values: np.ndarray) -> np.ndarray:
+        x_slots, y_slots, z_slots = self.local_pencil_slots
+        return np.asfortranarray(values[z_slots, x_slots, y_slots, :])
+
+    def slab_to_x_pencil(self, values: np.ndarray) -> np.ndarray:
+        """Convert a public SCF Z-slab field to the local X pencil."""
+        if self.pencil_fft is None:
+            return np.asarray(values)
+        return self.pencil_fft.slab_to_x_pencil(values)
+
+    def x_pencil_to_slab(self, values: np.ndarray) -> np.ndarray:
+        """Convert a local X-pencil field to the public SCF Z slab."""
+        if self.pencil_fft is None:
+            return np.asarray(values)
+        return self.pencil_fft.x_pencil_to_slab(values)
+
     def coefficients_to_grid(
         self,
         coefficients: np.ndarray,
@@ -890,6 +972,19 @@ class LocalPotentialWorkspace:
             if not use_scratch:
                 result = result.copy()
             return result[..., 0] if was_vector else result
+        if self.pencil_fft is not None:
+            timer = (
+                self.timers.measure("fftw")
+                if self.timers is not None
+                else nullcontext()
+            )
+            with timer:
+                z_pencil = self._coefficients_to_z_pencil(vectors)
+                x_pencil = self.pencil_fft.backward(z_pencil)
+                real_slab = self.pencil_fft.x_pencil_to_slab(x_pencil)
+            if not use_scratch:
+                real_slab = real_slab.copy()
+            return real_slab[..., 0] if was_vector else real_slab
         local_sticks = self.sticks_by_rank[self.mpi.rank]
         stick_shape = (
             self.shape[2],
@@ -1060,6 +1155,17 @@ class LocalPotentialWorkspace:
                 grid_stride,
             )
             return result[:, 0] if was_scalar else result
+        if self.pencil_fft is not None:
+            timer = (
+                self.timers.measure("fftw")
+                if self.timers is not None
+                else nullcontext()
+            )
+            with timer:
+                x_pencil = self.pencil_fft.slab_to_x_pencil(values)
+                z_pencil = self.pencil_fft.forward(x_pencil)
+                result = self._z_pencil_to_coefficients(z_pencil)
+            return result[:, 0] if was_scalar else result
         if not (
             values.dtype == np.complex128
             and values.flags.c_contiguous
@@ -1090,6 +1196,14 @@ class LocalPotentialWorkspace:
         out: np.ndarray | None = None,
         diagonal: np.ndarray | None = None,
     ) -> np.ndarray:
+        if self.pencil_fft is not None:
+            return self._distributed_apply_pencil(
+                real_potential,
+                vectors,
+                native_potential_layout=native_potential_layout,
+                out=out,
+                diagonal=diagonal,
+            )
         return self._distributed_apply_native(
             real_potential,
             vectors,
@@ -1097,6 +1211,55 @@ class LocalPotentialWorkspace:
             out=out,
             diagonal=diagonal,
         )
+
+    def _distributed_apply_pencil(
+        self,
+        real_potential: np.ndarray,
+        vectors: np.ndarray,
+        *,
+        native_potential_layout: bool = False,
+        out: np.ndarray | None = None,
+        diagonal: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Apply Vloc using the production sparse-to-dense pencil boundary."""
+        assert self.pencil_fft is not None
+        result = (
+            np.empty(vectors.shape, dtype=np.complex128)
+            if out is None
+            else np.asarray(out)
+        )
+        if result.shape != vectors.shape or result.dtype != np.complex128:
+            raise ValueError("local-potential output has the wrong shape or dtype")
+        potential_values = np.asarray(real_potential, dtype=np.float64)
+        if potential_values.shape == self.pencil_fft.local_x_shape:
+            potential_x = potential_values
+        else:
+            local_z = self.local_slab.stop - self.local_slab.start
+            if native_potential_layout:
+                expected = (local_z, self.shape[0], self.shape[1])
+                if potential_values.shape != expected:
+                    raise ValueError("native local potential has the wrong shape")
+                potential_slab = np.moveaxis(potential_values, 0, 2)
+            else:
+                expected = (self.shape[0], self.shape[1], local_z)
+                if potential_values.shape != expected:
+                    raise ValueError("local potential has the wrong slab shape")
+                potential_slab = potential_values
+            potential_x = self.pencil_fft.slab_to_x_pencil(potential_slab)
+        timer = (
+            self.timers.measure("fftw")
+            if self.timers is not None
+            else nullcontext()
+        )
+        with timer:
+            z_pencil = self._coefficients_to_z_pencil(vectors)
+            real_x = self.pencil_fft.backward(z_pencil)
+            real_x *= potential_x[..., None]
+            transformed = self.pencil_fft.forward(real_x)
+            result[...] = self._z_pencil_to_coefficients(transformed)
+            if diagonal is not None:
+                result += np.asarray(diagonal)[:, None] * vectors
+        return result
 
     def _distributed_apply_native(
         self,
@@ -1292,6 +1455,27 @@ class LocalPotentialWorkspace:
                             self.size,
                             grid_stride,
                         )
+            return
+        if self.pencil_fft is not None:
+            batch_size = min(
+                number_of_vectors,
+                self.distributed_fft_batch_size or number_of_vectors,
+            )
+            for start in range(0, number_of_vectors, batch_size):
+                stop = min(start + batch_size, number_of_vectors)
+                with timer:
+                    z_pencil = self._coefficients_to_z_pencil(
+                        vectors[:, start:stop]
+                    )
+                    real_x = self.pencil_fft.backward(z_pencil)
+                    partial_x = np.sum(
+                        np.abs(real_x) ** 2
+                        * weights[None, None, None, start:stop],
+                        axis=-1,
+                    )
+                    density += np.real(
+                        self.pencil_fft.x_pencil_to_slab(partial_x)
+                    )
             return
         if self.mpi.size > 1:
             assert self.transpose_plan is not None

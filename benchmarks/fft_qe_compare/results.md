@@ -62,5 +62,23 @@ by a memory model rather than maximized blindly.
 The pencil and sparse slab times are not a backend speed comparison. The
 pencil test transforms every grid point; the slab Hpsi test transforms only
 active plane-wave sticks and uses a fused native kernel. Pencil's current role
-is correctness-validated scaling beyond the `MPI ranks <= Nz` slab limit; its
-next optimization is native transpose packing and sparse Z-pencil boundaries.
+is correctness-validated scaling beyond the `MPI ranks <= Nz` slab limit.
+
+## Production SCF slab versus pencil
+
+The production sparse plane-wave boundary was then connected to the pencil
+engine and rerun with the same `Si.gamma.in` input and four ranks. Both paths
+converged in seven iterations to `-14.57882210 Ry`, with identical printed
+bands and energy components.
+
+| Decomposition | PWSCF wall | FFT wall | Vloc wall | Aggregate peak PSS |
+|---|---:|---:|---:|---:|
+| Sparse slab | 1.78 s | 0.63 s | 0.60 s | 216.43 MiB |
+| Dense pencil | 3.53 s | 2.42 s | 2.18 s | 225.31 MiB |
+
+The pencil result is a scaling implementation, not a claim of a crossover at
+four ranks: its dense Z/Y/X plan arrays and two MPI transposes are expected to
+lose to the fused sparse slab kernel at this modest process count. The result
+establishes end-to-end SCF equivalence and removes the slab's `ranks <= Nz`
+topological limit. The next performance work is native packed pencil
+transposes and avoiding dense inactive-grid traffic.

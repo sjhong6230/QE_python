@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from qepy_pw.basis import FFTGridDescriptor, LocalPotentialWorkspace
 from qepy_pw.fft_engine import FFTTaskTopology, PencilFFT3D
 from qepy_pw.mpi import MPIContext
 
@@ -62,6 +63,113 @@ def test_pencil_roundtrip_and_local_potential() -> None:
     local_expected = _local_z(expected, fft)
     local_error = float(np.max(np.abs(observed - local_expected)))
     assert mpi.max_scalar(local_error) < 2.0e-11
+
+
+def test_z_slab_x_pencil_field_redistribution_roundtrip() -> None:
+    mpi = MPIContext.world()
+    shape = (7, 10, 9)
+    topology = FFTTaskTopology.build(mpi.comm, shape)
+    fft = PencilFFT3D(shape, topology, threads=1)
+    z_slab = mpi.slab(shape[2])
+    x, y, z = np.meshgrid(
+        np.arange(shape[0]),
+        np.arange(shape[1]),
+        np.arange(z_slab.start, z_slab.stop),
+        indexing="ij",
+    )
+    local = np.ascontiguousarray(0.3 * x - 0.2 * y + 0.7 * z)
+    pencil = fft.slab_to_x_pencil(local)
+    restored = fft.x_pencil_to_slab(pencil)
+    np.testing.assert_array_equal(restored, local)
+
+
+def test_production_workspace_uses_sparse_pencil_boundary() -> None:
+    mpi = MPIContext.world()
+    shape = (6, 8, 10)
+    topology = FFTTaskTopology.build(mpi.comm, shape)
+    fft = PencilFFT3D(shape, topology, threads=1)
+    indices = np.indices(shape, dtype=np.int32).reshape(3, -1).T
+    descriptor = FFTGridDescriptor.build(
+        indices,
+        shape,
+        mpi.size,
+        local_rank=mpi.rank,
+        decomposition="pencil",
+        process_grid=topology.process_grid,
+    )
+    workspace = LocalPotentialWorkspace(
+        indices,
+        shape,
+        mpi=mpi,
+        descriptor=descriptor,
+        pencil_fft=fft,
+        distributed_fft_batch_size=2,
+    )
+    bands = 3
+    reciprocal = _global_coefficients(shape, bands, 0)
+    flat = reciprocal.reshape(-1, bands)
+    local_coefficients = np.asfortranarray(
+        flat[workspace.local_plane_wave_indices]
+    )
+    real = np.fft.ifftn(reciprocal, axes=(0, 1, 2)) * np.prod(shape)
+    slab = mpi.slab(shape[2])
+
+    observed_real = workspace.coefficients_to_grid(local_coefficients)
+    np.testing.assert_allclose(
+        observed_real,
+        real[:, :, slab, :],
+        rtol=2.0e-12,
+        atol=2.0e-11,
+    )
+    observed_coefficients = workspace.grid_to_coefficients(
+        np.ascontiguousarray(real[:, :, slab, :])
+    )
+    np.testing.assert_allclose(
+        observed_coefficients,
+        local_coefficients,
+        rtol=2.0e-12,
+        atol=2.0e-12,
+    )
+
+    x, y, z = np.meshgrid(
+        np.arange(shape[0]),
+        np.arange(shape[1]),
+        np.arange(shape[2]),
+        indexing="ij",
+    )
+    potential = 0.8 + 0.015 * x - 0.01 * y + 0.02 * z
+    potential_x = fft.slab_to_x_pencil(
+        np.ascontiguousarray(potential[:, :, slab])
+    )
+    observed_applied = workspace.apply(potential_x, local_coefficients)
+    expected_applied = np.fft.fftn(
+        real * potential[..., None], axes=(0, 1, 2)
+    ) / np.prod(shape)
+    np.testing.assert_allclose(
+        observed_applied,
+        expected_applied.reshape(-1, bands)[
+            workspace.local_plane_wave_indices
+        ],
+        rtol=3.0e-12,
+        atol=3.0e-11,
+    )
+
+    weights = np.asarray([0.4, 0.7, 0.2])
+    observed_density = np.zeros(
+        (shape[0], shape[1], slab.stop - slab.start)
+    )
+    workspace.accumulate_density(
+        observed_density, local_coefficients, weights
+    )
+    expected_density = np.sum(
+        np.abs(real) ** 2 * weights[None, None, None, :], axis=-1
+    )
+    np.testing.assert_allclose(
+        observed_density,
+        expected_density[:, :, slab],
+        rtol=3.0e-12,
+        atol=3.0e-10,
+    )
 
 
 def test_task_groups_execute_independent_band_sets() -> None:

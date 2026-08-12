@@ -39,7 +39,12 @@ from ..diagonalization import (
     rmm_diis,
 )
 from ..errors import QEInputError, UnsupportedFeatureError, not_implemented
-from ..fft_engine import FFTMemoryPlan
+from ..fft_engine import (
+    FFTMemoryPlan,
+    FFTTaskTopology,
+    PencilFFT3D,
+    choose_fft_decomposition,
+)
 from ..ewald import ewald_energy, ewald_forces, ewald_stress
 from .buffers import (
     WavefunctionBuffer,
@@ -341,6 +346,7 @@ class _LazyWorkspaceSequence(Sequence[LocalPotentialWorkspace]):
         timers: TimingRegistry,
         scratch_pool: FFTScratchPool,
         descriptor: FFTGridDescriptor | None,
+        pencil_fft: PencilFFT3D | None = None,
         serial_fft_batch_size: int | None = None,
         distributed_fft_batch_size: int | None = None,
         cache_workspaces: bool = False,
@@ -358,6 +364,7 @@ class _LazyWorkspaceSequence(Sequence[LocalPotentialWorkspace]):
             timers=timers,
             scratch_pool=scratch_pool,
             descriptor=descriptor,
+            pencil_fft=pencil_fft,
             serial_fft_batch_size=serial_fft_batch_size,
             distributed_fft_batch_size=distributed_fft_batch_size,
             retain_serial_sticks=retain_serial_sticks,
@@ -2215,10 +2222,22 @@ def _run_scf(
             use_all_frac=bool(pw.system.get("use_all_frac", False)),
         ),
     )
-    if mpi.size > shape[2]:
+    raw_fft_decomposition = os.environ.get(
+        "QEPY_FFT_DECOMPOSITION", "auto"
+    ).strip().lower()
+    if raw_fft_decomposition not in {"auto", "slab", "pencil"}:
+        raise QEInputError(
+            "QEPY_FFT_DECOMPOSITION must be auto, slab, or pencil"
+        )
+    selected_fft_decomposition = (
+        choose_fft_decomposition(shape, mpi.size)
+        if raw_fft_decomposition == "auto"
+        else raw_fft_decomposition
+    )
+    if selected_fft_decomposition == "slab" and mpi.size > shape[2]:
         raise QEInputError(
             f"{mpi.size} MPI ranks exceed the third FFT dimension "
-            f"({shape[2]}); use at most {shape[2]} ranks"
+            f"({shape[2]}); select QEPY_FFT_DECOMPOSITION=pencil"
         )
     if restart_mode != "restart" and (
         starting_potential == "file" or starting_wavefunctions == "file"
@@ -2263,7 +2282,16 @@ def _run_scf(
             electronic_states=not fixed_potential,
         )
     fft_scratch_pool = FFTScratchPool()
+    pencil_topology: FFTTaskTopology | None = None
+    pencil_fft: PencilFFT3D | None = None
     if mpi.size > 1:
+        if selected_fft_decomposition == "pencil":
+            pencil_topology = FFTTaskTopology.build(mpi.comm, shape)
+            pencil_fft = PencilFFT3D(
+                shape,
+                pencil_topology,
+                threads=threads_per_process,
+            )
         catalog = bases[0].catalog
         wave_indices = (
             catalog.indices
@@ -2273,7 +2301,16 @@ def _run_scf(
             )
         )
         wave_fft_descriptor = FFTGridDescriptor.build(
-            wave_indices, shape, mpi.size, local_rank=mpi.rank
+            wave_indices,
+            shape,
+            mpi.size,
+            local_rank=mpi.rank,
+            decomposition=selected_fft_decomposition,
+            process_grid=(
+                pencil_topology.process_grid
+                if pencil_topology is not None
+                else None
+            ),
         )
         preferred_distributed_fft_batch = max(1, threads_per_process)
         raw_fft_limit = os.environ.get("QEPY_FFT_MEMORY_LIMIT_MIB", "").strip()
@@ -2288,34 +2325,41 @@ def _run_scf(
                 raise QEInputError(
                     "QEPY_FFT_MEMORY_LIMIT_MIB must be a positive number"
                 )
-            local_z = mpi.slab(shape[2])
-            local_real_points = (
-                shape[0]
-                * shape[1]
-                * (local_z.stop - local_z.start)
-            )
-            local_sticks = len(
-                wave_fft_descriptor.sticks_by_rank[mpi.rank]
-            )
-            transpose = wave_fft_descriptor.transpose_plans[mpi.rank]
-            assert transpose is not None
-            forward_one = transpose.native_counts(1)
-            reverse_one = transpose.native_counts(1, reverse=True)
-            inverse_receive = int(
-                forward_one[3][-1] + forward_one[2][-1]
-            )
-            reverse_send = int(
-                reverse_one[1][-1] + reverse_one[0][-1]
-            )
-            memory_plan = FFTMemoryPlan.choose(
-                bands=max(1, 2 * nbnd),
-                fixed_bytes=16 * local_real_points,
-                bytes_per_band=16
-                * (
+            if pencil_fft is not None:
+                fixed_fft_bytes = int(
+                    np.prod(pencil_fft.local_x_shape) * 16
+                )
+                fft_bytes_per_band = pencil_fft.estimated_scratch_bytes(1)
+            else:
+                local_z = mpi.slab(shape[2])
+                local_real_points = (
+                    shape[0]
+                    * shape[1]
+                    * (local_z.stop - local_z.start)
+                )
+                local_sticks = len(
+                    wave_fft_descriptor.sticks_by_rank[mpi.rank]
+                )
+                transpose = wave_fft_descriptor.transpose_plans[mpi.rank]
+                assert transpose is not None
+                forward_one = transpose.native_counts(1)
+                reverse_one = transpose.native_counts(1, reverse=True)
+                inverse_receive = int(
+                    forward_one[3][-1] + forward_one[2][-1]
+                )
+                reverse_send = int(
+                    reverse_one[1][-1] + reverse_one[0][-1]
+                )
+                fixed_fft_bytes = 16 * local_real_points
+                fft_bytes_per_band = 16 * (
                     shape[2] * local_sticks
                     + inverse_receive
                     + reverse_send
-                ),
+                )
+            memory_plan = FFTMemoryPlan.choose(
+                bands=max(1, 2 * nbnd),
+                fixed_bytes=fixed_fft_bytes,
+                bytes_per_band=fft_bytes_per_band,
                 memory_limit_bytes=fft_limit_bytes,
                 preferred_tile=preferred_distributed_fft_batch,
             )
@@ -2335,6 +2379,7 @@ def _run_scf(
         timers=timers,
         scratch_pool=fft_scratch_pool,
         descriptor=wave_fft_descriptor,
+        pencil_fft=pencil_fft,
         # Bound serial FFT storage by the rank-local thread team. This keeps
         # memory O(threads), not O(bands), while independent band transforms
         # occupy the cores. MPI retains its block transform.
@@ -2363,7 +2408,16 @@ def _run_scf(
     charge_indices = reciprocal_grid.charge_indices
     charge_fft_descriptor = (
         FFTGridDescriptor.build(
-            charge_indices, shape, mpi.size, local_rank=mpi.rank
+            charge_indices,
+            shape,
+            mpi.size,
+            local_rank=mpi.rank,
+            decomposition=selected_fft_decomposition,
+            process_grid=(
+                pencil_topology.process_grid
+                if pencil_topology is not None
+                else None
+            ),
         )
         if mpi.size > 1
         else None
@@ -2375,6 +2429,7 @@ def _run_scf(
         timers=timers,
         scratch_pool=fft_scratch_pool,
         descriptor=charge_fft_descriptor,
+        pencil_fft=pencil_fft,
         distributed_fft_batch_size=1,
         # Serial charge transforms use compact flat FFT slots.  The retained
         # QE stick catalog is needed only by the distributed transpose.
@@ -2688,35 +2743,51 @@ def _run_scf(
             distributed_fft_batch = min(
                 int(preferred_distributed_fft_batch), maximum_block
             )
-            charge_local_stick_points = shape[2] * len(
-                charge_fft_descriptor.sticks_by_rank[mpi.rank]
-            )
-            wave_slab_points = local_real_points // shape[0] // shape[1]
-            wave_slab_points *= wavefunction_sticks
-            charge_slab_points = (
-                local_real_points // shape[0] // shape[1]
-            ) * charge_sticks
-            # One scratch allocation is shared by wave and charge Z sticks.
-            # MPI owns grow-only send/receive buffers sized by the largest of
-            # either transpose direction.  Count these actual maxima instead
-            # of assuming perfectly balanced wave sticks, which understated
-            # the runtime pool for the denser charge descriptor.
-            stick_scratch = max(
-                charge_local_stick_points,
-                local_stick_points * distributed_fft_batch,
-            )
-            transpose_buffer = max(
-                charge_local_stick_points,
-                charge_slab_points,
-                local_stick_points * distributed_fft_batch,
-                wave_slab_points * distributed_fft_batch,
-            )
-            real_batch = 1
-            fft_bytes = (
-                stick_scratch
-                + local_real_points * real_batch
-                + 2 * transpose_buffer
-            ) * 16
+            if pencil_fft is not None:
+                # The dense Z/Y/X plan arrays are bounded by the selected
+                # band tile. Charge transforms additionally retain the
+                # one-band plans, while their send/receive exchange storage
+                # is shared and grows only to the larger payload.
+                fft_bytes = pencil_fft.estimated_scratch_bytes(
+                    distributed_fft_batch
+                )
+                if distributed_fft_batch != 1:
+                    fft_bytes += pencil_fft.estimated_scratch_bytes(1)
+                # Veff stays in X pencils for the complete k-point loop, so
+                # Hpsi never repeats the public Z-slab redistribution.
+                fft_bytes += (
+                    int(np.prod(pencil_fft.local_x_shape))
+                    * 8
+                    * (2 if lsda else 1)
+                )
+            else:
+                charge_local_stick_points = shape[2] * len(
+                    charge_fft_descriptor.sticks_by_rank[mpi.rank]
+                )
+                wave_slab_points = local_real_points // shape[0] // shape[1]
+                wave_slab_points *= wavefunction_sticks
+                charge_slab_points = (
+                    local_real_points // shape[0] // shape[1]
+                ) * charge_sticks
+                # One scratch allocation is shared by wave and charge Z
+                # sticks. MPI owns grow-only send/receive buffers sized by
+                # the largest of either transpose direction.
+                stick_scratch = max(
+                    charge_local_stick_points,
+                    local_stick_points * distributed_fft_batch,
+                )
+                transpose_buffer = max(
+                    charge_local_stick_points,
+                    charge_slab_points,
+                    local_stick_points * distributed_fft_batch,
+                    wave_slab_points * distributed_fft_batch,
+                )
+                real_batch = 1
+                fft_bytes = (
+                    stick_scratch
+                    + local_real_points * real_batch
+                    + 2 * transpose_buffer
+                ) * 16
         else:
             fft_batch_size = 1
             # The inverse and forward Z-stick phases are sequential and use
@@ -3351,6 +3422,20 @@ def _run_scf(
                 v_eff_g = np.fft.fftn(v_eff_local) / np.prod(shape)
             else:
                 v_eff_g = np.asarray([potential_average], dtype=complex)
+        pencil_v_eff_local: np.ndarray | None = None
+        if pencil_fft is not None and diagonalization != "dense":
+            if lsda:
+                pencil_v_eff_local = np.stack(
+                    [
+                        charge_workspace.slab_to_x_pencil(component)
+                        for component in v_eff_grid
+                    ],
+                    axis=0,
+                )
+            else:
+                pencil_v_eff_local = charge_workspace.slab_to_x_pencil(
+                    v_eff_grid
+                )
         if potential_started is not None:
             timers.stop("v_of_rho", potential_started)
         eigenvalues = []
@@ -3415,13 +3500,20 @@ def _run_scf(
             active_v_eff_g = v_eff_g[spin_index] if lsda else v_eff_g
             if lsda:
                 active_v_eff_grid = v_eff_grid[spin_index]
-                active_v_eff_local = (
-                    np.moveaxis(active_v_eff_grid, 2, 0)
-                    if native_potential_layout
-                    else active_v_eff_grid
-                )
+                if pencil_v_eff_local is not None:
+                    active_v_eff_local = pencil_v_eff_local[spin_index]
+                else:
+                    active_v_eff_local = (
+                        np.moveaxis(active_v_eff_grid, 2, 0)
+                        if native_potential_layout
+                        else active_v_eff_grid
+                    )
             else:
-                active_v_eff_local = v_eff_local
+                active_v_eff_local = (
+                    pencil_v_eff_local
+                    if pencil_v_eff_local is not None
+                    else v_eff_local
+                )
             if diagonalization == "dense":
                 hamiltonian = potential_matrix(
                     active_v_eff_g, basis.indices
