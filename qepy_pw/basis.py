@@ -1667,7 +1667,7 @@ class LocalPotentialWorkspace:
                 grid = self._scratch(
                     "serial_fft_grid", (active, grid_stride)
                 )
-                if self.thread_count > 1 and native_potential_layout:
+                if native_potential_layout:
                     z_plan, xy_plan = self._serial_spatial_plans(grid)
                     self._native_fft.apply_serial_spatial(
                         grid,

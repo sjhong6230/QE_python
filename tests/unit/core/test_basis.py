@@ -5,6 +5,7 @@ import pytest
 
 from qepy_pw.basis import (
     FFTScratchPool,
+    LocalPotentialWorkspace,
     PlaneWaveBasis,
     PlaneWaveCatalog,
     _cutoff_miller_extents,
@@ -122,6 +123,43 @@ def test_fft_local_potential_matches_explicit_convolution() -> None:
     expected = potential_matrix(potential_g, indices) @ coefficients
     actual = apply_local_potential(potential_g, indices, coefficients)
     np.testing.assert_allclose(actual, expected, atol=2.0e-14)
+
+
+def test_serial_sparse_spatial_fft_matches_full_3d_fft() -> None:
+    shape = (12, 10, 8)
+    axes = [
+        np.rint(np.fft.fftfreq(size) * size).astype(np.int32)
+        for size in shape
+    ]
+    gx, gy, gz = np.meshgrid(*axes, indexing="ij", sparse=True)
+    slots = np.column_stack(
+        np.nonzero(gx * gx + gy * gy + gz * gz <= 3.5**2)
+    )
+    indices = np.column_stack(
+        [axes[axis][slots[:, axis]] for axis in range(3)]
+    ).astype(np.int32, copy=False)
+    rows = np.arange(len(indices), dtype=float)[:, None]
+    bands = np.arange(3, dtype=float)[None, :]
+    coefficients = np.asfortranarray(
+        np.sin(0.13 * rows + bands) + 1j * np.cos(0.17 * rows - bands)
+    )
+    xyz = np.sin(0.07 * np.arange(np.prod(shape))).reshape(shape)
+    diagonal = np.linspace(0.1, 0.9, len(indices))
+
+    sparse = LocalPotentialWorkspace(indices, shape).apply(
+        np.ascontiguousarray(np.moveaxis(xyz, 2, 0)),
+        coefficients,
+        native_potential_layout=True,
+        diagonal=diagonal,
+    )
+    full = LocalPotentialWorkspace(indices, shape).apply(
+        xyz,
+        coefficients,
+        native_potential_layout=False,
+        diagonal=diagonal,
+    )
+
+    np.testing.assert_allclose(sparse, full, atol=8.0e-13)
 
 
 def test_fft_scratch_pool_reuses_and_grows_named_storage() -> None:

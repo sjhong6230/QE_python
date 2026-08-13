@@ -3507,10 +3507,10 @@ def _run_scf(
         # Allocate the effective-potential owner before XC and use it first as
         # the total-density workspace. This removes ``rho + rho_core`` as a
         # separate full-grid temporary on every SCF iteration.
-        native_potential_layout = (
-            (mpi.size > 1 or threads_per_process > 1)
-            and diagonalization != "dense"
-        )
+        # The native z,x,y owner also enables QE's sparse stick/plane FFT in
+        # serial.  It avoids transforming inactive z sticks even with one
+        # thread; distributed and threaded runs already used this layout.
+        native_potential_layout = diagonalization != "dense"
         if lsda:
             v_eff_local = None
             if build_input_hxc:
@@ -3771,10 +3771,7 @@ def _run_scf(
                     local_workspace=local_workspace,
                     timers=timers,
                     real_potential=active_v_eff_local,
-                    native_potential_layout=(
-                        (mpi.size > 1 or threads_per_process > 1)
-                        and diagonalization != "dense"
-                    ),
+                    native_potential_layout=native_potential_layout,
                     # QE's usnldiag uses v_of_0: the G=0 component of the
                     # ionic local potential, not the average total effective
                     # potential used by H|psi>.
