@@ -334,6 +334,7 @@ def test_high_verbosity_force_and_stress_decompositions_sum_to_totals():
         result.stress_terms.core_correction_ha_per_bohr3,
         result.stress_terms.ewald_ha_per_bohr3,
     ))
+    force_sum -= np.mean(force_sum, axis=0, keepdims=True)
     np.testing.assert_allclose(force_sum, result.forces_ha_per_bohr)
     np.testing.assert_allclose(
         stress_sum, result.stress_ha_per_bohr3, atol=1.0e-18

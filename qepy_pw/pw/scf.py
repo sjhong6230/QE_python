@@ -1825,6 +1825,46 @@ def _local_and_core_forces(
     return mpi.sum_array(local), mpi.sum_array(core)
 
 
+def _scf_force_correction(
+    pw: PWInput,
+    pseudos: dict[str, LocalPotential],
+    potential_residual: np.ndarray,
+    workspace: LocalPotentialWorkspace,
+    g_vectors: np.ndarray,
+    mpi: MPIContext,
+) -> np.ndarray:
+    """Return QE's Chan--Bohnen--Ho incomplete-SCF force correction.
+
+    ``potential_residual`` is ``V_Hxc[rho_out] - V_Hxc[rho_in]`` in
+    Hartree.  QE's ``force_corr`` contracts its reciprocal coefficients
+    with the superposition of free-atom valence densities.  The Python
+    charge basis stores both signs of G, so no Gamma-only factor of two is
+    required here.
+    """
+    residual_g = workspace.grid_to_coefficients(potential_residual)
+    q = np.linalg.norm(g_vectors, axis=1)
+    correction = np.zeros((len(pw.atoms), 3), dtype=np.float64)
+    radial_by_label: dict[str, np.ndarray] = {}
+    for atom_index, atom in enumerate(pw.atoms):
+        radial = radial_by_label.get(atom.label)
+        if radial is None:
+            radial = pseudos[atom.label].atomic_density_fourier(
+                q, pw.volume
+            )
+            radial_by_label[atom.label] = radial
+        phase = np.exp(-1j * (g_vectors @ atom.position))
+        atomic_density_g = radial * phase
+        correction[atom_index] = pw.volume * np.real(
+            np.sum(
+                np.conjugate(residual_g)[:, None]
+                * (1j * g_vectors)
+                * atomic_density_g[:, None],
+                axis=0,
+            )
+        )
+    return mpi.sum_array(correction)
+
+
 def _hellmann_feynman_stress(
     pw: PWInput,
     pseudos: dict[str, LocalPotential],
@@ -3478,6 +3518,7 @@ def _run_scf(
     # total-energy correction.  Retain that grid as the next iteration's
     # input potential instead of repeating identical Hartree and GGA FFTs.
     input_hxc: np.ndarray | None = None
+    force_potential_residual: np.ndarray | None = None
     while iteration <= maxiter:
         build_input_hxc = input_hxc is None
         potential_started = (
@@ -4336,6 +4377,47 @@ def _run_scf(
         # feeding an already-converged residual back through Broyden changes
         # the fixed-point history and can move the calculation away again.
         converged = density_converged
+        if converged and calculate_forces:
+            # QE preserves the final input Hxc potential and recomputes the
+            # output one, forming vnew = V_Hxc[rho_out]-V_Hxc[rho_in].  The
+            # Hartree part follows directly from the already transformed
+            # density residual.  Build -Vxc[rho_in] now while the input
+            # density still exists; Vxc[rho_out] is added during the normal
+            # converged-energy evaluation below.
+            residual_hartree_g = np.zeros_like(charge_residual_g)
+            _load_native_fft().hartree_coefficients(
+                charge_residual_g,
+                local_charge_g2,
+                residual_hartree_g,
+            )
+            force_potential_residual = np.ascontiguousarray(
+                np.real(
+                    charge_workspace.coefficients_to_grid(
+                        residual_hartree_g, use_scratch=True
+                    )
+                )
+            )
+            del residual_hartree_g
+            if lsda:
+                real_grid_workspace[...] = rho
+                real_grid_workspace += 0.5 * rho_core[None, ...]
+            else:
+                np.add(rho, rho_core, out=real_grid_workspace)
+            _unused_epsilon, input_vxc = _xc_energy_potential(
+                real_grid_workspace,
+                xc_functional,
+                workspace=charge_workspace,
+                g_vectors=local_charge_vectors,
+                need_epsilon=False,
+            )
+            assert _unused_epsilon is None
+            if lsda:
+                force_potential_residual -= 0.5 * (
+                    input_vxc[0] + input_vxc[1]
+                )
+            else:
+                force_potential_residual -= input_vxc
+            del input_vxc, _unused_epsilon
         mix_started = timers.start()
         if converged:
             rho_energy = rho_out
@@ -4418,6 +4500,13 @@ def _run_scf(
                 float(np.sum(real_grid_workspace))
             )
         timers.stop("v_xc", xc_started)
+        if force_potential_residual is not None:
+            if lsda:
+                force_potential_residual += 0.5 * (
+                    vxc_energy[0] + vxc_energy[1]
+                )
+            else:
+                force_potential_residual += vxc_energy
         vh_energy = np.ascontiguousarray(
             np.real(
                 charge_workspace.coefficients_to_grid(
@@ -4571,6 +4660,27 @@ def _run_scf(
             stress_ha_per_bohr3 = None
             force_terms = None
             stress_terms = None
+            scf_correction = None
+            fractional_positions = positions @ np.linalg.inv(pw.lattice)
+            atom_labels = [atom.label for atom in pw.atoms]
+            if calculate_forces:
+                assert force_potential_residual is not None
+                scf_correction = symmetrize_forces(
+                    _scf_force_correction(
+                        pw,
+                        pseudo_by_label,
+                        force_potential_residual,
+                        charge_workspace,
+                        local_charge_vectors,
+                        mpi,
+                    ),
+                    pw.lattice,
+                    fractional_positions,
+                    atom_labels,
+                    pw.symmetry_operations,
+                )
+                del force_potential_residual
+                trim_allocator()
             nonlocal_energy = 0.0
             nonlocal_force = None
             nonlocal_tensor = None
@@ -4634,8 +4744,6 @@ def _run_scf(
                     reciprocal_vectors=local_charge_vectors,
                     mpi=mpi,
                 )
-                fractional_positions = positions @ np.linalg.inv(pw.lattice)
-                atom_labels = [atom.label for atom in pw.atoms]
                 force_components = [
                     symmetrize_forces(
                         component, pw.lattice, fractional_positions,
@@ -4645,16 +4753,18 @@ def _run_scf(
                         nonlocal_force, ionic_force, local_force, core_force,
                     )
                 ]
-                forces_ha_per_bohr = sum(force_components)
+                assert scf_correction is not None
+                forces_ha_per_bohr = sum(force_components) + scf_correction
                 # A periodic neutral cell is invariant under a rigid
-                # translation. Enforce the corresponding acoustic sum rule
-                # after assembling independently rounded FFT/projector terms.
+                # translation. QE imposes this acoustic sum rule on the
+                # assembled total, after adding force_corr; it does not label
+                # the removed mean as the SCF correction itself.
                 forces_ha_per_bohr -= np.mean(
                     forces_ha_per_bohr, axis=0, keepdims=True
                 )
                 force_terms = SCFForceTerms(
                     *force_components,
-                    forces_ha_per_bohr - sum(force_components),
+                    scf_correction,
                 )
                 del final_vxc
                 trim_allocator()

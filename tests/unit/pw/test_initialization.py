@@ -13,10 +13,12 @@ from qepy_pw.input import read_pw_input
 from qepy_pw.pw.scf import (
     ReciprocalGrid,
     _atomic_starting_density,
+    _scf_force_correction,
     _static_cache_limit_bytes,
     _starting_charge_scales,
     _starting_magnetizations,
 )
+from qepy_pw.mpi import MPIContext
 from qepy_pw.upf import read_upf
 
 
@@ -137,3 +139,67 @@ K_POINTS gamma
     assert scale * np.sum(density[0] - density[1]) == pytest.approx(
         0.8, abs=2.0e-12
     )
+
+
+def test_scf_force_correction_is_negative_atomic_density_energy_gradient() -> None:
+    pw = read_pw_input(io.StringIO(f"""\
+&CONTROL
+  pseudo_dir='{PSEUDO_DIR.as_posix()}'
+/
+&SYSTEM
+  ibrav=1, celldm(1)=10, nat=2, ntyp=1, ecutwfc=12
+/
+&ELECTRONS
+/
+ATOMIC_SPECIES
+H 1.0 H.pz-vbc.UPF
+ATOMIC_POSITIONS crystal
+H 0.17 0.23 0.31
+H 0.61 0.47 0.73
+K_POINTS gamma
+"""))
+    pseudo = read_upf(PSEUDO_DIR / "H.pz-vbc.UPF")
+    shape = (12, 12, 12)
+    geometry = ReciprocalGrid.build(
+        shape, pw.reciprocal, cutoff_ry=48.0
+    )
+    workspace = LocalPotentialWorkspace(geometry.charge_indices, shape)
+    grid = np.indices(shape, dtype=float)
+    potential_residual = (
+        0.03 * np.sin(2.0 * np.pi * grid[0] / shape[0])
+        + 0.02 * np.cos(4.0 * np.pi * grid[1] / shape[1])
+        - 0.01 * np.sin(2.0 * np.pi * grid[2] / shape[2])
+    )
+    correction = _scf_force_correction(
+        pw,
+        {"H": pseudo},
+        potential_residual,
+        workspace,
+        geometry.charge_vectors,
+        MPIContext.world(),
+    )
+
+    residual_g = workspace.grid_to_coefficients(potential_residual)
+    g_vectors = geometry.charge_vectors
+    radial = pseudo.atomic_density_fourier(
+        np.linalg.norm(g_vectors, axis=1), pw.volume
+    )
+
+    def interaction(position: np.ndarray) -> float:
+        phase = np.exp(-1j * (g_vectors @ position))
+        return pw.volume * float(
+            np.real(np.vdot(residual_g, radial * phase))
+        )
+
+    step = 1.0e-5
+    expected = np.zeros_like(correction)
+    for atom_index, atom in enumerate(pw.atoms):
+        for axis in range(3):
+            displacement = np.zeros(3)
+            displacement[axis] = step
+            expected[atom_index, axis] = -(
+                interaction(atom.position + displacement)
+                - interaction(atom.position - displacement)
+            ) / (2.0 * step)
+
+    np.testing.assert_allclose(correction, expected, atol=2.0e-11)
