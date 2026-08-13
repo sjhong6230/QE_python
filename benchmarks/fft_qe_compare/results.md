@@ -386,3 +386,52 @@ Regression validation after the change completed with 229 passed and two
 expected skips across the unit, QE-reference, slab-FFT, and pencil-FFT suites.
 Launching the slab/pencil integration files under four MPI ranks additionally
 produced 10 passing tests on each rank.
+
+## Memory-first optimization (2026-08-13)
+
+The memory pass retained `disk_io='none'` and did not introduce k-pools. It
+combined three changes: the static k-point cache became opt-in (default zero),
+charge-grid sizing scans bounded Miller-plane chunks instead of constructing
+and sorting a complete `ecutrho` plane-wave basis, and Davidson forms the
+intermediate residual directly without retaining a separate full Ritz-vector
+block. The output now reports aggregate sampled PSS, average PSS/rank, and
+lifetime peak RSS/rank side by side.
+
+For the four-band 8x8x8 input, comparison against the original cached path is:
+
+| Measurement | original cached path | memory-first path | Change |
+|---|---:|---:|---:|
+| Aggregate sampled PSS, 4 ranks | 473.88 MiB | 358.47 MiB | -24.4% |
+| Average sampled PSS/rank | 118.47 MiB | 89.62 MiB | -24.4% |
+| Lifetime peak RSS/rank | 200.33 MiB | 136.52 MiB | -31.8% |
+| Static cache/rank | 29.78 MiB | disabled | -29.78 MiB |
+| Final energy | -15.85334688 Ry | -15.85334688 Ry | identical |
+| SCF iterations | 7 | 7 | identical |
+
+The PSS decrease is predominantly the removal of rank-private all-k static
+projectors. The RSS decrease is predominantly the bounded charge-sphere scan:
+an isolated setup measurement reduced its high-water mark from 179.6 to
+79.6 MiB while returning the same FFT dimensions. The two improvements target
+different lifetimes, so both metrics are necessary.
+
+A final adjacent QE/Python run used four core-bound ranks and one thread/rank.
+The optimized Python run took 30.39 s externally versus 29.16 s for rebuilt QE,
+and its lifetime peak RSS was 136.52 versus 109.41 MiB/rank. Thus the RSS ratio
+fell from the earlier 1.86x to about 1.25x, while energies differed by only
+1e-8 Ry and both calculations converged in seven iterations. QE aggregate PSS
+was not sampled in this run, so only like-for-like RSS is compared across the
+programs.
+
+For the 128-band 2x2x2 RAM-only input, eliminating the intermediate Davidson
+Ritz owner preserved the six-iteration trajectory and final
+-15.66126555 Ry energy. Repeated single-run observations put the RSS reduction
+between about 6 and 17 MiB/rank depending on allocator high-water variation;
+the final verified run used 269,888 KiB. Because the existing aggregate PSS
+sampler runs at iteration boundaries after Davidson storage is released, it
+does not observe this transient solver reduction; RSS is the valid measured
+high-water metric for that change.
+
+The complete post-change suite passed 329 tests with two expected skips. The
+slab/pencil integration files also passed all 10 tests on each of four MPI
+ranks. An attempted in-place BLAS alias optimization was rejected after it
+failed memory-safety testing and is not present in the committed code.

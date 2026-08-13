@@ -107,6 +107,12 @@ setup time. The footer reports the admitted k-point count and retained bytes.
 export QEPY_STATIC_CACHE_LIMIT_MIB=32
 ```
 
+The footer reports both the sampled aggregate PSS and the lifetime peak RSS
+per rank. Aggregate PSS is the closer estimate of physical node RAM when MPI
+ranks share libraries or catalog pages; peak RSS is the conservative
+per-process high-water mark and also captures short setup allocations that
+iteration-boundary PSS sampling can miss.
+
 `QEPY_FFT_DECOMPOSITION` accepts `auto` (the default), `slab`, or `pencil`.
 `auto` retains the lower-communication sparse Z-stick slab while the rank
 count fits the FFT Z dimension, and selects a two-dimensional pencil grid
