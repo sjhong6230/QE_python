@@ -40,6 +40,18 @@ def _clean_zero(value: float, tolerance: float = 5.0e-12) -> float:
     return 0.0 if abs(value) < tolerance else float(value)
 
 
+def _format_scf_accuracy_ry(value_ry: float) -> str:
+    """Format ``dr2`` with QE's fixed/scientific notation switch.
+
+    QE 7.5 uses ``F17.8`` above ``eps8`` and ``1PE17.1`` otherwise.
+    Python's ``E`` conversion has the same exponent convention for this
+    field, so the two width/precision specifications reproduce both forms.
+    """
+    if value_ry > 1.0e-8:
+        return f"{value_ry:17.8f}"
+    return f"{value_ry:17.1E}"
+
+
 def _qe_symmetry_operations(pw: PWInput):
     """Return operations in a stable, QE-like order, with identity first."""
     identity = np.eye(3, dtype=int)
@@ -595,7 +607,7 @@ def format_iteration(step: SCFIteration) -> str:
     if np.isfinite(step.estimated_accuracy_ha):
         print(
             f"     estimated scf accuracy    <"
-            f"{step.estimated_accuracy_ha * 2:17.8f} Ry\n",
+            f"{_format_scf_accuracy_ry(step.estimated_accuracy_ha * 2)} Ry\n",
             file=out,
         )
     return out.getvalue()
@@ -791,9 +803,10 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
     if calculation == "scf":
         print(f"\n{marker}    total energy              ={result.total_energy_ha * 2:17.8f} Ry", file=out)
     if result.iterations:
+        accuracy_ry = 2.0 * result.iterations[-1].estimated_accuracy_ha
         print(
             f"     estimated scf accuracy    <"
-            f"{2.0 * result.iterations[-1].estimated_accuracy_ha:17.8f} Ry",
+            f"{_format_scf_accuracy_ry(accuracy_ry)} Ry",
             file=out,
         )
     if occupations_mode == "smearing" and result.energy_terms is not None:
