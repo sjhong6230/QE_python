@@ -965,6 +965,17 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
             "(aggregate PSS, sampled)",
             file=out,
         )
+        print(
+            "     Average sampled PSS/rank = "
+            f"{format_bytes(result.peak_sampled_pss_bytes_all_ranks // max(1, result.mpi_processes))}",
+            file=out,
+        )
+        if result.peak_rss_bytes_per_rank:
+            print(
+                "     Lifetime peak RSS/rank = "
+                f"{format_bytes(result.peak_rss_bytes_per_rank)}",
+                file=out,
+            )
     else:
         measured_peak = (
             result.peak_rss_bytes_all_ranks

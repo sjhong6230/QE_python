@@ -889,7 +889,8 @@ def davidson(
 
     update_projected(0)
 
-    def ritz_pairs() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def reduced_solution() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Diagonalize and form residuals without a full Ritz-vector owner."""
         with (
             timers.measure("cdiaghg")
             if timers is not None
@@ -912,18 +913,22 @@ def davidson(
             if timers is not None
             else nullcontext()
         ):
-            vectors = _matmul_f(basis, coefficients)
-            # Form H|psi>-epsilon|psi> directly in its final owner.  The
-            # former separate H|psi> Ritz matrix was only needed at a rare
-            # Davidson restart and raised the large-Npw peak by one band
-            # block on every rank.
+            # Form H|psi>-epsilon|psi> directly in one final owner.  A full
+            # Ritz-vector matrix is needed only on convergence or refresh;
+            # retaining it at every reduced solve costs Npw*Nband complex
+            # values.  Bound the short-lived basis-product scratch by rows.
             residual = _matmul_f(applied_basis, coefficients)
-            _load_native_fft().subtract_band_energies(
-                residual,
-                vectors,
-                np.ascontiguousarray(roots, dtype=np.float64),
+            scaled = coefficients * roots[None, :]
+            target_bytes = 4 << 20
+            rows_per_chunk = max(
+                1,
+                target_bytes
+                // max(1, residual.shape[1] * residual.itemsize),
             )
-        return roots, vectors, residual
+            for start in range(0, residual.shape[0], rows_per_chunk):
+                stop = min(start + rows_per_chunk, residual.shape[0])
+                residual[start:stop] -= basis[start:stop] @ scaled
+        return roots, coefficients, residual
 
     if initial_is_ritz:
         # QE cegterg(lrot=.true.) trusts rotate_wfc: it does not perform a
@@ -940,12 +945,18 @@ def davidson(
             values = np.asarray(
                 initial_eigenvalues[:number_of_roots], dtype=float
             )
-        ritz_vectors = basis[:, :number_of_roots]
+        ritz_coefficients = np.eye(
+            active_columns,
+            number_of_roots,
+            dtype=float if metric is not None else complex,
+        )
         residuals = _form_residual(
-            applied_basis[:, :number_of_roots], ritz_vectors, values
+            applied_basis[:, :number_of_roots],
+            basis[:, :number_of_roots],
+            values,
         )
     else:
-        values, ritz_vectors, residuals = ritz_pairs()
+        values, ritz_coefficients, residuals = reduced_solution()
     track_residual_norms = (
         residual_factor is not None or residual_energy_scale is not None
     )
@@ -993,11 +1004,9 @@ def davidson(
         basis_storage[:, old_columns:active_columns] = corrections
         basis = basis_storage[:, :active_columns]
         corrections = basis_storage[:, old_columns:active_columns]
-        # The correction is now owned by basis_storage.  The preceding Ritz
-        # pair is no longer used, so release both band blocks before Hpsi and
-        # before constructing the replacement pair.  This prevents old and
-        # new Ritz/residual blocks from overlapping at the Davidson peak.
-        del ritz_vectors, residuals
+        # The correction is now owned by basis_storage.  Release the old
+        # residual before Hpsi and before constructing its replacement.
+        del residuals
         _apply_into(
             operator,
             operator_into,
@@ -1007,7 +1016,7 @@ def davidson(
         applied_basis = applied_storage[:, :active_columns]
         hamiltonian_applications += corrections.shape[1]
         update_projected(old_columns)
-        values, ritz_vectors, residuals = ritz_pairs()
+        values, ritz_coefficients, residuals = reduced_solution()
         if track_residual_norms:
             residual_norms = reduced_residual_norms(residuals)
         converged = (
@@ -1031,6 +1040,7 @@ def davidson(
         if number_unconverged == 0:
             if not track_residual_norms:
                 residual_norms = reduced_residual_norms(residuals)
+            ritz_vectors = _matmul_f(basis, ritz_coefficients)
             return DavidsonResult(
                 values,
                 ritz_vectors,
@@ -1049,6 +1059,7 @@ def davidson(
                 else nullcontext()
             ):
                 active_columns = number_of_roots
+                ritz_vectors = _matmul_f(basis, ritz_coefficients)
                 basis_storage[:, :active_columns] = ritz_vectors
                 basis = basis_storage[:, :active_columns]
                 # Reconstruct H|psi> = residual + epsilon|psi> directly in
@@ -1069,9 +1080,16 @@ def davidson(
                     active_columns,
                     dtype=float if metric is not None else complex,
                 )
+                ritz_coefficients = np.eye(
+                    active_columns,
+                    number_of_roots,
+                    dtype=float if metric is not None else complex,
+                )
+                del ritz_vectors
 
     if not track_residual_norms:
         residual_norms = reduced_residual_norms(residuals)
+    ritz_vectors = _matmul_f(basis, ritz_coefficients)
     return DavidsonResult(
         values,
         ritz_vectors,
