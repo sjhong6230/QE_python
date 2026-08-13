@@ -7,9 +7,11 @@ from qepy_pw.basis import (
     FFTScratchPool,
     PlaneWaveBasis,
     PlaneWaveCatalog,
+    _cutoff_miller_extents,
     _next_fast_len_real,
     apply_local_potential,
     fft_shape,
+    make_basis,
     make_bases,
     potential_matrix,
 )
@@ -82,6 +84,29 @@ def test_fft_shape_respects_symmetry_translation_factors() -> None:
     assert shape[0] % 2 == 0
     assert shape[1] % 3 == 0
     assert all(_next_fast_len_real(size) == size for size in shape)
+
+
+@pytest.mark.parametrize(
+    "reciprocal",
+    [
+        np.diag([1.0, 1.3, 1.7]),
+        np.asarray(
+            [[1.1, 0.2, 0.0], [0.1, 1.4, 0.3], [0.2, 0.0, 1.6]]
+        ),
+    ],
+)
+@pytest.mark.parametrize("ecut_ry", [3.0, 11.0, 37.0])
+def test_chunked_cutoff_extents_match_materialized_basis(
+    reciprocal: np.ndarray, ecut_ry: float
+) -> None:
+    expected = np.max(
+        np.abs(make_basis(reciprocal, np.zeros(3), ecut_ry).indices),
+        axis=0,
+    )
+    actual = _cutoff_miller_extents(
+        reciprocal, ecut_ry, chunk_bytes=512
+    )
+    np.testing.assert_array_equal(actual, expected)
 
 
 def test_fft_local_potential_matches_explicit_convolution() -> None:

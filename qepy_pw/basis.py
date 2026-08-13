@@ -2055,6 +2055,63 @@ def _miller_grid(bound: int) -> np.ndarray:
     return np.moveaxis(grid, 0, -1).reshape(-1, 3)
 
 
+def _cutoff_miller_extents(
+    reciprocal: np.ndarray,
+    ecut_ry: float,
+    *,
+    chunk_bytes: int = 8 << 20,
+) -> np.ndarray:
+    """Find charge-sphere Miller extents without materializing its basis.
+
+    ``fft_shape`` needs only three maxima, whereas ``make_basis`` also builds
+    and energy-sorts every candidate vector.  Scan bounded batches of Miller
+    planes so the temporary memory is independent of the cutoff volume.
+    """
+    reciprocal = np.asarray(reciprocal, dtype=np.float64)
+    if reciprocal.shape != (3, 3):
+        raise ValueError("reciprocal must have shape (3, 3)")
+    if not np.isfinite(ecut_ry) or ecut_ry <= 0.0:
+        raise ValueError("ecut_ry must be positive")
+    minimum_stretch = float(
+        np.linalg.svd(reciprocal, compute_uv=False)[-1]
+    )
+    bound = _basis_bound(
+        reciprocal, np.zeros(3), 0.5 * float(ecut_ry), minimum_stretch
+    )
+    axis = np.arange(-bound, bound + 1, dtype=np.int32)
+    side = len(axis)
+    yz = np.empty((side, side, 2), dtype=np.int32)
+    yz[..., 0] = axis[:, None]
+    yz[..., 1] = axis[None, :]
+    # A candidate row, its Cartesian vector, energy, and selection mask need
+    # approximately 45 bytes.  Keep at least one complete Miller plane.
+    bytes_per_plane = max(1, side * side * 45)
+    planes_per_chunk = max(1, int(chunk_bytes) // bytes_per_plane)
+    maximum = np.zeros(3, dtype=np.int32)
+    found = False
+    for start in range(0, side, planes_per_chunk):
+        x_values = axis[start : start + planes_per_chunk]
+        candidates = np.empty(
+            (len(x_values), side, side, 3), dtype=np.int32
+        )
+        candidates[..., 0] = x_values[:, None, None]
+        candidates[..., 1:] = yz[None, ...]
+        flat = candidates.reshape(-1, 3)
+        vectors = flat @ reciprocal
+        g2 = np.einsum("ij,ij->i", vectors, vectors)
+        # ``make_bases`` compares 0.5*g2 with 0.5*ecut plus 1e-12.
+        inside = g2 <= float(ecut_ry) + 2.0e-12
+        if np.any(inside):
+            maximum = np.maximum(
+                maximum,
+                np.max(np.abs(flat[inside]), axis=0),
+            )
+            found = True
+    if not found:
+        raise QEInputError("ecutrho produces an empty reciprocal sphere")
+    return maximum
+
+
 def make_bases(
     reciprocal: np.ndarray,
     k_crystal: np.ndarray,
@@ -2207,12 +2264,9 @@ def fft_shape(
         # axis, and uses 2*nb+1 before good_fft_order.  Deriving the grid from
         # wavefunction G-G' spans loses the empty cutoff boundary and produced
         # 30^3 instead of QE's 32^3 for the 40-Ry Si test.
-        charge_basis = make_basis(
-            np.asarray(reciprocal, dtype=float),
-            np.zeros(3),
-            float(ecutrho_ry),
+        maximum_indices = _cutoff_miller_extents(
+            np.asarray(reciprocal, dtype=float), float(ecutrho_ry)
         )
-        maximum_indices = np.max(np.abs(charge_basis.indices), axis=0)
         shape = []
         for value, factor in zip(maximum_indices, fft_factors):
             order = int(2 * value + 1)
