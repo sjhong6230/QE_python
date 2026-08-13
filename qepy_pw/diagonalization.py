@@ -156,6 +156,7 @@ class PlaneWaveHamiltonian:
         real_potential: np.ndarray | None = None,
         native_potential_layout: bool = False,
         potential_average: float | None = None,
+        local_kinetic: np.ndarray | None = None,
     ) -> None:
         self.basis = basis
         self.potential_g = potential_g
@@ -178,12 +179,20 @@ class PlaneWaveHamiltonian:
         )
         self.mpi = self.local_workspace.mpi
         self.local_rows = self.local_workspace.local_plane_wave_indices
-        kinetic = self.basis.kinetic
-        self.local_kinetic = (
-            kinetic[self.local_rows]
-            if self.mpi.size > 1
-            else kinetic
-        )
+        if local_kinetic is None:
+            self.local_kinetic = (
+                self.basis.kinetic_for_rows(self.local_rows)
+                if self.mpi.size > 1
+                else self.basis.kinetic
+            )
+        else:
+            self.local_kinetic = np.asarray(
+                local_kinetic, dtype=np.float64
+            )
+            if self.local_kinetic.shape != (len(self.local_rows),):
+                raise ValueError(
+                    "local kinetic energies do not match the FFT-owned rows"
+                )
         localized_terms: list[ProjectorTerm] = []
         for term in projector_terms:
             if isinstance(term, FactorizedProjectorTerm):

@@ -975,6 +975,17 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
             f"{format_bytes(measured_peak)} (RSS upper bound)",
             file=out,
         )
+    if result.static_cache_limit_bytes_per_rank > 0:
+        print(
+            "     Static k-point cache/rank = "
+            f"{format_bytes(result.static_cache_bytes_per_rank)} "
+            f"({result.static_cache_kpoints}/"
+            f"{len(result.plane_waves_per_k)} k points; limit "
+            f"{format_bytes(result.static_cache_limit_bytes_per_rank)})",
+            file=out,
+        )
+    else:
+        print("     Static k-point cache/rank = disabled", file=out)
     print("\n     init_run     :"
           + _format_timing(result, "init_run"), file=out)
     print("     electrons    :"
@@ -1011,6 +1022,13 @@ def format_footer(pw: PWInput, result: SCFResult) -> str:
         print(f"     {name:<16s}:" + _format_timing(result, name), file=out)
     print("\n     Called by c_bands:", file=out)
     print("     init_us_2    :" + _format_timing(result, "init_us_2"), file=out)
+    for name in (
+        "c_bands:basis",
+        "c_bands:operator",
+        "c_bands:save",
+        "c_bands:cleanup",
+    ):
+        print(f"     {name:<17s}:" + _format_timing(result, name), file=out)
     print("     cegterg      :" + _format_timing(result, "cegterg"), file=out)
     for name in (
         "cdiaghg",

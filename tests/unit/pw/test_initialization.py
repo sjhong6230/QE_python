@@ -8,10 +8,12 @@ import numpy as np
 import pytest
 
 from qepy_pw.basis import LocalPotentialWorkspace
+from qepy_pw.errors import QEInputError
 from qepy_pw.input import read_pw_input
 from qepy_pw.pw.scf import (
     ReciprocalGrid,
     _atomic_starting_density,
+    _static_cache_limit_bytes,
     _starting_charge_scales,
     _starting_magnetizations,
 )
@@ -19,6 +21,26 @@ from qepy_pw.upf import read_upf
 
 
 PSEUDO_DIR = Path(__file__).resolve().parents[2] / "qe_reference" / "upstream" / "pseudo"
+
+
+def test_static_kpoint_cache_limit_is_bounded_and_can_be_disabled(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("QEPY_STATIC_CACHE_LIMIT_MIB", raising=False)
+    assert _static_cache_limit_bytes() == 32 * 1024**2
+    monkeypatch.setenv("QEPY_STATIC_CACHE_LIMIT_MIB", "0")
+    assert _static_cache_limit_bytes() == 0
+    monkeypatch.setenv("QEPY_STATIC_CACHE_LIMIT_MIB", "1.5")
+    assert _static_cache_limit_bytes() == int(1.5 * 1024**2)
+    monkeypatch.setenv("QEPY_STATIC_CACHE_LIMIT_MIB", "invalid")
+    with pytest.raises(QEInputError, match="nonnegative number"):
+        _static_cache_limit_bytes()
+    monkeypatch.setenv("QEPY_STATIC_CACHE_LIMIT_MIB", "-1")
+    with pytest.raises(QEInputError, match="nonnegative number"):
+        _static_cache_limit_bytes()
+    monkeypatch.setenv("QEPY_STATIC_CACHE_LIMIT_MIB", "inf")
+    with pytest.raises(QEInputError, match="nonnegative number"):
+        _static_cache_limit_bytes()
 
 
 def _two_species_input(system: str):

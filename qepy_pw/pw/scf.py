@@ -235,6 +235,16 @@ class KPointProgress:
     cpu_seconds: float | None = None
 
 
+@dataclass(frozen=True)
+class _KPointStaticHamiltonianData:
+    """Memory-bounded, SCF-invariant data for one rank and k point."""
+
+    local_vectors: np.ndarray
+    local_kinetic: np.ndarray
+    projector_terms: tuple[ProjectorTerm, ...]
+    nbytes: int
+
+
 @dataclass
 class SCFResult:
     """Physical result and restart/reporting data returned by :func:`run_scf`."""
@@ -251,6 +261,9 @@ class SCFResult:
     peak_rss_bytes_all_ranks: int = 0
     peak_sampled_pss_bytes_all_ranks: int = 0
     timings: dict[str, TimingEntry] = field(default_factory=dict)
+    static_cache_kpoints: int = 0
+    static_cache_bytes_per_rank: int = 0
+    static_cache_limit_bytes_per_rank: int = 0
     forces_ha_per_bohr: np.ndarray | None = None
     stress_ha_per_bohr3: np.ndarray | None = None
     force_terms: SCFForceTerms | None = None
@@ -653,14 +666,18 @@ def _nonlocal_projector_terms(
     factorized: bool = False,
     packed: bool = False,
     local_rows: np.ndarray | None = None,
+    local_vectors: np.ndarray | None = None,
 ) -> tuple[ProjectorTerm, ...]:
     """Build the compact atom-projector representation of the nonlocal term."""
-    basis_vectors = basis.vectors
     if factorized or packed:
         vectors = (
-            basis_vectors
-            if local_rows is None
-            else basis_vectors[local_rows]
+            np.asarray(local_vectors, dtype=np.float64)
+            if local_vectors is not None
+            else (
+                basis.vectors
+                if local_rows is None
+                else basis.vectors_for_rows(local_rows)
+            )
         )
         layouts = []
         for species in pw.species:
@@ -760,6 +777,7 @@ def _nonlocal_projector_terms(
             )
         return tuple(terms)
     terms: list[ProjectorTerm] = []
+    basis_vectors = basis.vectors
     for atom in pw.atoms:
         pseudo = pseudos[atom.label]
         beta, coupling = pseudo.atomic_projectors(
@@ -768,6 +786,41 @@ def _nonlocal_projector_terms(
         if beta.shape[1]:
             terms.append((beta, coupling))
     return tuple(terms)
+
+
+def _projector_terms_nbytes(terms: tuple[ProjectorTerm, ...]) -> int:
+    """Count unique NumPy owners retained by projector terms."""
+    arrays: list[np.ndarray] = []
+    for term in terms:
+        if isinstance(term, FactorizedProjectorTerm):
+            arrays.extend((term.beta, term.phases, term.coupling))
+        elif isinstance(term, PackedProjectorTerm):
+            arrays.extend((term.beta, term.coupling, term.diagonal))
+        else:
+            arrays.extend(term)
+    owners: dict[int, np.ndarray] = {}
+    for array in arrays:
+        owner = np.asarray(array)
+        while isinstance(owner.base, np.ndarray):
+            owner = owner.base
+        owners[id(owner)] = owner
+    return sum(array.nbytes for array in owners.values())
+
+
+def _static_cache_limit_bytes() -> int:
+    """Return the per-rank cap for invariant k-point Hamiltonian data."""
+    raw = os.environ.get("QEPY_STATIC_CACHE_LIMIT_MIB", "32").strip()
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise QEInputError(
+            "QEPY_STATIC_CACHE_LIMIT_MIB must be a nonnegative number"
+        ) from exc
+    if not np.isfinite(value) or value < 0.0:
+        raise QEInputError(
+            "QEPY_STATIC_CACHE_LIMIT_MIB must be a nonnegative number"
+        )
+    return int(value * 1024.0**2)
 
 
 def _local_projector_terms(
@@ -833,6 +886,8 @@ def _atomic_starting_orbitals(
     local_rows: np.ndarray | None = None,
     mpi: MPIContext | None = None,
     starting_wfc: str | None = None,
+    local_vectors: np.ndarray | None = None,
+    local_kinetic: np.ndarray | None = None,
 ) -> np.ndarray:
     """Build QE ``atomic+random`` trial vectors for the first diagonalization."""
     starting_wfc = str(
@@ -845,13 +900,23 @@ def _atomic_starting_orbitals(
             f"startingwfc={starting_wfc!r} is not ported"
         )
     basis_vectors = (
-        basis.vectors
-        if local_rows is None
-        else basis.vectors[np.asarray(local_rows, dtype=np.int32)]
+        np.asarray(local_vectors, dtype=np.float64)
+        if local_vectors is not None
+        else (
+            basis.vectors
+            if local_rows is None
+            else basis.vectors_for_rows(local_rows)
+        )
     )
-    kinetic = 0.5 * np.einsum(
-        "ij,ij->i", basis_vectors, basis_vectors
+    kinetic = (
+        np.asarray(local_kinetic, dtype=np.float64)
+        if local_kinetic is not None
+        else 0.5 * np.einsum(
+            "ij,ij->i", basis_vectors, basis_vectors
+        )
     )
+    if kinetic.shape != (len(basis_vectors),):
+        raise ValueError("local kinetic energies do not match local vectors")
     blocks = []
     if starting_wfc != "random":
         centered_by_label: dict[str, np.ndarray] = {}
@@ -898,17 +963,17 @@ def _atomic_starting_orbitals(
             kinetic,
             random_stream,
             global_plane_waves=(
-                len(basis.vectors) if local_rows is not None else None
+                len(basis) if local_rows is not None else None
             ),
             rows=local_rows,
         )
     elif trials.shape[1] < number_of_bands:
         missing = number_of_bands - trials.shape[1]
         amplitude, phase_fraction = (
-            random_stream.pairs_by_band(len(basis.vectors), missing)
+            random_stream.pairs_by_band(len(basis), missing)
             if local_rows is None
             else random_stream.pairs_by_band_rows(
-                len(basis.vectors), missing, local_rows
+                len(basis), missing, local_rows
             )
         )
         phase = np.exp(
@@ -1623,13 +1688,13 @@ def _nonlocal_derivatives(
     for compact_basis, vectors, weight, workspace, band_occupations in zip(
         bases, eigenvectors, weights, workspaces, occupations
     ):
-        basis = compact_basis.materialize()
+        basis = compact_basis
         local_rows = (
             workspace.local_plane_wave_indices
             if mpi.size > 1
-            else np.arange(len(basis.indices))
+            else np.arange(len(basis))
         )
-        gk = basis.vectors[local_rows]
+        gk = basis.vectors_for_rows(local_rows)
         active = np.flatnonzero(np.abs(band_occupations) > 1.0e-15)
         if active.size == 0:
             continue
@@ -1791,13 +1856,13 @@ def _hellmann_feynman_stress(
     for compact_basis, vectors, weight, workspace, band_occupations in zip(
         bases, eigenvectors, weights, local_workspaces, occupations
     ):
-        basis = compact_basis.materialize()
+        basis = compact_basis
         local_rows = (
             workspace.local_plane_wave_indices
             if mpi.size > 1
-            else np.arange(len(basis.indices))
+            else np.arange(len(basis))
         )
-        gk = basis.vectors[local_rows]
+        gk = basis.vectors_for_rows(local_rows)
         band_count = len(band_occupations)
         active_vectors = vectors[:, :band_count]
         if (
@@ -3358,6 +3423,11 @@ def _run_scf(
             gamma_only=gamma_half_enabled,
         )
     qe_random = _QERandom()
+    static_cache_limit = _static_cache_limit_bytes()
+    static_cache_bytes = 0
+    static_hamiltonian_data: list[
+        _KPointStaticHamiltonianData | None
+    ] = [None] * len(bases)
     requested_diago_thr = pw.electrons.get("diago_thr_init")
     if requested_diago_thr is not None:
         diago_thr_ry = float(requested_diago_thr)
@@ -3598,8 +3668,13 @@ def _run_scf(
                 progress(
                     "kpoint_start", KPointProgress(kpoint_index + 1)
                 )
-            basis = compact_basis.materialize()
             local_workspace = local_workspaces[kpoint_index]
+            if diagonalization == "dense":
+                basis_started = timers.start()
+                basis = compact_basis.materialize()
+                timers.stop("c_bands:basis", basis_started)
+            else:
+                basis = compact_basis
             spin_index = (
                 int(pw.kpoint_spins[kpoint_index]) - 1 if lsda else 0
             )
@@ -3642,20 +3717,53 @@ def _run_scf(
                 hamiltonian_applications.append(1)
                 eigen_residuals.append(0.0)
             else:
-                init_us_started = timers.start()
-                projector_terms = _nonlocal_projector_terms(
-                    pw,
-                    pseudo_by_label,
-                    basis,
-                    factorized=True,
-                    packed=True,
-                    local_rows=(
+                static_data = static_hamiltonian_data[kpoint_index]
+                if static_data is None:
+                    local_rows = (
                         local_workspace.local_plane_wave_indices
                         if mpi.size > 1
                         else None
-                    ),
-                )
-                timers.stop("init_us_2", init_us_started)
+                    )
+                    basis_started = timers.start()
+                    local_vectors = (
+                        basis.vectors
+                        if local_rows is None
+                        else basis.vectors_for_rows(local_rows)
+                    )
+                    local_kinetic = 0.5 * np.einsum(
+                        "ij,ij->i", local_vectors, local_vectors
+                    )
+                    timers.stop("c_bands:basis", basis_started)
+                    init_us_started = timers.start()
+                    projector_terms = _nonlocal_projector_terms(
+                        pw,
+                        pseudo_by_label,
+                        basis,
+                        factorized=True,
+                        packed=True,
+                        local_rows=local_rows,
+                        local_vectors=local_vectors,
+                    )
+                    timers.stop("init_us_2", init_us_started)
+                    static_nbytes = (
+                        local_vectors.nbytes
+                        + local_kinetic.nbytes
+                        + _projector_terms_nbytes(projector_terms)
+                    )
+                    static_data = _KPointStaticHamiltonianData(
+                        local_vectors,
+                        local_kinetic,
+                        projector_terms,
+                        static_nbytes,
+                    )
+                    if (
+                        static_cache_bytes + static_nbytes
+                        <= static_cache_limit
+                    ):
+                        static_hamiltonian_data[kpoint_index] = static_data
+                        static_cache_bytes += static_nbytes
+                projector_terms = static_data.projector_terms
+                operator_started = timers.start()
                 full_operator = PlaneWaveHamiltonian(
                     basis,
                     active_v_eff_g,
@@ -3671,6 +3779,7 @@ def _run_scf(
                     # ionic local potential, not the average total effective
                     # potential used by H|psi>.
                     potential_average=v_ion_average,
+                    local_kinetic=static_data.local_kinetic,
                 )
                 gamma_map = local_workspace.gamma_map
                 operator = (
@@ -3678,6 +3787,7 @@ def _run_scf(
                     if gamma_map is not None
                     else full_operator
                 )
+                timers.stop("c_bands:operator", operator_started)
                 trial_vectors = (
                     wavefunction_buffer[kpoint_index]
                     if wavefunction_buffer is not None
@@ -3688,6 +3798,12 @@ def _run_scf(
                 trial_applied = None
                 if trial_vectors is None:
                     wfcinit_started = timers.start()
+                    starting_local_rows = (
+                        full_operator.local_rows
+                        if mpi.size > 1
+                        and pw.full_kpoint_count > len(pw.kpoints)
+                        else None
+                    )
                     starting = _atomic_starting_orbitals(
                         pw,
                         pseudo_by_label,
@@ -3699,12 +3815,7 @@ def _run_scf(
                         # distributed starting subspace is the exact row slice
                         # of the serial one, without allocating its global
                         # wavefunction matrix on every rank.
-                        local_rows=(
-                            full_operator.local_rows
-                            if mpi.size > 1
-                            and pw.full_kpoint_count > len(pw.kpoints)
-                            else None
-                        ),
+                        local_rows=starting_local_rows,
                         mpi=(
                             mpi
                             if mpi.size > 1
@@ -3712,6 +3823,18 @@ def _run_scf(
                             else None
                         ),
                         starting_wfc=starting_wavefunctions,
+                        local_vectors=(
+                            static_data.local_vectors
+                            if mpi.size == 1
+                            or starting_local_rows is not None
+                            else None
+                        ),
+                        local_kinetic=(
+                            static_data.local_kinetic
+                            if mpi.size == 1
+                            or starting_local_rows is not None
+                            else None
+                        ),
                     )
                     if mpi.size > 1 and starting.shape[0] == len(basis):
                         starting = starting[
@@ -3733,6 +3856,7 @@ def _run_scf(
                             real_potential=active_v_eff_local,
                             native_potential_layout=True,
                             potential_average=v_ion_average,
+                            local_kinetic=static_data.local_kinetic,
                         )
                         rotation_gamma_map = rotation_workspace.gamma_map
                         rotation_operator = (
@@ -3942,6 +4066,7 @@ def _run_scf(
                     float(np.max(solution.residual_norms))
                 )
             eigenvalues.append(values)
+            save_started = timers.start()
             if wavefunction_buffer is not None:
                 # c_bands saves every freshly diagonalized k point
                 # immediately. Subsequent consumers obtain it through
@@ -3951,7 +4076,9 @@ def _run_scf(
                 assert isinstance(eigenvectors, list)
                 eigenvectors.append(vectors)
                 previous_eigenvectors[kpoint_index] = vectors
+            timers.stop("c_bands:save", save_started)
             if diagonalization != "dense":
+                cleanup_started = timers.start()
                 del (
                     operator,
                     full_operator,
@@ -3960,7 +4087,9 @@ def _run_scf(
                     trial_vectors,
                     trial_eigenvalues,
                     trial_applied,
+                    static_data,
                 )
+                timers.stop("c_bands:cleanup", cleanup_started)
             if report_kpoints and progress is not None:
                 # QE reports completion after save_buffer and flushes stdout,
                 # so the displayed CPU time means this k point is durable.
@@ -4066,6 +4195,11 @@ def _run_scf(
                     peak_sampled_pss_all_ranks
                 ),
                 timings=timers.snapshot(),
+                static_cache_kpoints=sum(
+                    item is not None for item in static_hamiltonian_data
+                ),
+                static_cache_bytes_per_rank=static_cache_bytes,
+                static_cache_limit_bytes_per_rank=static_cache_limit,
                 occupations=[values.copy() for values in band_occupations],
                 fermi_energy_ha=fermi_energy,
                 mpi_processes=mpi.size,
@@ -4600,6 +4734,11 @@ def _run_scf(
                     peak_sampled_pss_all_ranks
                 ),
                 timings=timers.snapshot(),
+                static_cache_kpoints=sum(
+                    item is not None for item in static_hamiltonian_data
+                ),
+                static_cache_bytes_per_rank=static_cache_bytes,
+                static_cache_limit_bytes_per_rank=static_cache_limit,
                 forces_ha_per_bohr=forces_ha_per_bohr,
                 stress_ha_per_bohr3=stress_ha_per_bohr3,
                 force_terms=force_terms,
@@ -4668,6 +4807,11 @@ def _run_scf(
         peak_rss_bytes_all_ranks=peak_all_ranks,
         peak_sampled_pss_bytes_all_ranks=peak_sampled_pss_all_ranks,
         timings=timers.snapshot(),
+        static_cache_kpoints=sum(
+            item is not None for item in static_hamiltonian_data
+        ),
+        static_cache_bytes_per_rank=static_cache_bytes,
+        static_cache_limit_bytes_per_rank=static_cache_limit,
         occupations=[values.copy() for values in band_occupations],
         fermi_energy_ha=fermi_energy,
         mpi_processes=mpi.size,

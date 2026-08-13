@@ -40,6 +40,17 @@ def test_compact_plane_wave_basis_materializes_catalog_mapping() -> None:
     np.testing.assert_array_equal(materialized.indices, basis.indices)
     np.testing.assert_allclose(materialized.vectors, basis.vectors)
 
+    rows = np.asarray([1], dtype=np.int32)
+    np.testing.assert_array_equal(
+        basis.indices_for_rows(rows), basis.indices[rows]
+    )
+    np.testing.assert_allclose(
+        basis.vectors_for_rows(rows), basis.vectors[rows]
+    )
+    np.testing.assert_allclose(
+        basis.kinetic_for_rows(rows), basis.kinetic[rows]
+    )
+
 
 def test_plane_wave_mapping_rejects_indices_outside_catalog() -> None:
     catalog = PlaneWaveCatalog(np.zeros((1, 3), dtype=np.int32), np.eye(3))

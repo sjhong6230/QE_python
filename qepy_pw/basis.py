@@ -187,6 +187,34 @@ class PlaneWaveBasis:
         vectors = self.vectors
         return 0.5 * np.einsum("ij,ij->i", vectors, vectors)
 
+    def indices_for_rows(self, rows: np.ndarray) -> np.ndarray:
+        """Materialize only selected Miller rows of a compact basis."""
+        selected = np.asarray(rows, dtype=np.int64)
+        if self.catalog is None:
+            assert self._legacy_indices is not None
+            return self._legacy_indices[selected]
+        assert self.global_indices is not None
+        return self.catalog.indices[self.global_indices[selected]]
+
+    def vectors_for_rows(self, rows: np.ndarray) -> np.ndarray:
+        """Materialize only selected ``G+k`` rows of a compact basis."""
+        selected = np.asarray(rows, dtype=np.int64)
+        if self.catalog is None:
+            assert self._legacy_vectors is not None
+            return self._legacy_vectors[selected]
+        assert self.global_indices is not None
+        assert self.k_crystal is not None
+        catalog_rows = self.global_indices[selected]
+        return (
+            self.catalog.vectors[catalog_rows]
+            + self.k_crystal @ self.catalog.reciprocal
+        )
+
+    def kinetic_for_rows(self, rows: np.ndarray) -> np.ndarray:
+        """Return kinetic energies for selected rows without a full basis."""
+        vectors = self.vectors_for_rows(rows)
+        return 0.5 * np.einsum("ij,ij->i", vectors, vectors)
+
     def __len__(self) -> int:
         return len(self.indices)
 
