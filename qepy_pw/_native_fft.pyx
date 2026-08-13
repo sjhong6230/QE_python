@@ -899,6 +899,237 @@ def qe_precondition(
     return output
 
 
+def qe_precondition_normalized_selected(
+    cnp.ndarray residuals,
+    cnp.ndarray eigenvalues,
+    cnp.ndarray diagonal,
+    cnp.ndarray selected,
+):
+    """Precondition and normalize selected roots for serial Davidson."""
+    cdef Py_ssize_t nrows = residuals.shape[0]
+    cdef Py_ssize_t nbands = selected.size
+    cdef Py_ssize_t source_bands = residuals.shape[1]
+    cdef Py_ssize_t g, b, source_band
+    cdef Py_ssize_t rs0 = residuals.strides[0] // 16
+    cdef Py_ssize_t rs1 = residuals.strides[1] // 16
+    cdef cnp.ndarray output = np.empty(
+        (nrows, nbands), dtype=np.complex128, order="F"
+    )
+    cdef cnp.ndarray squared_norms = np.zeros(nbands, dtype=np.float64)
+    cdef double complex *source
+    cdef double complex *target
+    cdef double *values
+    cdef double *kinetic
+    cdef double *norms
+    cdef int64_t *columns
+    cdef double complex value
+    cdef double x_ry, denominator, squared_norm, inverse_norm
+    if residuals.ndim != 2 or residuals.dtype != np.complex128:
+        raise ValueError("residuals must be a complex128 matrix")
+    if (
+        eigenvalues.ndim != 1
+        or eigenvalues.dtype != np.float64
+        or not eigenvalues.flags.c_contiguous
+        or eigenvalues.size != source_bands
+    ):
+        raise ValueError("eigenvalues must match residual columns")
+    if (
+        diagonal.ndim != 1
+        or diagonal.dtype != np.float64
+        or not diagonal.flags.c_contiguous
+        or diagonal.size != nrows
+    ):
+        raise ValueError("diagonal must be contiguous float64")
+    if selected.dtype != np.int64 or not selected.flags.c_contiguous:
+        raise ValueError("selected roots must be contiguous int64")
+    source = <double complex *>cnp.PyArray_DATA(residuals)
+    target = <double complex *>cnp.PyArray_DATA(output)
+    values = <double *>cnp.PyArray_DATA(eigenvalues)
+    kinetic = <double *>cnp.PyArray_DATA(diagonal)
+    norms = <double *>cnp.PyArray_DATA(squared_norms)
+    columns = <int64_t *>cnp.PyArray_DATA(selected)
+    # For the small-band serial path a plain loop is materially cheaper than
+    # entering three OpenMP regions for every k point and Davidson step.  It
+    # also traverses each selected column only twice instead of the separate
+    # precondition, norm, and normalized-copy passes used by the generic MPI
+    # path.
+    with nogil:
+        for b in range(nbands):
+            source_band = columns[b]
+            if source_band < 0 or source_band >= source_bands:
+                with gil:
+                    raise ValueError("selected root is out of range")
+            squared_norm = 0.0
+            for g in range(nrows):
+                x_ry = 2.0 * (kinetic[g] - values[source_band])
+                denominator = 0.5 * (
+                    1.0
+                    + x_ry
+                    + sqrt(1.0 + (x_ry - 1.0) * (x_ry - 1.0))
+                )
+                value = (
+                    2.0 * source[g * rs0 + source_band * rs1] / denominator
+                )
+                target[g + b * nrows] = value
+                squared_norm = squared_norm + (
+                    creal(value) * creal(value) + cimag(value) * cimag(value)
+                )
+            norms[b] = squared_norm
+            if squared_norm > 0.0:
+                inverse_norm = 1.0 / sqrt(squared_norm)
+                for g in range(nrows):
+                    target[g + b * nrows] = (
+                        target[g + b * nrows] * inverse_norm
+                    )
+    return output, squared_norms
+
+
+def davidson_projected_rows(
+    cnp.ndarray new_basis,
+    cnp.ndarray applied_basis,
+    cnp.ndarray basis,
+):
+    """Return ``new_basis**H @ (applied_basis, basis)`` without copies."""
+    cdef long long nrows
+    cdef long long nnew
+    cdef long long nactive
+    cdef cnp.ndarray h_rows
+    cdef cnp.ndarray s_rows
+    cdef double complex alpha = 1.0
+    cdef double complex zero = 0.0
+    cdef int h_status
+    cdef int s_status
+    if (
+        new_basis.ndim != 2
+        or applied_basis.ndim != 2
+        or basis.ndim != 2
+        or new_basis.dtype != np.complex128
+        or applied_basis.dtype != np.complex128
+        or basis.dtype != np.complex128
+        or new_basis.shape[0] != applied_basis.shape[0]
+        or new_basis.shape[0] != basis.shape[0]
+        or applied_basis.shape[0] != basis.shape[0]
+        or applied_basis.shape[1] != basis.shape[1]
+    ):
+        raise ValueError("Davidson projected-matrix operands disagree")
+    # The Davidson owner arrays are column-major.  Calling CBLAS with
+    # ConjTrans consumes that layout directly and, unlike ``a.conj().T @ b``,
+    # does not allocate and populate an Npw-by-Nnew conjugated temporary.
+    if (
+        not new_basis.flags.f_contiguous
+        or not applied_basis.flags.f_contiguous
+        or not basis.flags.f_contiguous
+    ):
+        return None
+    nrows = new_basis.shape[0]
+    nnew = new_basis.shape[1]
+    nactive = basis.shape[1]
+    h_rows = np.empty((nnew, nactive), dtype=np.complex128, order="F")
+    s_rows = np.empty_like(h_rows, order="F")
+    with nogil:
+        h_status = qepy_zgemm64(
+            102, 113, 111,
+            nnew, nactive, nrows,
+            &alpha,
+            <double complex *>cnp.PyArray_DATA(new_basis), nrows,
+            <double complex *>cnp.PyArray_DATA(applied_basis), nrows,
+            &zero,
+            <double complex *>cnp.PyArray_DATA(h_rows), nnew,
+        )
+        s_status = qepy_zgemm64(
+            102, 113, 111,
+            nnew, nactive, nrows,
+            &alpha,
+            <double complex *>cnp.PyArray_DATA(new_basis), nrows,
+            <double complex *>cnp.PyArray_DATA(basis), nrows,
+            &zero,
+            <double complex *>cnp.PyArray_DATA(s_rows), nnew,
+        )
+    if h_status != 0 or s_status != 0:
+        return None
+    return h_rows, s_rows
+
+
+def davidson_residual(
+    cnp.ndarray basis,
+    cnp.ndarray applied_basis,
+    cnp.ndarray coefficients,
+    cnp.ndarray eigenvalues,
+):
+    """Form ``Hbasis*C - basis*C*e`` in one BLAS-owned result."""
+    cdef long long nrows
+    cdef long long nactive
+    cdef long long nroots
+    cdef Py_ssize_t column, row
+    cdef cnp.ndarray scaled
+    cdef cnp.ndarray output
+    cdef double complex *source
+    cdef double complex *target
+    cdef double *roots
+    cdef double complex one = 1.0
+    cdef double complex minus_one = -1.0
+    cdef double complex zero = 0.0
+    cdef int first_status
+    cdef int second_status
+    if (
+        basis.ndim != 2
+        or applied_basis.ndim != 2
+        or coefficients.ndim != 2
+        or eigenvalues.ndim != 1
+        or basis.dtype != np.complex128
+        or applied_basis.dtype != np.complex128
+        or coefficients.dtype != np.complex128
+        or eigenvalues.dtype != np.float64
+        or basis.shape[0] != applied_basis.shape[0]
+        or basis.shape[1] != applied_basis.shape[1]
+        or basis.shape[1] != coefficients.shape[0]
+        or coefficients.shape[1] != eigenvalues.size
+    ):
+        raise ValueError("Davidson residual operands disagree")
+    if (
+        not basis.flags.f_contiguous
+        or not applied_basis.flags.f_contiguous
+        or not coefficients.flags.f_contiguous
+        or not eigenvalues.flags.c_contiguous
+    ):
+        return None
+    nrows = basis.shape[0]
+    nactive = basis.shape[1]
+    nroots = coefficients.shape[1]
+    scaled = np.empty_like(coefficients, order="F")
+    output = np.empty((nrows, nroots), dtype=np.complex128, order="F")
+    source = <double complex *>cnp.PyArray_DATA(coefficients)
+    target = <double complex *>cnp.PyArray_DATA(scaled)
+    roots = <double *>cnp.PyArray_DATA(eigenvalues)
+    with nogil:
+        for column in range(nroots):
+            for row in range(nactive):
+                target[row + column * nactive] = (
+                    source[row + column * nactive] * roots[column]
+                )
+        first_status = qepy_zgemm64(
+            102, 111, 111,
+            nrows, nroots, nactive,
+            &one,
+            <double complex *>cnp.PyArray_DATA(applied_basis), nrows,
+            <double complex *>cnp.PyArray_DATA(coefficients), nactive,
+            &zero,
+            <double complex *>cnp.PyArray_DATA(output), nrows,
+        )
+        second_status = qepy_zgemm64(
+            102, 111, 111,
+            nrows, nroots, nactive,
+            &minus_one,
+            <double complex *>cnp.PyArray_DATA(basis), nrows,
+            <double complex *>cnp.PyArray_DATA(scaled), nactive,
+            &one,
+            <double complex *>cnp.PyArray_DATA(output), nrows,
+        )
+    if first_status != 0 or second_status != 0:
+        return None
+    return output
+
+
 def tetrahedron_integrated_sum(cnp.ndarray sorted_energies, double energy):
     """Sum QE's integrated linear-tetrahedron fractions without temporaries."""
     cdef Py_ssize_t count, index

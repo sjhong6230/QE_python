@@ -837,8 +837,14 @@ def davidson(
         ):
             new_basis = basis[:, first_new:active_columns]
             if metric is None:
-                h_local = new_basis.conj().T @ applied_basis
-                s_local = new_basis.conj().T @ basis
+                native_rows = _load_native_fft().davidson_projected_rows(
+                    new_basis, applied_basis, basis
+                )
+                if native_rows is None:
+                    h_local = new_basis.conj().T @ applied_basis
+                    s_local = new_basis.conj().T @ basis
+                else:
+                    h_local, s_local = native_rows
             else:
                 h_local = metric.local_gram(new_basis, applied_basis)
                 s_local = metric.local_gram(new_basis, basis)
@@ -917,17 +923,29 @@ def davidson(
             # Ritz-vector matrix is needed only on convergence or refresh;
             # retaining it at every reduced solve costs Npw*Nband complex
             # values.  Bound the short-lived basis-product scratch by rows.
-            residual = _matmul_f(applied_basis, coefficients)
-            scaled = coefficients * roots[None, :]
-            target_bytes = 4 << 20
-            rows_per_chunk = max(
-                1,
-                target_bytes
-                // max(1, residual.shape[1] * residual.itemsize),
+            native = _load_native_fft()
+            residual = (
+                native.davidson_residual(
+                    basis,
+                    applied_basis,
+                    np.asarray(coefficients, dtype=np.complex128, order="F"),
+                    np.ascontiguousarray(roots, dtype=np.float64),
+                )
+                if metric is None
+                else None
             )
-            for start in range(0, residual.shape[0], rows_per_chunk):
-                stop = min(start + rows_per_chunk, residual.shape[0])
-                residual[start:stop] -= basis[start:stop] @ scaled
+            if residual is None:
+                residual = _matmul_f(applied_basis, coefficients)
+                scaled = coefficients * roots[None, :]
+                target_bytes = 4 << 20
+                rows_per_chunk = max(
+                    1,
+                    target_bytes
+                    // max(1, residual.shape[1] * residual.itemsize),
+                )
+                for start in range(0, residual.shape[0], rows_per_chunk):
+                    stop = min(start + rows_per_chunk, residual.shape[0])
+                    residual[start:stop] -= basis[start:stop] @ scaled
         return roots, coefficients, residual
 
     if initial_is_ritz:
@@ -981,22 +999,43 @@ def davidson(
     for iteration in range(1, max_iterations + 1):
         completed_iterations = iteration
         previous_values = values
-        with (
-            timers.measure("g_psi")
-            if timers is not None
-            else nullcontext()
-        ):
-            corrections = _qe_precondition(
-                residuals[:, unconverged],
-                values[unconverged],
-                diagonal,
-            )
-        # QE normalizes each preconditioned residual but deliberately keeps
-        # the correction block nonorthogonal.  The generalized reduced
-        # eigenproblem already contains its overlap matrix; projecting the
-        # corrections against the full Davidson basis adds large BLAS work
-        # and another collective without changing their useful span.
-        corrections = _normalize_columns(corrections, mpi, metric=metric)
+        selected_roots = np.ascontiguousarray(
+            np.flatnonzero(unconverged), dtype=np.int64
+        )
+        if metric is None and mpi.size == 1:
+            with (
+                timers.measure("g_psi")
+                if timers is not None
+                else nullcontext()
+            ):
+                corrections, squared_norms = (
+                    _load_native_fft().qe_precondition_normalized_selected(
+                        np.asarray(residuals, dtype=np.complex128),
+                        np.ascontiguousarray(values, dtype=np.float64),
+                        np.ascontiguousarray(diagonal, dtype=np.float64),
+                        selected_roots,
+                    )
+                )
+            scale = max(float(np.max(squared_norms)), 1.0e-300)
+            keep = squared_norms > 1.0e-28 * scale
+            if not np.all(keep):
+                corrections = np.asfortranarray(corrections[:, keep])
+        else:
+            with (
+                timers.measure("g_psi")
+                if timers is not None
+                else nullcontext()
+            ):
+                corrections = _qe_precondition(
+                    residuals[:, unconverged],
+                    values[unconverged],
+                    diagonal,
+                )
+            # QE normalizes each preconditioned residual but deliberately
+            # keeps the correction block nonorthogonal.  The generalized
+            # problem already contains its overlap matrix; projecting these
+            # vectors against the basis adds work without changing the span.
+            corrections = _normalize_columns(corrections, mpi, metric=metric)
         if corrections.shape[1] == 0:
             break
         old_columns = active_columns
