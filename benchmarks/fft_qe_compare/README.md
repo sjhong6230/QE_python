@@ -35,7 +35,7 @@ not the eigensolver, density, interpreter, or total process memory.
 bands. `Si.heavy.auto.8x8x8.nbnd4.in` raises it to an `8x8x8` automatic grid,
 which symmetry reduces to 29 irreducible points. Their SCF cap is 20 because
 the four-band `2x2x2` trajectory needs 13 iterations to satisfy `1d-8`.
-The optimized multi-k-point runs use the default
-`QEPY_STATIC_CACHE_LIMIT_MIB=32`. The footer reports both the rank-local
-bytes retained and the number of k points admitted by that cap; use `0` for
-the no-cache ablation.
+The documented cached multi-k-point runs explicitly use
+`QEPY_STATIC_CACHE_LIMIT_MIB=32`. The memory-first runtime default is `0`.
+The footer reports both the rank-local bytes retained and the number of k
+points admitted by a positive cap.

@@ -320,9 +320,10 @@ QE 7.5 retains `igk_k(npwx,nks)` and `ngk(nks)` for every local k point, but
 uses one `g2kin(npwx)` kinetic buffer and one `vkb(npwx,nkb)` projector buffer.
 Inside every `c_bands` k loop it calls `g2_kin(ik)` and `init_us_2(...)`,
 overwriting those current-k buffers. The Python cache is therefore more
-aggressive than QE's memory policy. `QEPY_STATIC_CACHE_LIMIT_MIB` defaults to
-32 MiB/rank, accepts `0` to disable reuse, and rejects negative/non-finite
-values. The run footer reports its actual occupancy.
+aggressive than QE's memory policy. `QEPY_STATIC_CACHE_LIMIT_MIB=32` was used
+explicitly for the cached measurements below. Following the memory ablation,
+the runtime uses a memory-first default of `0`; positive values opt into reuse,
+and negative/non-finite values are rejected. The run footer reports occupancy.
 
 ### Cache ablation
 

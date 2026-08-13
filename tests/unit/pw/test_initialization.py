@@ -27,7 +27,7 @@ def test_static_kpoint_cache_limit_is_bounded_and_can_be_disabled(
     monkeypatch,
 ) -> None:
     monkeypatch.delenv("QEPY_STATIC_CACHE_LIMIT_MIB", raising=False)
-    assert _static_cache_limit_bytes() == 32 * 1024**2
+    assert _static_cache_limit_bytes() == 0
     monkeypatch.setenv("QEPY_STATIC_CACHE_LIMIT_MIB", "0")
     assert _static_cache_limit_bytes() == 0
     monkeypatch.setenv("QEPY_STATIC_CACHE_LIMIT_MIB", "1.5")

@@ -98,12 +98,13 @@ export QEPY_FFT_MEMORY_LIMIT_MIB=256
 
 `QEPY_STATIC_CACHE_LIMIT_MIB` caps rank-local, SCF-invariant k-point data
 (local `G+k` geometry, kinetic energies, and packed nonlocal projectors).
-The default is 32 MiB per rank. Reusing these arrays removes per-iteration
-`c_bands` allocation work; set the value to `0` when minimum resident memory
-is more important than setup throughput.
+The memory-first default is `0`, which recomputes current-k data in a single
+working buffer instead of retaining it for every k point. Set a positive
+per-rank limit to trade resident memory for lower per-iteration `c_bands`
+setup time. The footer reports the admitted k-point count and retained bytes.
 
 ```bash
-export QEPY_STATIC_CACHE_LIMIT_MIB=16
+export QEPY_STATIC_CACHE_LIMIT_MIB=32
 ```
 
 `QEPY_FFT_DECOMPOSITION` accepts `auto` (the default), `slab`, or `pencil`.

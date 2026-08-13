@@ -809,7 +809,7 @@ def _projector_terms_nbytes(terms: tuple[ProjectorTerm, ...]) -> int:
 
 def _static_cache_limit_bytes() -> int:
     """Return the per-rank cap for invariant k-point Hamiltonian data."""
-    raw = os.environ.get("QEPY_STATIC_CACHE_LIMIT_MIB", "32").strip()
+    raw = os.environ.get("QEPY_STATIC_CACHE_LIMIT_MIB", "0").strip()
     try:
         value = float(raw)
     except ValueError as exc:
