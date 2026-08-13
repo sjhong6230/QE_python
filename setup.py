@@ -144,7 +144,18 @@ if mkl_available:
         ["-Wl,--no-as-needed", "-lmkl_rt", "-Wl,--as-needed"]
     )
     print("qepy-pw build: using system Intel MKL")
-elif find_library("openblas") is not None:
+else:
+    numpy_library_dir = Path(np.__file__).resolve().parent.parent / "numpy.libs"
+    numpy_bundles_openblas = bool(
+        list(numpy_library_dir.glob("*openblas*.so*"))
+    )
+    force_system_blas = os.environ.get(
+        "QEPY_LINK_SYSTEM_BLAS", "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+if not mkl_available and find_library("openblas") is not None and (
+    force_system_blas or not numpy_bundles_openblas
+):
     numeric_libraries = ["-lopenblas"]
     if find_library("lapacke") is not None:
         numeric_libraries.append("-llapacke")
@@ -155,8 +166,11 @@ elif find_library("openblas") is not None:
         ["-Wl,--no-as-needed", *numeric_libraries, "-Wl,--as-needed"]
     )
     print("qepy-pw build: using system OpenBLAS")
-else:
-    print("qepy-pw build: using NumPy BLAS/LAPACK runtime")
+elif not mkl_available:
+    print(
+        "qepy-pw build: using NumPy BLAS/LAPACK runtime "
+        "(avoids a second OpenBLAS ABI in the process)"
+    )
 
 explicit_mpicc = (
     os.environ.get("MPICC")
