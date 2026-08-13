@@ -20,8 +20,12 @@ def test_native_davidson_projected_rows_match_numpy() -> None:
 
     assert rows is not None
     h_rows, s_rows = rows
-    assert np.allclose(h_rows, new.conj().T @ applied, atol=2.0e-14)
-    assert np.allclose(s_rows, new.conj().T @ basis, atol=2.0e-14)
+    assert np.allclose(
+        h_rows, new.conj().T @ applied, rtol=2.0e-14, atol=2.0e-14
+    )
+    assert np.allclose(
+        s_rows, new.conj().T @ basis, rtol=2.0e-14, atol=2.0e-14
+    )
 
 
 def test_native_davidson_residual_matches_numpy() -> None:
@@ -46,7 +50,7 @@ def test_native_davidson_residual_matches_numpy() -> None:
 
     assert residual is not None
     assert residual.flags.f_contiguous
-    assert np.allclose(residual, expected, atol=3.0e-14)
+    assert np.allclose(residual, expected, rtol=2.0e-14, atol=3.0e-14)
 
 
 def test_native_selected_preconditioner_matches_separate_formula() -> None:
@@ -69,7 +73,7 @@ def test_native_selected_preconditioner_matches_separate_formula() -> None:
     expected = separate / np.sqrt(expected_norms)[None, :]
 
     assert np.allclose(squared_norms, expected_norms, rtol=3.0e-15)
-    assert np.allclose(combined, expected, atol=3.0e-15)
+    assert np.allclose(combined, expected, rtol=3.0e-15, atol=3.0e-15)
 
 
 def test_qe_paro_converges_lowest_matrix_eigenpairs() -> None:
