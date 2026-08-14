@@ -16,11 +16,14 @@ class TimingEntry:
 class _Measurement:
     """Small context manager avoiding generator allocation in hot kernels."""
 
-    __slots__ = ("registry", "name", "cpu_start", "wall_start")
+    __slots__ = ("registry", "name", "calls", "cpu_start", "wall_start")
 
-    def __init__(self, registry: "TimingRegistry", name: str) -> None:
+    def __init__(
+        self, registry: "TimingRegistry", name: str, calls: int = 1
+    ) -> None:
         self.registry = registry
         self.name = name
+        self.calls = calls
         self.cpu_start = 0.0
         self.wall_start = 0.0
 
@@ -32,15 +35,18 @@ class _Measurement:
         entry = self.registry.entries.setdefault(self.name, TimingEntry())
         entry.cpu_seconds += time.process_time() - self.cpu_start
         entry.wall_seconds += time.perf_counter() - self.wall_start
-        entry.calls += 1
+        entry.calls += self.calls
 
 
 class TimingRegistry:
     def __init__(self) -> None:
         self.entries: dict[str, TimingEntry] = {}
 
-    def measure(self, name: str) -> _Measurement:
-        return _Measurement(self, name)
+    def measure(self, name: str, calls: int = 1) -> _Measurement:
+        """Measure one scope representing ``calls`` logical operations."""
+        if calls < 1:
+            raise ValueError("timer calls must be positive")
+        return _Measurement(self, name, calls)
 
     def start(self) -> tuple[float, float]:
         return time.process_time(), time.perf_counter()

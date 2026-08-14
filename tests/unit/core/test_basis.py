@@ -16,6 +16,7 @@ from qepy_pw.basis import (
     make_bases,
     potential_matrix,
 )
+from qepy_pw.timing import TimingRegistry
 
 
 @pytest.mark.parametrize(
@@ -160,6 +161,35 @@ def test_serial_sparse_spatial_fft_matches_full_3d_fft() -> None:
     )
 
     np.testing.assert_allclose(sparse, full, atol=8.0e-13)
+
+
+def test_serial_fftw_timer_counts_qe_logical_band_transforms() -> None:
+    shape = (6, 6, 6)
+    indices = np.asarray(
+        [[0, 0, 0], [1, 0, 0], [-1, 0, 0], [0, 1, 0]],
+        dtype=np.int32,
+    )
+    coefficients = np.asfortranarray(
+        np.arange(12, dtype=float).reshape(4, 3) + 0.25j
+    )
+    timers = TimingRegistry()
+    workspace = LocalPotentialWorkspace(
+        indices,
+        shape,
+        timers=timers,
+        serial_fft_batch_size=1,
+    )
+
+    workspace.apply(np.ones(shape), coefficients)
+    # QE counts one inverse and one forward transform for every Hpsi band.
+    assert timers.entries["fftw"].calls == 2 * coefficients.shape[1]
+
+    density = np.zeros(shape)
+    workspace.accumulate_density(
+        density, coefficients, np.ones(coefficients.shape[1])
+    )
+    # Density construction adds one inverse transform per occupied band.
+    assert timers.entries["fftw"].calls == 3 * coefficients.shape[1]
 
 
 def test_fft_scratch_pool_reuses_and_grows_named_storage() -> None:

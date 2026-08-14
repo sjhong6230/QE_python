@@ -59,3 +59,18 @@ def test_timing_registry_accumulates_calls_and_snapshot_is_independent(monkeypat
     registry.entries["fft"].calls += 1
     assert snapshot["fft"].calls == 4
 
+
+def test_timing_registry_counts_batched_logical_operations(monkeypatch) -> None:
+    cpu = iter([3.0, 3.5])
+    wall = iter([30.0, 31.25])
+    monkeypatch.setattr(timing_module.time, "process_time", lambda: next(cpu))
+    monkeypatch.setattr(timing_module.time, "perf_counter", lambda: next(wall))
+    registry = TimingRegistry()
+
+    with registry.measure("fftw", calls=8):
+        pass
+
+    assert registry.entries["fftw"].cpu_seconds == pytest.approx(0.5)
+    assert registry.entries["fftw"].wall_seconds == pytest.approx(1.25)
+    assert registry.entries["fftw"].calls == 8
+

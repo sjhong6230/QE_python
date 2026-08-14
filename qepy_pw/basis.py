@@ -1437,11 +1437,6 @@ class LocalPotentialWorkspace:
         ):
             self.gamma_map.accumulate_density(density, vectors, weights)
             return
-        timer = (
-            self.timers.measure("fftw")
-            if self.timers is not None
-            else nullcontext()
-        )
         if self.mpi.size == 1:
             batch_size = min(
                 number_of_vectors,
@@ -1456,6 +1451,11 @@ class LocalPotentialWorkspace:
                 )
                 if self.thread_count > 1 and active < self.thread_count:
                     z_plan, xy_plan = self._serial_spatial_plans(grid)
+                    timer = (
+                        self.timers.measure("fftw", calls=active)
+                        if self.timers is not None
+                        else nullcontext()
+                    )
                     with timer:
                         self._native_fft.accumulate_density_serial_spatial(
                             density,
@@ -1479,6 +1479,11 @@ class LocalPotentialWorkspace:
                         grid_stride,
                         parallel_bands=parallel_bands,
                     )
+                    timer = (
+                        self.timers.measure("fftw", calls=active)
+                        if self.timers is not None
+                        else nullcontext()
+                    )
                     with timer:
                         self._native_fft.accumulate_density_serial(
                             density,
@@ -1498,6 +1503,12 @@ class LocalPotentialWorkspace:
             )
             for start in range(0, number_of_vectors, batch_size):
                 stop = min(start + batch_size, number_of_vectors)
+                active = stop - start
+                timer = (
+                    self.timers.measure("fftw", calls=active)
+                    if self.timers is not None
+                    else nullcontext()
+                )
                 with timer:
                     z_pencil = self._coefficients_to_z_pencil(
                         vectors[:, start:stop]
@@ -1566,6 +1577,11 @@ class LocalPotentialWorkspace:
                         else None
                     ),
                     preserve_values=False,
+                )
+                timer = (
+                    self.timers.measure("fftw", calls=active)
+                    if self.timers is not None
+                    else nullcontext()
                 )
                 with timer:
                     self._native_fft.accumulate_density_distributed(
@@ -1655,7 +1671,11 @@ class LocalPotentialWorkspace:
         if result.shape != vectors.shape or result.dtype != np.complex128:
             raise ValueError("local-potential output has the wrong shape or dtype")
         timer = (
-            self.timers.measure("fftw")
+            # QE's wave timer counts the inverse and forward transform of
+            # every band separately.  The native kernel keeps the complete
+            # Hpsi block in one timing scope, so weight that scope by the
+            # equivalent number of logical transforms.
+            self.timers.measure("fftw", calls=2 * number_of_vectors)
             if self.timers is not None
             else nullcontext()
         )
