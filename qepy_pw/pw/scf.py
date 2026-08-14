@@ -3839,7 +3839,6 @@ def _run_scf(
                     starting_local_rows = (
                         full_operator.local_rows
                         if mpi.size > 1
-                        and pw.full_kpoint_count > len(pw.kpoints)
                         else None
                     )
                     starting = _atomic_starting_orbitals(
@@ -3856,8 +3855,7 @@ def _run_scf(
                         local_rows=starting_local_rows,
                         mpi=(
                             mpi
-                            if mpi.size > 1
-                            and pw.full_kpoint_count > len(pw.kpoints)
+                            if starting_local_rows is not None
                             else None
                         ),
                         starting_wfc=starting_wavefunctions,

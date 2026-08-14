@@ -7,11 +7,13 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from qepy_pw.basis import LocalPotentialWorkspace
+from qepy_pw.basis import LocalPotentialWorkspace, PlaneWaveBasis
 from qepy_pw.errors import QEInputError
 from qepy_pw.input import read_pw_input
 from qepy_pw.pw.scf import (
     ReciprocalGrid,
+    _QERandom,
+    _atomic_starting_orbitals,
     _atomic_starting_density,
     _scf_force_correction,
     _static_cache_limit_bytes,
@@ -23,6 +25,73 @@ from qepy_pw.upf import read_upf
 
 
 PSEUDO_DIR = Path(__file__).resolve().parents[2] / "qe_reference" / "upstream" / "pseudo"
+
+
+class _UsableLocalTrialsMPI:
+    def sum_array(self, value: np.ndarray) -> np.ndarray:
+        return np.ones_like(value)
+
+
+class _SyntheticAtomicOrbitals:
+    def atomic_orbital_basis(
+        self, vectors: np.ndarray, _volume: float
+    ) -> np.ndarray:
+        radius = np.linalg.norm(vectors, axis=1)
+        return np.column_stack(
+            (
+                np.exp(-0.2 * radius),
+                vectors[:, 0] * np.exp(-0.3 * radius),
+                vectors[:, 1] * np.exp(-0.3 * radius),
+                vectors[:, 2] * np.exp(-0.3 * radius),
+            )
+        )
+
+
+def test_rank_local_atomic_starting_orbitals_match_global_rows() -> None:
+    indices = np.array(
+        [
+            (gx, gy, gz)
+            for gx in range(-2, 3)
+            for gy in range(-2, 3)
+            for gz in range(-2, 3)
+            if gx * gx + gy * gy + gz * gz <= 5
+        ],
+        dtype=np.int32,
+    )
+    vectors = indices.astype(float)
+    basis = PlaneWaveBasis(
+        indices,
+        vectors,
+        0.5 * np.einsum("gi,gi->g", vectors, vectors),
+    )
+    pw = SimpleNamespace(
+        atoms=[SimpleNamespace(label="X", position=np.array([0.2, 0.3, 0.4]))],
+        electrons={},
+        volume=31.0,
+    )
+    pseudos = {"X": _SyntheticAtomicOrbitals()}
+    global_stream = _QERandom()
+    global_trials = _atomic_starting_orbitals(
+        pw, pseudos, basis, 4, global_stream
+    )
+    rows = np.arange(1, len(basis), 3, dtype=np.int32)
+    local_stream = _QERandom()
+    local_trials = _atomic_starting_orbitals(
+        pw,
+        pseudos,
+        basis,
+        4,
+        local_stream,
+        local_rows=rows,
+        mpi=_UsableLocalTrialsMPI(),
+        local_vectors=vectors[rows],
+        local_kinetic=basis.kinetic[rows],
+    )
+
+    np.testing.assert_allclose(
+        local_trials, global_trials[rows], rtol=0.0, atol=2.0e-16
+    )
+    assert local_stream.random() == global_stream.random()
 
 
 def test_static_kpoint_cache_limit_is_bounded_and_can_be_disabled(
