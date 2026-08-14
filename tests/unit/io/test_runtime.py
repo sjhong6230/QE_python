@@ -7,7 +7,7 @@ import qepy_pw.timing as timing_module
 from qepy_pw.errors import QEInputError
 from qepy_pw.memory import format_bytes
 from qepy_pw.mpi import MPIContext
-from qepy_pw.threads import hybrid_thread_count
+from qepy_pw.threads import hybrid_thread_count, thread_environment_warning
 from qepy_pw.timing import TimingRegistry
 
 
@@ -40,6 +40,17 @@ def test_thread_count_honors_qepy_precedence_and_openmp_lists(monkeypatch) -> No
     monkeypatch.setenv("QEPY_NUM_THREADS", "0")
     with pytest.raises(QEInputError, match="positive integer"):
         hybrid_thread_count()
+
+
+def test_thread_environment_warning_exposes_conflicting_overrides(monkeypatch) -> None:
+    monkeypatch.setenv("OMP_NUM_THREADS", "4")
+    monkeypatch.setenv("QEPY_NUM_THREADS", "1")
+    assert thread_environment_warning() == (
+        "QEPY_NUM_THREADS=1 overrides OMP_NUM_THREADS=4; "
+        "using 1 thread(s) per MPI process"
+    )
+    monkeypatch.setenv("QEPY_NUM_THREADS", "4")
+    assert thread_environment_warning() is None
 
 
 def test_timing_registry_accumulates_calls_and_snapshot_is_independent(monkeypatch) -> None:

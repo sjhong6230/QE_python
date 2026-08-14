@@ -21,6 +21,7 @@ from ..qe_format import (
     format_qe_duration,
     qe_date_and_time,
 )
+from ..threads import thread_environment_warning
 from ..upf import read_upf
 from ..xc import canonical_xc_name
 from ..version import __version__
@@ -169,6 +170,9 @@ def format_header(pw: PWInput) -> str:
     )
     print("\n     Python reference port of the scalar SCF path in Quantum ESPRESSO pw.x", file=out)
     print(f"     Reading input from {pw.source}\n", file=out)
+    thread_warning = thread_environment_warning()
+    if thread_warning is not None:
+        print(f"     WARNING: {thread_warning}\n", file=out)
     from ..errors import QEWarning, format_qe_warning
 
     for diagnostic in pw.warnings:
