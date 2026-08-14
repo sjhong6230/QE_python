@@ -780,6 +780,41 @@ class LocalPotentialWorkspace:
             * complex_per_alignment
         )
 
+    def _serial_density_uses_spatial_fft(self, active_bands: int) -> bool:
+        """Select the sparse stick path for an OpenMP density batch.
+
+        A partial band batch cannot occupy the complete thread team with
+        independent 3-D transforms, so spatial decomposition remains the
+        natural fallback.  At four or more threads, a full team also wins
+        once the grid reaches the existing large-FFT threshold: the fused
+        spatial kernel parallelizes packing, stick/plane transforms, and the
+        final band reduction without creating separate FFTW teams.
+        """
+        if self.thread_count <= 1:
+            return False
+        if active_bands < self.thread_count:
+            return True
+        return (
+            active_bands == self.thread_count
+            and self.thread_count >= 4
+            and self.size >= _FFT_THREAD_WORK_THRESHOLD
+        )
+
+    def _distributed_planner_flag(self, active_bands: int) -> str | None:
+        """Use measured plans for the stable one-band MPI tile.
+
+        The memory-first MPI policy uses a one-band tile with one thread per
+        rank.  Its Z-stick and XY-slab shapes stay fixed across Davidson and
+        every k point, so the one-time planning cost is amortized over many
+        thousands of transforms.  Larger/partial hybrid blocks retain the
+        bounded-cost ESTIMATE policy because their shapes vary.
+        """
+        return (
+            "FFTW_MEASURE"
+            if self.thread_count == 1 and active_bands == 1
+            else None
+        )
+
     def _native_plan(
         self,
         values: np.ndarray,
@@ -1360,6 +1395,9 @@ class LocalPotentialWorkspace:
                 reverse_send_size, inverse_receive_size
             )
         threaded_sticks = self.thread_count > 1
+        stable_planner_flag = self._distributed_planner_flag(
+            number_of_vectors
+        )
         z_plan = self._native_plan(
             sticks,
             (self.shape[2],),
@@ -1367,6 +1405,7 @@ class LocalPotentialWorkspace:
             len(local_sticks) * number_of_vectors,
             1,
             parallel_bands=threaded_sticks,
+            planner_flag=stable_planner_flag,
             preserve_values=False,
         )
         threaded_planes = self.thread_count > 1
@@ -1379,9 +1418,12 @@ class LocalPotentialWorkspace:
             parallel_bands=threaded_planes,
             planner_flag=(
                 "FFTW_MEASURE"
-                if self.thread_count > 1
-                and self.shape[0] * self.shape[1] * local_z
-                >= _BATCHED_FFT_THREAD_WORK_THRESHOLD
+                if stable_planner_flag is not None
+                or (
+                    self.thread_count > 1
+                    and self.shape[0] * self.shape[1] * local_z
+                    >= _BATCHED_FFT_THREAD_WORK_THRESHOLD
+                )
                 else None
             ),
             preserve_values=False,
@@ -1449,7 +1491,7 @@ class LocalPotentialWorkspace:
                 grid = self._scratch(
                     "serial_fft_grid", (active, grid_stride)
                 )
-                if self.thread_count > 1 and active < self.thread_count:
+                if self._serial_density_uses_spatial_fft(active):
                     z_plan, xy_plan = self._serial_spatial_plans(grid)
                     timer = (
                         self.timers.measure("fftw", calls=active)
@@ -1554,6 +1596,7 @@ class LocalPotentialWorkspace:
                     0, receive_size
                 )
                 threaded_sticks = self.thread_count > 1
+                stable_planner_flag = self._distributed_planner_flag(active)
                 z_plan = self._native_plan(
                     sticks,
                     (self.shape[2],),
@@ -1561,6 +1604,7 @@ class LocalPotentialWorkspace:
                     len(local_sticks) * active,
                     1,
                     parallel_bands=threaded_sticks,
+                    planner_flag=stable_planner_flag,
                     preserve_values=False,
                 )
                 xy_plan = self._native_plan(
@@ -1571,9 +1615,12 @@ class LocalPotentialWorkspace:
                     self.shape[0] * self.shape[1],
                     planner_flag=(
                         "FFTW_MEASURE"
-                        if self.thread_count > 1
-                        and self.shape[0] * self.shape[1] * local_z
-                        >= _BATCHED_FFT_THREAD_WORK_THRESHOLD
+                        if stable_planner_flag is not None
+                        or (
+                            self.thread_count > 1
+                            and self.shape[0] * self.shape[1] * local_z
+                            >= _BATCHED_FFT_THREAD_WORK_THRESHOLD
+                        )
                         else None
                     ),
                     preserve_values=False,

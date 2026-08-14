@@ -162,6 +162,49 @@ def test_serial_sparse_spatial_fft_matches_full_3d_fft() -> None:
 
     np.testing.assert_allclose(sparse, full, atol=8.0e-13)
 
+    spatial_workspace = LocalPotentialWorkspace(
+        indices, shape, serial_fft_batch_size=3
+    )
+    spatial_workspace.thread_count = 4
+    full_workspace = LocalPotentialWorkspace(
+        indices, shape, serial_fft_batch_size=3
+    )
+    full_workspace.thread_count = 1
+    weights = np.asarray([0.2, 0.3, 0.5])
+    spatial_density = np.zeros(shape)
+    full_density = np.zeros(shape)
+    spatial_workspace.accumulate_density(
+        spatial_density, coefficients, weights
+    )
+    full_workspace.accumulate_density(full_density, coefficients, weights)
+    np.testing.assert_allclose(spatial_density, full_density, atol=2.0e-11)
+
+
+def test_serial_density_spatial_policy_uses_large_four_thread_grids() -> None:
+    indices = np.asarray([[0, 0, 0]], dtype=np.int32)
+    small = LocalPotentialWorkspace(indices, (32, 32, 32))
+    large = LocalPotentialWorkspace(indices, (64, 64, 64))
+
+    small.thread_count = 4
+    large.thread_count = 4
+    assert not small._serial_density_uses_spatial_fft(4)
+    assert large._serial_density_uses_spatial_fft(4)
+    assert large._serial_density_uses_spatial_fft(3)
+
+    large.thread_count = 2
+    assert not large._serial_density_uses_spatial_fft(2)
+
+
+def test_distributed_single_band_tile_uses_measured_fftw_plan() -> None:
+    workspace = LocalPotentialWorkspace(
+        np.asarray([[0, 0, 0]], dtype=np.int32), (8, 8, 8)
+    )
+    workspace.thread_count = 1
+    assert workspace._distributed_planner_flag(1) == "FFTW_MEASURE"
+    assert workspace._distributed_planner_flag(2) is None
+    workspace.thread_count = 2
+    assert workspace._distributed_planner_flag(1) is None
+
 
 def test_serial_fftw_timer_counts_qe_logical_band_transforms() -> None:
     shape = (6, 6, 6)
